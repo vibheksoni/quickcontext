@@ -111,6 +111,7 @@ Validation commands:
 - `cargo check --manifest-path service/Cargo.toml`
 - `cargo test --manifest-path service/Cargo.toml`
 - `python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py`
+- `venv/Scripts/python.exe -m unittest engine.tests.test_regressions`
 
 Benchmarking guidance:
 

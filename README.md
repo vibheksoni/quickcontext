@@ -182,6 +182,7 @@ Useful validation commands during development:
 cargo check --manifest-path service/Cargo.toml
 cargo test --manifest-path service/Cargo.toml
 python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py
+venv/Scripts/python.exe -m unittest engine.tests.test_regressions
 ```
 
 For local performance work, keep benchmark notes in `BENCHMARK_LOCAL.md`. That file is intentionally gitignored.
