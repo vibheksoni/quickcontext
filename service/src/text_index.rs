@@ -354,8 +354,7 @@ fn upsert_doc(
         None => return false,
     };
 
-    let tokenizer = Tokenizer::new();
-    let term_freq = tokenizer.tokenize_with_frequency(&source);
+    let term_freq = tokenizer().tokenize_with_frequency(&source);
     let doc_len: usize = term_freq.iter().map(|(_, tf)| *tf as usize).sum();
 
     let id = reuse_id.unwrap_or_else(|| {
@@ -426,8 +425,7 @@ fn score_candidates(
     filter: &SearchFilter,
     max_candidates: usize,
 ) -> Vec<IndexedCandidate> {
-    let tokenizer = Tokenizer::new();
-    let query_terms = tokenizer.tokenize(query);
+    let query_terms = tokenizer().tokenize(query);
     if query_terms.is_empty() || index.docs.is_empty() {
         return Vec::new();
     }
@@ -569,6 +567,11 @@ fn persistence_path(root: &Path) -> Result<PathBuf, String> {
     let dir = root.join(".quickcontext");
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create text index dir: {e}"))?;
     Ok(dir.join("text_search_index.redb"))
+}
+
+fn tokenizer() -> &'static Tokenizer {
+    static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
+    TOKENIZER.get_or_init(Tokenizer::new)
 }
 
 fn persist_index(root: &Path, index: &ProjectTextIndex) -> Result<(), String> {

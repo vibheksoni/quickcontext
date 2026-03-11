@@ -1,4 +1,8 @@
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import re
+from threading import Lock
 from typing import TYPE_CHECKING, Optional
 
 from qdrant_client import QdrantClient, models
@@ -14,6 +18,7 @@ if TYPE_CHECKING:
 RRF_K = 60
 TOP_RANK_BONUS_1 = 0.05
 TOP_RANK_BONUS_2_3 = 0.02
+QUERY_CACHE_SIZE = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +90,9 @@ class CodeSearcher:
         self._code_provider = code_provider
         self._desc_provider = desc_provider
         self._reranker = reranker
+        self._cache_lock = Lock()
+        self._query_vector_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
+        self._keyword_cache: OrderedDict[str, list[str]] = OrderedDict()
 
     def search_code(
         self,
@@ -115,8 +123,8 @@ class CodeSearcher:
         Returns:
             list[SearchResult] — Results sorted by relevance.
         """
-        query_vector = self._code_provider.embed_single(query).tolist()
-        query_keywords = extract_keywords(query) if use_keywords else []
+        query_vector = self._embed_query_cached(query, using="code")
+        query_keywords = self._extract_keywords_cached(query) if use_keywords else []
 
         return self._search(
             query=query,
@@ -161,8 +169,8 @@ class CodeSearcher:
         Returns:
             list[SearchResult] — Results sorted by relevance.
         """
-        query_vector = self._desc_provider.embed_single(query).tolist()
-        query_keywords = extract_keywords(query) if use_keywords else []
+        query_vector = self._embed_query_cached(query, using="description")
+        query_keywords = self._extract_keywords_cached(query) if use_keywords else []
 
         return self._search(
             query=query,
@@ -218,28 +226,33 @@ class CodeSearcher:
         Returns:
             list[SearchResult] — Results sorted by relevance.
         """
-        code_results = self.search_code(
-            query=query,
-            limit=max(limit * 3, 30),
-            language=language,
-            file_path=file_path,
-            path_prefix=path_prefix,
-            symbol_kind=symbol_kind,
-            use_keywords=use_keywords,
-            keyword_weight=keyword_weight,
-            rerank=False,
-        )
-        desc_results = self.search_description(
-            query=query,
-            limit=max(limit * 3, 30),
-            language=language,
-            file_path=file_path,
-            path_prefix=path_prefix,
-            symbol_kind=symbol_kind,
-            use_keywords=use_keywords,
-            keyword_weight=keyword_weight,
-            rerank=False,
-        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            code_future = executor.submit(
+                self.search_code,
+                query=query,
+                limit=max(limit * 3, 30),
+                language=language,
+                file_path=file_path,
+                path_prefix=path_prefix,
+                symbol_kind=symbol_kind,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=False,
+            )
+            desc_future = executor.submit(
+                self.search_description,
+                query=query,
+                limit=max(limit * 3, 30),
+                language=language,
+                file_path=file_path,
+                path_prefix=path_prefix,
+                symbol_kind=symbol_kind,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=False,
+            )
+            code_results = code_future.result()
+            desc_results = desc_future.result()
 
         fused = self._rrf_fuse(
             [code_results, desc_results],
@@ -304,12 +317,8 @@ class CodeSearcher:
         if not sub_queries:
             return []
 
-        result_lists: list[list[SearchResult]] = []
-        weights: list[float] = []
-
-        for idx, sub in enumerate(sub_queries):
+        def _run_subquery(sub: StructuredSubQuery, idx: int) -> tuple[list[SearchResult], float]:
             weight = first_query_weight if idx == 0 else 1.0
-
             if sub.kind == "lex":
                 results = self.search_code(
                     query=sub.text,
@@ -320,18 +329,6 @@ class CodeSearcher:
                     symbol_kind=symbol_kind,
                     use_keywords=use_keywords,
                     keyword_weight=max(keyword_weight, 0.45),
-                    rerank=False,
-                )
-            elif sub.kind == "vec":
-                results = self.search_description(
-                    query=sub.text,
-                    limit=max(limit * 3, 30),
-                    language=language,
-                    file_path=file_path,
-                    path_prefix=path_prefix,
-                    symbol_kind=symbol_kind,
-                    use_keywords=use_keywords,
-                    keyword_weight=keyword_weight,
                     rerank=False,
                 )
             else:
@@ -346,10 +343,21 @@ class CodeSearcher:
                     keyword_weight=keyword_weight,
                     rerank=False,
                 )
+            return results, weight
 
-            if results:
-                result_lists.append(results)
-                weights.append(weight)
+        result_lists: list[list[SearchResult]] = []
+        weights: list[float] = []
+        max_workers = min(4, max(1, len(sub_queries)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_run_subquery, sub, idx)
+                for idx, sub in enumerate(sub_queries)
+            ]
+            for future in futures:
+                results, weight = future.result()
+                if results:
+                    result_lists.append(results)
+                    weights.append(weight)
 
         if not result_lists:
             return []
@@ -642,6 +650,24 @@ class CodeSearcher:
             symbol_kind_value = point.payload.get("symbol_kind") or point.payload.get("symbol_type") or "unknown"
             symbol_name_value = point.payload["symbol_name"]
             file_path_value = point.payload["file_path"]
+            final_score *= self._kind_score_multiplier(symbol_kind_value, len(query_keywords))
+            final_score *= self._path_signal_multiplier(file_path_value, len(query_keywords))
+
+            if query_keywords:
+                symbol_tokens = self._symbol_tokens(
+                    symbol_name_value,
+                    point.payload.get("signature"),
+                )
+                symbol_overlap = keyword_overlap_score(query_keywords, symbol_tokens)
+                final_score += symbol_overlap * 0.18
+                if len(query_keywords) >= 2 and symbol_overlap >= 0.5:
+                    final_score *= 1.12
+                if (
+                    len(query_keywords) >= 2
+                    and symbol_overlap < 0.5
+                    and symbol_kind_value.lower() in {"data_key", "variable", "property", "import"}
+                ):
+                    final_score *= 0.7
 
             if query_keywords:
                 generic_symbol_names = {"main", "entry", "_start"}
@@ -682,3 +708,113 @@ class CodeSearcher:
             return self._blend_with_rerank(query, search_results, limit)
 
         return search_results[:limit]
+
+    def _kind_score_multiplier(self, symbol_kind: str, query_keyword_count: int) -> float:
+        """
+        Apply light semantic priors by symbol kind.
+
+        symbol_kind: str — Stored symbol kind.
+        query_keyword_count: int — Number of extracted query keywords.
+        Returns: float — Score multiplier.
+        """
+        kind = (symbol_kind or "").lower()
+        if kind in {"class", "function", "method", "struct", "enum", "trait", "interface"}:
+            return 1.12
+        if query_keyword_count >= 2 and kind in {"data_key", "variable", "import", "property"}:
+            return 0.8
+        return 1.0
+
+    def _path_signal_multiplier(self, file_path: str, query_keyword_count: int) -> float:
+        """
+        Apply a small penalty to lower-signal config/data files for multi-term queries.
+
+        file_path: str — Result file path.
+        query_keyword_count: int — Number of extracted query keywords.
+        Returns: float — Score multiplier.
+        """
+        if query_keyword_count < 2:
+            return 1.0
+
+        normalized = file_path.replace("\\", "/").lower()
+        low_signal_suffixes = (
+            ".yml",
+            ".yaml",
+            ".json",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".lock",
+        )
+        if normalized.endswith(low_signal_suffixes):
+            return 0.82
+        return 1.0
+
+    def _symbol_tokens(self, symbol_name: str, signature: Optional[str]) -> list[str]:
+        """
+        Extract normalized tokens from symbol metadata for direct overlap scoring.
+
+        symbol_name: str — Symbol name.
+        signature: Optional[str] — Symbol signature.
+        Returns: list[str] — Lowercase deduplicated tokens.
+        """
+        raw = f"{symbol_name} {signature or ''}"
+        expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", raw)
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expanded)
+        seen: set[str] = set()
+        out: list[str] = []
+        for token in tokens:
+            lower = token.lower()
+            if len(lower) < 2 or lower in seen:
+                continue
+            seen.add(lower)
+            out.append(lower)
+        return out
+
+    def _embed_query_cached(self, query: str, using: str) -> list[float]:
+        """
+        Cache query embeddings to avoid repeated provider calls for the same text.
+
+        query: str — Query text.
+        using: str — Vector space key ("code" or "description").
+        Returns: list[float] — Query vector as a Python list.
+        """
+        cache_key = (using, query)
+        with self._cache_lock:
+            cached = self._query_vector_cache.get(cache_key)
+            if cached is not None:
+                self._query_vector_cache.move_to_end(cache_key)
+                return cached
+
+        provider = self._code_provider if using == "code" else self._desc_provider
+        vector = provider.embed_single(query).tolist()
+
+        with self._cache_lock:
+            self._query_vector_cache[cache_key] = vector
+            self._query_vector_cache.move_to_end(cache_key)
+            while len(self._query_vector_cache) > QUERY_CACHE_SIZE:
+                self._query_vector_cache.popitem(last=False)
+
+        return vector
+
+    def _extract_keywords_cached(self, query: str) -> list[str]:
+        """
+        Cache keyword extraction for repeated query text.
+
+        query: str — Query text.
+        Returns: list[str] — Extracted keywords.
+        """
+        with self._cache_lock:
+            cached = self._keyword_cache.get(query)
+            if cached is not None:
+                self._keyword_cache.move_to_end(query)
+                return cached
+
+        keywords = extract_keywords(query)
+
+        with self._cache_lock:
+            self._keyword_cache[query] = keywords
+            self._keyword_cache.move_to_end(query)
+            while len(self._keyword_cache) > QUERY_CACHE_SIZE:
+                self._keyword_cache.popitem(last=False)
+
+        return keywords
