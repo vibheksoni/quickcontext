@@ -104,6 +104,21 @@ Common engine flow:
 - `python -m engine refresh <files...>`
 - `python -m engine watch <dir>`
 
+## Validation And Benchmarking
+
+Validation commands:
+
+- `cargo check --manifest-path service/Cargo.toml`
+- `cargo test --manifest-path service/Cargo.toml`
+- `python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py`
+
+Benchmarking guidance:
+
+- Prefer direct before/after timings for any speed-related change.
+- Use the Rust release binary for service-only timings.
+- Use bounded targets for end-to-end indexing when the active config uses remote embeddings.
+- Keep local benchmark notes in `BENCHMARK_LOCAL.md`. That file is intentionally gitignored.
+
 ## Strict Coding Guidelines
 
 - Keep code clean and modular.
@@ -139,3 +154,4 @@ Useful areas for contributors:
 - When touching indexing or search, check dimension compatibility and collection behavior.
 - When touching IPC, keep Windows and Linux behavior aligned at the protocol level.
 - When touching docs, keep them plain, direct, and easy to navigate.
+- Prefer evidence-based changes: benchmark, validate, then iterate.
