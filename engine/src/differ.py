@@ -8,17 +8,26 @@ from engine.src.chunker import CodeChunk
 class ChunkIdentity:
     """
     Unique identifier for a code chunk based on symbol identity.
-    Uses symbol name + parent + kind instead of byte positions for stability.
+    Includes chunk_id so deletions map to the exact stored point, and uses
+    signature/span fields to avoid collisions for overloaded symbols.
 
+    chunk_id: str — Deterministic chunk ID used for point ID derivation.
     file_path: str — Absolute file path.
     symbol_name: str — Symbol name (function/class/etc).
     symbol_kind: str — Symbol kind (function, class, method, etc).
     parent: Optional[str] — Parent symbol name (class for methods, None for top-level).
+    signature: Optional[str] — Signature text when available.
+    byte_start: int — Byte start for disambiguation.
+    byte_end: int — Byte end for disambiguation.
     """
+    chunk_id: str
     file_path: str
     symbol_name: str
     symbol_kind: str
     parent: Optional[str]
+    signature: Optional[str]
+    byte_start: int
+    byte_end: int
 
     @staticmethod
     def from_chunk(chunk: CodeChunk) -> "ChunkIdentity":
@@ -29,10 +38,14 @@ class ChunkIdentity:
         Returns: ChunkIdentity — Unique identifier for the chunk.
         """
         return ChunkIdentity(
+            chunk_id=chunk.chunk_id,
             file_path=chunk.file_path,
             symbol_name=chunk.symbol_name,
             symbol_kind=chunk.symbol_kind,
             parent=chunk.parent,
+            signature=chunk.signature,
+            byte_start=chunk.byte_start,
+            byte_end=chunk.byte_end,
         )
 
 
@@ -71,7 +84,7 @@ class ChunkDiffer:
     Compares old and new chunks to detect changes at chunk granularity.
 
     Strategy:
-    - Identity: file_path + symbol_name + byte_start + byte_end
+    - Identity: chunk identity plus signature/span disambiguation
     - Added: New chunks not in old set
     - Modified: Same identity but different file_hash or source
     - Deleted: Old chunks not in new set

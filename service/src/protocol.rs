@@ -21,6 +21,12 @@ pub enum Request {
         file: String,
         symbol: String,
     },
+    #[serde(rename = "scan_files")]
+    ScanFiles {
+        path: String,
+        #[serde(default)]
+        respect_gitignore: Option<bool>,
+    },
     #[serde(rename = "grep")]
     Grep {
         query: String,

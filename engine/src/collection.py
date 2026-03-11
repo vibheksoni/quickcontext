@@ -136,6 +136,30 @@ class CollectionManager:
                     max_version = max(max_version, int(suffix))
         return max_version + 1
 
+    def _latest_versioned_collection(self) -> str | None:
+        """
+        Find the highest existing versioned collection for this project.
+
+        Returns: str | None — Latest versioned collection name, if any.
+        """
+        prefix = self._collection_name + "_v"
+        latest_name = None
+        latest_version = -1
+
+        collections = self._client.get_collections().collections
+        for col in collections:
+            if not col.name.startswith(prefix):
+                continue
+            suffix = col.name[len(prefix):]
+            if not suffix.isdigit():
+                continue
+            version = int(suffix)
+            if version > latest_version:
+                latest_version = version
+                latest_name = col.name
+
+        return latest_name
+
     def exists(self) -> bool:
         """
         Check if the project has an active collection (via alias or direct name).
@@ -143,6 +167,8 @@ class CollectionManager:
         Returns: bool — True if a usable collection exists.
         """
         if self.resolve_alias() is not None:
+            return True
+        if self._latest_versioned_collection() is not None:
             return True
         return self._collection_exists(self._collection_name)
 
@@ -194,6 +220,20 @@ class CollectionManager:
         if self.resolve_alias() is not None:
             return False
 
+        latest_versioned = self._latest_versioned_collection()
+        if latest_versioned is not None:
+            self._client.update_collection_aliases(
+                change_aliases_operations=[
+                    models.CreateAliasOperation(
+                        create_alias=models.CreateAlias(
+                            collection_name=latest_versioned,
+                            alias_name=self._collection_name,
+                        )
+                    )
+                ]
+            )
+            return True
+
         if self._collection_exists(self._collection_name):
             self._migrate_legacy()
             return True
@@ -212,6 +252,7 @@ class CollectionManager:
             "symbol_kind",
             "symbol_type",
             "symbol_name",
+            "path_prefixes",
         ]
         for field_name in keyword_fields:
             self._client.create_payload_index(
@@ -290,6 +331,51 @@ class CollectionManager:
         shadow_name = f"{self._collection_name}_v{version}"
         self._create_versioned(shadow_name)
         return shadow_name
+
+    def copy_points(self, source_collection: str, target_collection: str, batch_size: int = 256) -> int:
+        """
+        Copy all points from one collection into another.
+
+        source_collection: str — Existing collection to read from.
+        target_collection: str — Empty collection to write into.
+        batch_size: int — Scroll and upsert batch size.
+        Returns: int — Number of copied points.
+        """
+        copied = 0
+        offset = None
+
+        while True:
+            records, next_offset = self._client.scroll(
+                collection_name=source_collection,
+                limit=max(1, int(batch_size)),
+                offset=offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            if not records:
+                break
+
+            points = [
+                models.PointStruct(
+                    id=record.id,
+                    vector=record.vector,
+                    payload=record.payload,
+                )
+                for record in records
+            ]
+
+            self._client.upsert(
+                collection_name=target_collection,
+                points=points,
+                wait=True,
+            )
+            copied += len(points)
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return copied
 
     def swap_alias(self, new_collection: str) -> str | None:
         """

@@ -25,6 +25,7 @@ use crate::types::{
 
 const STATE_KEY: &str = "state";
 const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot");
+const REFRESH_DEBOUNCE_MS: u128 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SymbolRecord {
@@ -70,6 +71,7 @@ struct ProjectIndex {
     callers_by_callee: HashMap<String, Vec<CallerEdge>>,
     callees_by_caller: HashMap<usize, Vec<CallerEdge>>,
     call_edges_ready: bool,
+    last_refresh_check_ms: u128,
 }
 
 #[derive(Default)]
@@ -415,6 +417,15 @@ fn refresh_symbol_index_if_needed(
 ) -> Result<bool, String> {
     let root = Path::new(project_root);
 
+    {
+        let index = project_lock
+            .read()
+            .map_err(|_| "symbol index read lock poisoned".to_string())?;
+        if now_ms().saturating_sub(index.last_refresh_check_ms) < REFRESH_DEBOUNCE_MS {
+            return Ok(true);
+        }
+    }
+
     let current = collect_file_signatures_fast(
         root,
         specs,
@@ -435,6 +446,11 @@ fn refresh_symbol_index_if_needed(
     let mut index = project_lock
         .write()
         .map_err(|_| "symbol index write lock poisoned".to_string())?;
+
+    if now_ms().saturating_sub(index.last_refresh_check_ms) < REFRESH_DEBOUNCE_MS {
+        return Ok(true);
+    }
+    index.last_refresh_check_ms = now_ms();
 
     if index.file_signatures == current {
         return Ok(true);
@@ -688,6 +704,8 @@ fn build_project_index(
     let mut symbols = Vec::new();
     let mut token_to_symbol_ids: HashMap<String, Vec<usize>> = HashMap::new();
     let mut name_to_symbol_ids: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut callers_by_callee: HashMap<String, Vec<CallerEdge>> = HashMap::new();
+    let mut callees_by_caller: HashMap<usize, Vec<CallerEdge>> = HashMap::new();
 
     for file in &extracted {
         for s in &file.symbols {
@@ -716,10 +734,23 @@ fn build_project_index(
 
             symbols.push(record);
         }
-    }
+        let source = match fs::read_to_string(&file.file_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
 
-    let callers_by_callee: HashMap<String, Vec<CallerEdge>> = HashMap::new();
-    let callees_by_caller: HashMap<usize, Vec<CallerEdge>> = HashMap::new();
+        let file_edges = extract_call_edges(&source, &file.language, &file.symbols, specs)?;
+        for edge in file_edges {
+            callers_by_callee
+                .entry(edge.callee_name_lower.clone())
+                .or_default()
+                .push(edge.clone());
+            callees_by_caller
+                .entry(edge.caller_symbol_id)
+                .or_default()
+                .push(edge);
+        }
+    }
 
     Ok(ProjectIndex {
         project_root: root.to_string_lossy().to_string(),
@@ -729,7 +760,8 @@ fn build_project_index(
         name_to_symbol_ids,
         callers_by_callee,
         callees_by_caller,
-        call_edges_ready: false,
+        call_edges_ready: true,
+        last_refresh_check_ms: now_ms(),
     })
 }
 
@@ -1082,7 +1114,15 @@ fn hydrate_project_index(persisted: PersistedIndex) -> ProjectIndex {
         callers_by_callee,
         callees_by_caller,
         call_edges_ready: persisted.call_edges_ready,
+        last_refresh_check_ms: now_ms(),
     }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -1396,16 +1396,60 @@ class QuickContext:
 
         if show_progress:
             print(f"Indexing project: {detected_project}")
-            print(f"Extracting symbols from {directory}...")
+            print(f"Scanning supported files in {directory}...")
 
-        extraction_results = self.extract_symbols(directory)
+        scan_entries = self.parser_service.scan_files(directory)
 
         indexer = self._get_indexer(detected_project)
-        indexed_hashes = indexer.get_file_hashes([r.file_path for r in extraction_results])
-
-        changed_results: list[ExtractionResult] = []
+        candidate_entries = []
         unchanged_files = 0
-        for result in extraction_results:
+
+        for entry in scan_entries:
+            cached_hash = None
+            if not force_refresh:
+                cached_hash = file_cache.is_unchanged_from_metadata(
+                    entry.file_path,
+                    entry.file_size,
+                    entry.file_mtime,
+                )
+            if cached_hash is not None:
+                unchanged_files += 1
+                continue
+            candidate_entries.append(entry)
+
+        indexed_hashes = indexer.get_file_hashes([entry.file_path for entry in candidate_entries])
+        changed_results: list[ExtractionResult] = []
+
+        if show_progress and candidate_entries:
+            print(f"Extracting symbols from {len(candidate_entries)} candidate files...")
+
+        candidate_paths = {entry.file_path for entry in candidate_entries}
+        if candidate_entries and (
+            len(candidate_entries) == len(scan_entries)
+            or len(candidate_entries) > 100
+        ):
+            extracted_candidates = [
+                result
+                for result in self.extract_symbols(directory)
+                if result.file_path in candidate_paths
+            ]
+            extracted_paths = {result.file_path for result in extracted_candidates}
+            missing_paths = sorted(candidate_paths - extracted_paths)
+            for file_path in missing_paths:
+                extracted_candidates.extend(self.extract_symbols(file_path))
+        else:
+            extracted_candidates = []
+            for entry in candidate_entries:
+                extracted_candidates.extend(self.extract_symbols(entry.file_path))
+
+        for result in extracted_candidates:
+            file_cache.update_from_extraction(
+                result.file_path,
+                result.file_hash,
+                result.file_size,
+                result.file_mtime,
+            )
+
             indexed_hash = indexed_hashes.get(result.file_path)
             if (
                 not force_refresh
@@ -1552,8 +1596,59 @@ class QuickContext:
 
         if not chunks:
             file_cache.save()
+            if incremental_resume:
+                if show_progress:
+                    print("No chunks to index after filtering")
+                return IndexStats(
+                    total_chunks=0,
+                    upserted_points=0,
+                    failed_points=0,
+                    total_tokens=0,
+                    duration_seconds=time.time() - started_at,
+                    llm_cost_usd=0.0,
+                    embedding_cost_usd=0.0,
+                    skipped_small_chunks=filter_stats.skipped_small,
+                    skipped_minified_chunks=filter_stats.skipped_minified,
+                    skipped_capped_chunks=filter_stats.skipped_per_file_cap,
+                    files_capped=filter_stats.files_capped,
+                    descriptions_enabled=generate_descriptions,
+                )
+
+            shadow_name = collection.create_shadow()
+            from engine.src.indexer import QdrantIndexer
+            shadow_indexer = QdrantIndexer(
+                client=collection.client,
+                collection_name=shadow_name,
+                batch_size=self._config.qdrant.upsert_batch_size,
+                upsert_concurrency=self._config.qdrant.upsert_concurrency,
+            )
+            old_collection = collection.resolve_alias()
+            if old_collection is not None and not force_refresh:
+                copied_points = collection.copy_points(
+                    source_collection=old_collection,
+                    target_collection=shadow_name,
+                    batch_size=self._config.qdrant.upsert_batch_size,
+                )
+                if show_progress:
+                    print(f"Copied {copied_points} existing points into {shadow_name}")
+
+                changed_paths = sorted({result.file_path for result in changed_results})
+                if changed_paths:
+                    shadow_indexer.delete_by_files(changed_paths)
+                    if show_progress:
+                        print(f"Removed stale points for {len(changed_paths)} changed files from {shadow_name}")
+
+            old_collection = collection.swap_alias(shadow_name)
+            if old_collection is not None:
+                try:
+                    collection.client.delete_collection(old_collection)
+                except Exception:
+                    pass
+            collection.cleanup_old_versions()
+
             if show_progress:
-                print("No chunks to index after filtering")
+                print("Applied filtered deletions with no replacement chunks")
+
             return IndexStats(
                 total_chunks=0,
                 upserted_points=0,
@@ -1596,6 +1691,22 @@ class QuickContext:
             batch_size=self._config.qdrant.upsert_batch_size,
             upsert_concurrency=self._config.qdrant.upsert_concurrency,
         )
+
+        old_collection = collection.resolve_alias()
+        if old_collection is not None and not force_refresh:
+            copied_points = collection.copy_points(
+                source_collection=old_collection,
+                target_collection=shadow_name,
+                batch_size=self._config.qdrant.upsert_batch_size,
+            )
+            if show_progress:
+                print(f"Copied {copied_points} existing points into {shadow_name}")
+
+            changed_paths = sorted({result.file_path for result in changed_results})
+            if changed_paths:
+                shadow_indexer.delete_by_files(changed_paths)
+                if show_progress:
+                    print(f"Removed stale points for {len(changed_paths)} changed files from {shadow_name}")
 
         if generate_descriptions:
             if show_progress:
@@ -1832,9 +1943,10 @@ class QuickContext:
         total_skipped_minified = 0
         total_skipped_capped = 0
         total_files_capped = 0
+        old_chunks_by_file = indexer.get_chunks_by_files(paths_to_extract)
 
         for file_path in paths_to_extract:
-            old_chunks = indexer.get_chunks_by_file(file_path)
+            old_chunks = old_chunks_by_file.get(file_path, [])
 
             results = self.extract_symbols(file_path)
             new_chunks = self.chunker.build_chunks(results)
@@ -1844,17 +1956,17 @@ class QuickContext:
                     result.file_path, result.file_hash, result.file_size, result.file_mtime,
                 )
 
-            diff = ChunkDiffer.diff(old_chunks, new_chunks)
-            filtered_reindex, filter_stats = filter_chunks(
-                diff.needs_reindex,
+            filtered_chunks, filter_stats = filter_chunks(
+                new_chunks,
                 ChunkFilterConfig(
                     min_chunk_bytes=max(1, int(min_chunk_bytes)),
                     max_chunks_per_file=max(1, int(max_chunks_per_file)),
                     skip_minified=bool(skip_minified),
                 ),
             )
+            diff = ChunkDiffer.diff(old_chunks, filtered_chunks)
 
-            all_chunks_to_reindex.extend(filtered_reindex)
+            all_chunks_to_reindex.extend(diff.needs_reindex)
             all_identities_to_delete.extend(diff.needs_deletion)
             total_unchanged += len(diff.unchanged)
             total_skipped_small += filter_stats.skipped_small
@@ -1866,7 +1978,7 @@ class QuickContext:
                 print(
                     f"  {file_path}: +{len(diff.added)} ~{len(diff.modified)} "
                     f"-{len(diff.deleted)} ={len(diff.unchanged)} "
-                    f"kept={len(filtered_reindex)}/{len(diff.needs_reindex)}"
+                    f"kept={len(filtered_chunks)}/{len(new_chunks)}"
                 )
 
         if max_total_chunks is not None and max_total_chunks > 0 and len(all_chunks_to_reindex) > max_total_chunks:

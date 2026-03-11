@@ -34,13 +34,34 @@ def content_hash(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def dedup_hash(chunk: CodeChunk) -> str:
+    """
+    Compute a context-aware dedup hash for description and embedding reuse.
+
+    Identical source in materially different symbol contexts can require
+    different descriptions, so the dedup key includes lightweight semantic
+    context in addition to raw source.
+
+    chunk: CodeChunk — Chunk to hash.
+    Returns: str — Hex digest used for dedup grouping.
+    """
+    parts = [
+        chunk.source,
+        chunk.symbol_name,
+        chunk.symbol_kind,
+        chunk.parent or "",
+        chunk.signature or "",
+        chunk.docstring or "",
+    ]
+    return hashlib.sha256("\n\0".join(parts).encode("utf-8")).hexdigest()
+
+
 def deduplicate_chunks(chunks: list[CodeChunk]) -> DeduplicationResult:
     """
-    Group chunks by source content hash, picking one representative per group.
+    Group chunks by context-aware dedup hash, picking one representative per group.
 
-    Chunks with identical source code (regardless of file path or symbol name)
-    share the same content hash. Only the first chunk per group is sent to
-    the LLM describer and embedding provider, saving API costs.
+    Chunks only dedup when both the raw source and lightweight semantic context
+    align closely enough to safely share generated descriptions and embeddings.
 
     chunks: list[CodeChunk] — All chunks to deduplicate.
     Returns: DeduplicationResult — Unique representatives and grouping info.
@@ -48,7 +69,7 @@ def deduplicate_chunks(chunks: list[CodeChunk]) -> DeduplicationResult:
     groups: dict[str, list[CodeChunk]] = {}
 
     for chunk in chunks:
-        h = content_hash(chunk.source)
+        h = dedup_hash(chunk)
         if h not in groups:
             groups[h] = []
         groups[h].append(chunk)

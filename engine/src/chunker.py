@@ -137,6 +137,9 @@ class ChunkBuilder:
             symbol.name,
             symbol.kind,
             symbol.parent,
+            symbol.signature,
+            symbol.byte_start,
+            symbol.byte_end,
         )
 
         return CodeChunk(
@@ -180,7 +183,7 @@ class ChunkBuilder:
         total_bytes = len(content_bytes)
 
         if total_bytes <= self._max_chunk_bytes:
-            chunk_id = self._generate_chunk_id(file_path, "<file>", "file", None)
+            chunk_id = self._generate_chunk_id(file_path, "<file>", "file", None, None, 0, total_bytes)
             chunks.append(CodeChunk(
                 chunk_id=chunk_id,
                 source=content,
@@ -209,7 +212,15 @@ class ChunkBuilder:
                 chunk_bytes = content_bytes[offset:chunk_end]
                 chunk_text = chunk_bytes.decode('utf-8', errors='ignore')
 
-                chunk_id = self._generate_chunk_id(file_path, f"<file_chunk_{chunk_idx}>", "file", None)
+                chunk_id = self._generate_chunk_id(
+                    file_path,
+                    f"<file_chunk_{chunk_idx}>",
+                    "file",
+                    None,
+                    None,
+                    offset,
+                    chunk_end,
+                )
                 line_start = bisect_right(newline_offsets, offset) + 1
                 line_end = bisect_right(newline_offsets, chunk_end) + 1
                 chunks.append(CodeChunk(
@@ -323,20 +334,38 @@ class ChunkBuilder:
         truncated = truncated_bytes.decode('utf-8', errors='ignore')
         return truncated + "\n\n... [truncated]"
 
-    def _generate_chunk_id(self, file_path: str, symbol_name: str, symbol_kind: str, parent: Optional[str] = None) -> str:
+    def _generate_chunk_id(
+        self,
+        file_path: str,
+        symbol_name: str,
+        symbol_kind: str,
+        parent: Optional[str] = None,
+        signature: Optional[str] = None,
+        byte_start: Optional[int] = None,
+        byte_end: Optional[int] = None,
+    ) -> str:
         """
         Generate deterministic chunk ID for Qdrant point.
-        Uses symbol identity (name + kind + parent) instead of byte positions for stability.
+        Uses symbol identity plus signature or byte span to avoid collisions.
 
         file_path: str — Source file path.
         symbol_name: str — Symbol name.
         symbol_kind: str — Symbol kind (function, class, method, etc).
         parent: Optional[str] — Parent symbol name (class for methods, None for top-level).
+        signature: Optional[str] — Signature text when available.
+        byte_start: Optional[int] — Byte start fallback for overload disambiguation.
+        byte_end: Optional[int] — Byte end fallback for overload disambiguation.
         Returns: str — Hex-encoded SHA256 hash.
         """
         normalized_path = str(Path(file_path).resolve())
         parent_str = f"::{parent}" if parent else ""
-        key = f"{normalized_path}::{symbol_name}::{symbol_kind}{parent_str}"
+        signature_str = f"::sig={signature}" if signature else ""
+        span_str = (
+            f"::span={int(byte_start)}-{int(byte_end)}"
+            if byte_start is not None and byte_end is not None
+            else ""
+        )
+        key = f"{normalized_path}::{symbol_name}::{symbol_kind}{parent_str}{signature_str}{span_str}"
         return hashlib.sha256(key.encode('utf-8')).hexdigest()
 
     def _hash_content(self, content: str) -> str:

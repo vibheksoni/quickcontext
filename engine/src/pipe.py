@@ -17,7 +17,7 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
     GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
@@ -25,6 +25,49 @@ if IS_WINDOWS:
     INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1).value
     PIPE_READMODE_BYTE = 0x00000000
     ERROR_PIPE_BUSY = 231
+
+    kernel32.CreateFileW.argtypes = [
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = ctypes.wintypes.HANDLE
+
+    kernel32.SetNamedPipeHandleState.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    kernel32.SetNamedPipeHandleState.restype = ctypes.wintypes.BOOL
+
+    kernel32.WaitNamedPipeW.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.wintypes.DWORD]
+    kernel32.WaitNamedPipeW.restype = ctypes.wintypes.BOOL
+
+    kernel32.WriteFile.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    kernel32.WriteFile.restype = ctypes.wintypes.BOOL
+
+    kernel32.ReadFile.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    kernel32.ReadFile.restype = ctypes.wintypes.BOOL
+
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
 
 
 def _default_unix_socket_path() -> str:
@@ -340,6 +383,27 @@ class PipeClient:
         data = resp.get("data", {})
         if not isinstance(data, dict):
             raise PipeProtocolError("invalid extract symbol response payload")
+        return data
+
+    def scan_files(self, path: str, respect_gitignore: bool = True) -> list[dict]:
+        """Return supported source files with lightweight metadata.
+
+        * path -- str, absolute path to file or directory
+        * respect_gitignore -- bool, honor .gitignore rules
+
+        Returns list of dictionaries with file path, language, size, and mtime.
+        """
+        payload: dict[str, object] = {
+            "method": "scan_files",
+            "path": path,
+            "respect_gitignore": respect_gitignore,
+        }
+        resp = self.request(payload)
+        if resp.get("status") == "error":
+            raise PipeError(resp.get("message", "scan files failed"))
+        data = resp.get("data", [])
+        if not isinstance(data, list):
+            raise PipeProtocolError("invalid scan files response payload")
         return data
 
     def grep(self, query: str, path: Optional[str] = None, respect_gitignore: bool = True, limit: int = 200, before_context: int = 0, after_context: int = 0) -> dict:

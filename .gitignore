@@ -275,6 +275,7 @@ pip-selfcheck.json
 !CODE_OF_CONDUCT.md
 !SUPPORT.md
 !SECURITY.md
+BENCHMARK_LOCAL.md
 .mcp.json
 .mcp.local.json
 .oclaude/

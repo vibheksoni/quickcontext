@@ -558,6 +558,13 @@ class CodeSearcher:
         normalized_path_prefix = None
         if path_prefix:
             normalized_path_prefix = path_prefix.replace("\\", "/").strip().strip("/").lower()
+            if normalized_path_prefix:
+                filters.append(
+                    models.FieldCondition(
+                        key="path_prefixes",
+                        match=models.MatchValue(value=normalized_path_prefix),
+                    )
+                )
 
         if symbol_kind:
             filters.append(
@@ -596,6 +603,24 @@ class CodeSearcher:
             limit=fetch_limit,
             with_payload=True,
         )
+
+        if normalized_path_prefix and not results.points:
+            fallback_filters = [
+                condition for condition in filters
+                if not (
+                    isinstance(condition, models.FieldCondition)
+                    and getattr(condition, "key", None) == "path_prefixes"
+                )
+            ]
+            fallback_filter = models.Filter(must=fallback_filters) if fallback_filters else None
+            results = self._client.query_points(
+                collection_name=self._collection_name,
+                query=query_vector,
+                using=using,
+                query_filter=fallback_filter,
+                limit=max(fetch_limit, limit * 25),
+                with_payload=True,
+            )
 
         search_results = []
         for point in results.points:

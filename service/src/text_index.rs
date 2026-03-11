@@ -19,6 +19,7 @@ const TEXT_INDEX_SCHEMA_VERSION: u32 = 2;
 const BM25_K1: f64 = 1.5;
 const BM25_B: f64 = 0.5;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
+const REFRESH_DEBOUNCE_MS: u128 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TextDocRecord {
@@ -52,6 +53,7 @@ struct ProjectTextIndex {
     postings: HashMap<String, HashMap<u32, u32>>,
     total_doc_len: usize,
     next_doc_id: u32,
+    last_refresh_check_ms: u128,
 }
 
 #[derive(Default)]
@@ -119,6 +121,9 @@ fn refresh_index_if_needed(
         let index = project_lock
             .read()
             .map_err(|_| "text index read lock poisoned".to_string())?;
+        if now_ms().saturating_sub(index.last_refresh_check_ms) < REFRESH_DEBOUNCE_MS {
+            return Ok(());
+        }
         if index.respect_gitignore == respect_gitignore && index.config_fingerprint == config_fingerprint {
             let current = collect_file_signatures_fast(
                 project_root,
@@ -136,6 +141,11 @@ fn refresh_index_if_needed(
     let mut index = project_lock
         .write()
         .map_err(|_| "text index write lock poisoned".to_string())?;
+
+    if now_ms().saturating_sub(index.last_refresh_check_ms) < REFRESH_DEBOUNCE_MS {
+        return Ok(());
+    }
+    index.last_refresh_check_ms = now_ms();
 
     if index.respect_gitignore != respect_gitignore || index.config_fingerprint != config_fingerprint {
         let rebuilt = build_index(project_root, specs, respect_gitignore, config_fingerprint)?;
@@ -223,6 +233,7 @@ fn build_index(
         postings: HashMap::new(),
         total_doc_len: 0,
         next_doc_id: 0,
+        last_refresh_check_ms: now_ms(),
     };
 
     for (path, sig) in file_signatures {
@@ -296,6 +307,7 @@ fn reconcile_index(
     }
 
     index.file_signatures = next_signatures;
+    index.last_refresh_check_ms = now_ms();
     Ok(changed)
 }
 
@@ -647,7 +659,15 @@ fn hydrate_index(persisted: PersistedTextIndex) -> ProjectTextIndex {
         postings,
         total_doc_len,
         next_doc_id: persisted.next_doc_id,
+        last_refresh_check_ms: now_ms(),
     }
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

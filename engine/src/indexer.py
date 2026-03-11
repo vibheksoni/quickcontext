@@ -177,6 +177,7 @@ class QdrantIndexer:
             PointStruct ready for upsert
         """
         payload = {
+            "chunk_id": chunk.chunk.chunk_id,
             "language": chunk.chunk.language,
             "file_path": chunk.chunk.file_path,
             "symbol_name": chunk.chunk.symbol_name,
@@ -205,6 +206,10 @@ class QdrantIndexer:
         if chunk.chunk.visibility:
             payload["visibility"] = chunk.chunk.visibility
 
+        path_prefixes = self._build_path_prefixes(chunk.chunk.file_path)
+        if path_prefixes:
+            payload["path_prefixes"] = path_prefixes
+
         point_id = uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id)
 
         return models.PointStruct(
@@ -230,6 +235,25 @@ class QdrantIndexer:
         tail = parts[-5:]
         return " / ".join(tail)
 
+    def _build_path_prefixes(self, file_path: str) -> list[str]:
+        """
+        Build normalized path prefixes for server-side path-scoped retrieval.
+
+        file_path: str — Absolute or relative file path.
+        Returns: list[str] — Incremental lowercase path prefixes.
+        """
+        normalized = file_path.replace("\\", "/").strip("/")
+        if not normalized:
+            return []
+
+        parts = [segment for segment in normalized.split("/") if segment]
+        prefixes: list[str] = []
+        current: list[str] = []
+        for part in parts[:-1]:
+            current.append(part)
+            prefixes.append("/".join(current).lower())
+        return prefixes
+
     def delete_by_file(self, file_path: str) -> None:
         """
         Delete all chunks for a specific file.
@@ -245,6 +269,29 @@ class QdrantIndexer:
                         models.FieldCondition(
                             key="file_path",
                             match=models.MatchValue(value=file_path),
+                        )
+                    ]
+                )
+            ),
+        )
+
+    def delete_by_files(self, file_paths: list[str]) -> None:
+        """
+        Delete all chunks for a batch of files.
+
+        file_paths: list[str] — File paths whose chunks should be deleted.
+        """
+        if not file_paths:
+            return
+
+        self._client.delete(
+            collection_name=self._collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="file_path",
+                            match=models.MatchAny(any=file_paths),
                         )
                     ]
                 )
@@ -276,29 +323,34 @@ class QdrantIndexer:
         """
         hashes: dict[str, Optional[str]] = {path: None for path in file_paths}
 
-        for file_path in file_paths:
+        if not file_paths:
+            return hashes
+
+        batch_size = 256
+        for offset in range(0, len(file_paths), batch_size):
+            batch = file_paths[offset:offset + batch_size]
             try:
-                results = self._client.scroll(
+                results, _ = self._client.scroll(
                     collection_name=self._collection_name,
                     scroll_filter=models.Filter(
                         must=[
                             models.FieldCondition(
                                 key="file_path",
-                                match=models.MatchValue(value=file_path),
+                                match=models.MatchAny(any=batch),
                             )
                         ]
                     ),
-                    limit=1,
-                    with_payload=["file_hash"],
+                    limit=len(batch),
+                    with_payload=["file_path", "file_hash"],
                     with_vectors=False,
                 )
-
-                if results[0]:
-                    point = results[0][0]
-                    hashes[file_path] = point.payload.get("file_hash")
-
             except Exception:
-                pass
+                continue
+
+            for point in results:
+                point_file_path = point.payload.get("file_path")
+                if point_file_path in hashes and hashes[point_file_path] is None:
+                    hashes[point_file_path] = point.payload.get("file_hash")
 
         return hashes
 
@@ -329,8 +381,7 @@ class QdrantIndexer:
 
             for point in results[0]:
                 payload = point.payload
-                parent_str = f":{payload.get('parent')}" if payload.get('parent') else ""
-                chunk_id = f"{payload['file_path']}:{payload['symbol_name']}:{payload['symbol_kind']}{parent_str}"
+                chunk_id = payload.get("chunk_id") or self._legacy_chunk_id_from_payload(payload)
                 chunk = CodeChunk(
                     chunk_id=chunk_id,
                     language=payload.get("language", "unknown"),
@@ -355,6 +406,65 @@ class QdrantIndexer:
 
         return chunks
 
+    def get_chunks_by_files(self, file_paths: list[str]) -> dict[str, list[CodeChunk]]:
+        """
+        Fetch all existing chunks for a batch of files from Qdrant.
+
+        file_paths: list[str] — File paths whose chunks to fetch.
+        Returns: dict[str, list[CodeChunk]] — Existing chunks grouped by file path.
+        """
+        grouped: dict[str, list[CodeChunk]] = {file_path: [] for file_path in file_paths}
+        if not file_paths:
+            return grouped
+
+        batch_size = 128
+        for offset in range(0, len(file_paths), batch_size):
+            batch = file_paths[offset:offset + batch_size]
+            try:
+                results, _ = self._client.scroll(
+                    collection_name=self._collection_name,
+                    scroll_filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="file_path",
+                                match=models.MatchAny(any=batch),
+                            )
+                        ]
+                    ),
+                    limit=10000,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception as e:
+                print(f"Failed to fetch chunks for batch: {e}")
+                continue
+
+            for point in results:
+                payload = point.payload
+                file_path = payload.get("file_path")
+                if file_path not in grouped:
+                    continue
+                chunk_id = payload.get("chunk_id") or self._legacy_chunk_id_from_payload(payload)
+                grouped[file_path].append(CodeChunk(
+                    chunk_id=chunk_id,
+                    language=payload.get("language", "unknown"),
+                    file_path=file_path,
+                    symbol_name=payload["symbol_name"],
+                    symbol_kind=payload["symbol_kind"],
+                    line_start=payload["line_start"],
+                    line_end=payload["line_end"],
+                    byte_start=payload["byte_start"],
+                    byte_end=payload["byte_end"],
+                    file_hash=payload["file_hash"],
+                    source=payload["source"],
+                    signature=payload.get("signature"),
+                    docstring=payload.get("docstring"),
+                    parent=payload.get("parent"),
+                    visibility=payload.get("visibility"),
+                ))
+
+        return grouped
+
     def delete_by_identities(self, identities: list) -> None:
         """
         Delete chunks by their ChunkIdentity objects.
@@ -366,10 +476,19 @@ class QdrantIndexer:
 
         chunk_ids = []
         for identity in identities:
-            parent_str = f":{identity.parent}" if identity.parent else ""
-            chunk_id = f"{identity.file_path}:{identity.symbol_name}:{identity.symbol_kind}{parent_str}"
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id))
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, identity.chunk_id))
             chunk_ids.append(point_id)
 
         if chunk_ids:
             self.delete_by_chunk_ids(chunk_ids)
+
+    def _legacy_chunk_id_from_payload(self, payload: dict) -> str:
+        """
+        Reconstruct the old chunk ID format for points indexed before chunk_id
+        was stored in payload.
+
+        payload: dict — Stored Qdrant payload.
+        Returns: str — Legacy chunk ID string.
+        """
+        parent_str = f":{payload.get('parent')}" if payload.get("parent") else ""
+        return f"{payload['file_path']}:{payload['symbol_name']}:{payload['symbol_kind']}{parent_str}"

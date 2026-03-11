@@ -9,7 +9,7 @@ use tree_sitter::{Node, Parser, Query, QueryCursor};
 use crate::lang::{self, LanguageSpec};
 use crate::role_classify;
 use crate::types::{
-    CompactExtractionResult, ExtractStats, ExtractedSymbol, ExtractionResult, SymbolKind,
+    CompactExtractionResult, ExtractStats, ExtractedSymbol, ExtractionResult, FileScanEntry, SymbolKind,
 };
 
 const QUICK_IGNORE_FILENAME: &str = ".quick-ignore";
@@ -329,6 +329,40 @@ pub fn collect_file_signatures_fast(
         signatures.insert(file_path, sig);
     }
     signatures
+}
+
+pub fn scan_supported_files(
+    root: &Path,
+    specs: &[LanguageSpec],
+    options: ExtractOptions,
+) -> Vec<FileScanEntry> {
+    let mut files = Vec::new();
+
+    for (file_path, language) in collect_supported_files(root, specs, options) {
+        let meta = match std::fs::metadata(&file_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let file_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+
+        let Some(file_mtime) = file_mtime else {
+            continue;
+        };
+
+        files.push(FileScanEntry {
+            file_path,
+            language,
+            file_size: meta.len(),
+            file_mtime,
+        });
+    }
+
+    files
 }
 
 pub fn file_signature(path: &Path) -> u64 {

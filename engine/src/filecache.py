@@ -188,6 +188,33 @@ class FileSignatureCache:
 
         return None
 
+    def is_unchanged_from_metadata(
+        self,
+        file_path: str | Path,
+        file_size: Optional[int],
+        file_mtime: Optional[int],
+    ) -> Optional[str]:
+        """
+        Check if a file is unchanged using externally provided metadata.
+
+        file_path: str | Path — File path to check.
+        file_size: Optional[int] — Current file size in bytes.
+        file_mtime: Optional[int] — Current file mtime as Unix epoch seconds.
+        Returns: Optional[str] — Cached file_hash if unchanged, None otherwise.
+        """
+        if file_size is None or file_mtime is None:
+            return None
+
+        key = self._normalize_path(file_path)
+        cached = self._entries.get(key)
+        if cached is None:
+            return None
+
+        if int(file_mtime) == cached.mtime and int(file_size) == cached.size:
+            return cached.file_hash
+
+        return None
+
     def update_from_extraction(self, file_path: str, file_hash: Optional[str], file_size: Optional[int], file_mtime: Optional[int]) -> None:
         """
         Update cache from Rust extraction result metadata.

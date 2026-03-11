@@ -89,6 +89,15 @@ pub struct ExtractionResult {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileScanEntry {
+    pub file_path: String,
+    pub language: String,
+    pub file_size: u64,
+    pub file_mtime: u64,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepMatch {
     pub file_path: String,
     pub line_number: usize,

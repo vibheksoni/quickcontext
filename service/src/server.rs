@@ -8,7 +8,7 @@ use tokio::net::UnixListener;
 use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
 use tokio_util::sync::CancellationToken;
 
-use crate::extract::{extract_compact_streaming, extract_path, extract_path_with_options, ExtractOptions};
+use crate::extract::{extract_compact_streaming, extract_path, extract_path_with_options, scan_supported_files, ExtractOptions};
 use crate::file_ops;
 use crate::symbol_edit;
 use crate::grep::grep_path;
@@ -277,6 +277,9 @@ async fn dispatch(req: Request, specs: &[LanguageSpec], cancel: &CancellationTok
             respect_gitignore,
         } => handle_extract(&path, compact, stats_only, respect_gitignore, specs),
         Request::ExtractSymbol { file, symbol } => handle_extract_symbol(&file, &symbol, specs),
+        Request::ScanFiles { path, respect_gitignore } => {
+            handle_scan_files(&path, respect_gitignore.unwrap_or(true), specs)
+        }
         Request::Grep {
             query,
             path,
@@ -948,6 +951,22 @@ fn handle_extract_symbol(file_str: &str, symbol_query: &str, specs: &[LanguageSp
             "symbols": val,
             "total_matches": matched.len(),
         })),
+        Err(e) => Response::error(format!("serialization failed: {e}")),
+    }
+}
+
+fn handle_scan_files(path_str: &str, respect_gitignore: bool, specs: &[LanguageSpec]) -> Response {
+    let path = Path::new(path_str);
+    let entries = scan_supported_files(
+        path,
+        specs,
+        ExtractOptions {
+            respect_gitignore,
+        },
+    );
+
+    match serde_json::to_value(entries) {
+        Ok(val) => Response::ok_data(val),
         Err(e) => Response::error(format!("serialization failed: {e}")),
     }
 }

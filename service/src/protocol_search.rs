@@ -15,7 +15,7 @@ use crate::types::{
 
 const QUICK_IGNORE_FILENAME: &str = ".quick-ignore";
 const DEFAULT_CONTEXT_RADIUS: usize = 28;
-const DEFAULT_MIN_SCORE: f64 = 0.0;
+const DEFAULT_MIN_SCORE: f64 = 8.0;
 const DEFAULT_MAX_INPUT_FIELDS: usize = 16;
 const DEFAULT_MAX_OUTPUT_FIELDS: usize = 12;
 
@@ -35,8 +35,6 @@ const BASE_MARKERS: &[&str] = &[
     "put(",
     "delete(",
     "patch(",
-    "request",
-    "response",
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +207,10 @@ fn extract_contracts(
                 let output_fields = collect_generic_output_fields(&window, cfg.max_output_fields);
                 let has_outputs = !output_fields.is_empty();
                 let matched = matched_terms(&query_terms, &window);
+                if !query_terms.is_empty() && matched.is_empty() {
+                    continue;
+                }
+
                 let mut score = 8.0 + matched.len() as f64;
                 if !input_fields.is_empty() {
                     score += 2.0;
@@ -255,6 +257,10 @@ fn extract_contracts(
                 let output_fields = collect_generic_output_fields(&window, cfg.max_output_fields);
                 let has_outputs = !output_fields.is_empty();
                 let matched = matched_terms(&query_terms, &window);
+                if !query_terms.is_empty() && matched.is_empty() {
+                    continue;
+                }
+
                 let score = 7.0
                     + matched.len() as f64
                     + if !input_fields.is_empty() { 2.0 } else { 0.0 }
@@ -295,6 +301,10 @@ fn extract_contracts(
                 let output_fields = collect_generic_output_fields(&window, cfg.max_output_fields);
                 let has_outputs = !output_fields.is_empty();
                 let matched = matched_terms(&query_terms, &window);
+                if !query_terms.is_empty() && matched.is_empty() {
+                    continue;
+                }
+
                 let score = 7.0
                     + matched.len() as f64
                     + if !input_fields.is_empty() { 2.0 } else { 0.0 }
@@ -336,6 +346,10 @@ fn extract_contracts(
                 let output_fields = collect_generic_output_fields(&window, cfg.max_output_fields);
                 let has_outputs = !output_fields.is_empty();
                 let matched = matched_terms(&query_terms, &window);
+                if !query_terms.is_empty() && matched.is_empty() {
+                    continue;
+                }
+
                 let transport = detect_transport(&lower, &ep);
                 let operation = operation_from_endpoint(&ep);
                 let mut score = 9.0 + matched.len() as f64;

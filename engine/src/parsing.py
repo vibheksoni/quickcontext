@@ -229,6 +229,32 @@ class CompactExtractionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FileScanEntry:
+    """
+    Lightweight file metadata for supported source files.
+
+    file_path: str — Absolute file path.
+    language: str — Detected language name.
+    file_size: int — File size in bytes.
+    file_mtime: int — File mtime as Unix epoch seconds.
+    """
+
+    file_path: str
+    language: str
+    file_size: int
+    file_mtime: int
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "FileScanEntry":
+        return FileScanEntry(
+            file_path=str(data.get("file_path", "")),
+            language=str(data.get("language", "")),
+            file_size=int(data.get("file_size", 0)),
+            file_mtime=int(data.get("file_mtime", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ExtractStats:
     """
     Aggregate extraction statistics returned by compact/stats_only mode.
@@ -1588,6 +1614,32 @@ class RustParserService:
                         if isinstance(item, dict)
                     )
             return results
+
+    def scan_files(
+        self,
+        path: str | Path,
+        respect_gitignore: bool = True,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> list[FileScanEntry]:
+        """
+        List supported source files with lightweight metadata.
+
+        path: str | Path â€” File or directory to scan.
+        respect_gitignore: bool â€” Apply ignore rules when True.
+        ensure_server: bool â€” Auto-start service if unavailable.
+        timeout_ms: int â€” Startup/connect timeout in milliseconds.
+        Returns: list[FileScanEntry] â€” Supported files with size and mtime.
+        """
+        input_path = Path(path).resolve()
+
+        if ensure_server:
+            self._client.ensure_server(timeout_ms=timeout_ms)
+        elif not self.connected:
+            self.connect(timeout_ms=timeout_ms)
+
+        raw = self._client.scan_files(str(input_path), respect_gitignore=respect_gitignore)
+        return [FileScanEntry.from_dict(item) for item in raw if isinstance(item, dict)]
 
     def extract_compact(
         self,
