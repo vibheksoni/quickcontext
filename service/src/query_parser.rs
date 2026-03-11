@@ -1,4 +1,5 @@
 use crate::tokenizer::Tokenizer;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryExpr {
@@ -52,15 +53,11 @@ enum QueryToken {
     RParen,
 }
 
-pub struct QueryParser {
-    tokenizer: Tokenizer,
-}
+pub struct QueryParser;
 
 impl QueryParser {
     pub fn new() -> Self {
-        Self {
-            tokenizer: Tokenizer::new(),
-        }
+        Self
     }
 
     pub fn parse(&self, input: &str) -> ParsedQuery {
@@ -229,7 +226,7 @@ impl QueryParser {
                 })
             }
             QueryToken::Word(word) => {
-                let keywords = self.tokenizer.tokenize(word);
+                let keywords = tokenizer().tokenize(word);
                 *pos += 1;
                 if keywords.is_empty() {
                     if *pos < tokens.len() {
@@ -250,6 +247,11 @@ impl QueryParser {
             }
         }
     }
+}
+
+fn tokenizer() -> &'static Tokenizer {
+    static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
+    TOKENIZER.get_or_init(Tokenizer::new)
 }
 
 fn tokenize_query(input: &str) -> Vec<QueryToken> {

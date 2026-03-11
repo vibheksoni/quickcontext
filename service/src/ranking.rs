@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::tokenizer::Tokenizer;
 
@@ -15,7 +16,6 @@ impl Default for Bm25Config {
 
 pub struct Bm25Scorer {
     config: Bm25Config,
-    tokenizer: Tokenizer,
 }
 
 pub struct ScoredDocument {
@@ -31,10 +31,7 @@ struct IdfEntry {
 
 impl Bm25Scorer {
     pub fn new(config: Bm25Config) -> Self {
-        Self {
-            config,
-            tokenizer: Tokenizer::new(),
-        }
+        Self { config }
     }
 
     pub fn with_defaults() -> Self {
@@ -42,7 +39,7 @@ impl Bm25Scorer {
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
+        tokenizer()
     }
 
     fn compute_idf(num_docs: usize, doc_freq: usize) -> f64 {
@@ -70,14 +67,14 @@ impl Bm25Scorer {
             return Vec::new();
         }
 
-        let query_tokens = self.tokenizer.tokenize(query);
+        let query_tokens = tokenizer().tokenize(query);
         if query_tokens.is_empty() {
             return Vec::new();
         }
 
         let doc_token_freqs: Vec<Vec<(String, u32)>> = documents
             .iter()
-            .map(|doc| self.tokenizer.tokenize_with_frequency(doc))
+            .map(|doc| tokenizer().tokenize_with_frequency(doc))
             .collect();
 
         let doc_lengths: Vec<usize> = doc_token_freqs
@@ -144,6 +141,11 @@ impl Bm25Scorer {
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
+}
+
+fn tokenizer() -> &'static Tokenizer {
+    static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
+    TOKENIZER.get_or_init(Tokenizer::new)
 }
 
 #[cfg(test)]
