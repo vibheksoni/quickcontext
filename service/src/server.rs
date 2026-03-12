@@ -1,6 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -136,7 +134,7 @@ impl Drop for SocketCleanupGuard {
 #[cfg(windows)]
 async fn run_windows() -> std::io::Result<()> {
     let cancel = CancellationToken::new();
-    let specs = Arc::new(lang::registry());
+    let specs = lang::registry();
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
@@ -167,11 +165,10 @@ async fn run_windows() -> std::io::Result<()> {
                     .max_instances(MAX_INSTANCES)
                     .create(PIPE_NAME)?;
 
-                let specs = Arc::clone(&specs);
                 let cancel = cancel.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(client, specs.as_ref(), &cancel).await {
+                    if let Err(e) = handle_client(client, specs, &cancel).await {
                         if should_log_client_error(&e) {
                             eprintln!("[quickcontext] client error: {e}");
                         }
@@ -188,7 +185,7 @@ async fn run_windows() -> std::io::Result<()> {
 #[cfg(unix)]
 async fn run_unix() -> std::io::Result<()> {
     let cancel = CancellationToken::new();
-    let specs = Arc::new(lang::registry());
+    let specs = lang::registry();
     let socket_path = default_socket_path();
 
     if let Some(parent) = socket_path.parent() {
@@ -216,11 +213,10 @@ async fn run_unix() -> std::io::Result<()> {
             }
             result = listener.accept() => {
                 let (stream, _) = result?;
-                let specs = Arc::clone(&specs);
                 let cancel = cancel.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, specs.as_ref(), &cancel).await {
+                    if let Err(e) = handle_client(stream, specs, &cancel).await {
                         if should_log_client_error(&e) {
                             eprintln!("[quickcontext] client error: {e}");
                         }

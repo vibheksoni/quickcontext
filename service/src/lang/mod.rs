@@ -27,6 +27,8 @@ pub mod haskell;
 pub mod ocaml;
 pub mod r_lang;
 
+use std::sync::OnceLock;
+
 use tree_sitter::Language;
 use crate::types::SymbolKind;
 
@@ -40,40 +42,43 @@ pub struct LanguageSpec {
 }
 
 
-pub fn registry() -> Vec<LanguageSpec> {
-    vec![
-        python::spec(),
-        javascript::spec(),
-        typescript::spec(),
-        typescript::spec_tsx(),
-        rust_lang::spec(),
-        go::spec(),
-        java::spec(),
-        c_lang::spec(),
-        cpp::spec(),
-        csharp::spec(),
-        ruby::spec(),
-        php::spec(),
-        bash::spec(),
-        html::spec(),
-        css::spec(),
-        markdown::spec(),
-        data::spec_json(),
-        data::spec_yaml(),
-        data::spec_toml(),
-        swift::spec(),
-        scala::spec(),
-        lua::spec(),
-        elixir::spec(),
-        hcl::spec(),
-        sql::spec(),
-        protobuf::spec(),
-        xml::spec(),
-        zig::spec(),
-        haskell::spec(),
-        ocaml::spec(),
-        r_lang::spec(),
-    ]
+pub fn registry() -> &'static [LanguageSpec] {
+    static REGISTRY: OnceLock<Vec<LanguageSpec>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        vec![
+            python::spec(),
+            javascript::spec(),
+            typescript::spec(),
+            typescript::spec_tsx(),
+            rust_lang::spec(),
+            go::spec(),
+            java::spec(),
+            c_lang::spec(),
+            cpp::spec(),
+            csharp::spec(),
+            ruby::spec(),
+            php::spec(),
+            bash::spec(),
+            html::spec(),
+            css::spec(),
+            markdown::spec(),
+            data::spec_json(),
+            data::spec_yaml(),
+            data::spec_toml(),
+            swift::spec(),
+            scala::spec(),
+            lua::spec(),
+            elixir::spec(),
+            hcl::spec(),
+            sql::spec(),
+            protobuf::spec(),
+            xml::spec(),
+            zig::spec(),
+            haskell::spec(),
+            ocaml::spec(),
+            r_lang::spec(),
+        ]
+    })
 }
 
 
