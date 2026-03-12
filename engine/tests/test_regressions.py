@@ -283,6 +283,13 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(searcher._hybrid_request_limit(5), 16)
         self.assertEqual(searcher._hybrid_request_limit(10), 30)
+        self.assertEqual(
+            searcher._hybrid_request_limit(
+                5,
+                ["role", "metadata", "assigned", "assign", "set", "classify", "classified", "rust", "carried", "carry", "propagate", "store", "persist", "payload", "vector"],
+            ),
+            18,
+        )
 
     def test_path_prefix_filter_builds_server_side_constraint(self) -> None:
         searcher = CodeSearcher(
@@ -358,6 +365,17 @@ class RegressionTests(unittest.TestCase):
         )
         keywords = searcher._extract_keywords_cached("How are duplicate chunks collapsed before embedding?")
         self.assertIn("dedup", keywords)
+
+    def test_query_keyword_expansion_bridges_assignment_and_payload_flow_terms(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        keywords = searcher._extract_keywords_cached("How is role metadata assigned and carried into indexed vector payloads?")
+        self.assertIn("classify", keywords)
+        self.assertIn("store", keywords)
 
     def test_symbol_tokens_add_dedup_for_deduplicate(self) -> None:
         searcher = CodeSearcher(
@@ -701,6 +719,19 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertGreater(bonus, 0.0)
         self.assertEqual(neutral, 0.0)
+
+    def test_action_query_boosts_classify_for_role_assignment_queries(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        bonus = searcher._action_symbol_bonus(
+            ["role", "assigned", "classify"],
+            ["classify", "role"],
+        )
+        self.assertGreater(bonus, 0.0)
 
     def test_non_test_query_penalizes_test_paths(self) -> None:
         searcher = CodeSearcher(

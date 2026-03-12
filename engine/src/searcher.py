@@ -28,11 +28,23 @@ QUERY_CACHE_SIZE = 256
 DISK_QUERY_CACHE_LIMIT = 512
 METADATA_TOKEN_CACHE_SIZE = 2048
 HYBRID_REQUEST_MIN_LIMIT = 16
+HYBRID_COMPLEX_QUERY_MIN_LIMIT = 18
 TOKEN_SYNONYMS = {
     "remove": ("delete", "deletion"),
     "delete": ("remove", "removed"),
     "stale": ("obsolete", "old"),
     "obsolete": ("stale", "old"),
+    "assign": ("set", "classify", "classified"),
+    "assigned": ("assign", "set", "classify", "classified"),
+    "classify": ("assigned", "role"),
+    "classified": ("classify", "assigned", "role"),
+    "carry": ("propagate", "store", "persist", "payload"),
+    "carried": ("carry", "propagate", "store", "persist", "payload"),
+    "propagate": ("carry", "carried", "store"),
+    "payload": ("store", "persist"),
+    "indexed": ("index", "stored", "persisted"),
+    "stored": ("store", "persisted"),
+    "persisted": ("store", "stored", "payload"),
     "hydrate": ("retrieve", "payload", "source"),
     "snippet": ("source",),
     "snippets": ("source",),
@@ -43,16 +55,23 @@ TOKEN_SYNONYMS = {
     "deduplicate": ("dedup", "duplicate"),
 }
 ACTION_QUERY_KEYWORDS = {
+    "assign",
+    "assigned",
     "hydrate",
     "refresh",
     "delete",
     "remove",
     "detect",
+    "classify",
     "connect",
     "collapse",
     "debounce",
     "cache",
+    "carry",
+    "carried",
     "persist",
+    "store",
+    "propagate",
     "create",
     "build",
     "expand",
@@ -303,7 +322,7 @@ class CodeSearcher:
         """
         ranking_keywords = self._extract_keywords_cached(query)
         blend_keywords = ranking_keywords if use_keywords else []
-        request_limit = self._hybrid_request_limit(limit)
+        request_limit = self._hybrid_request_limit(limit, ranking_keywords)
 
         code_vector, desc_vector = self._hybrid_query_vectors(query)
 
@@ -360,11 +379,14 @@ class CodeSearcher:
 
         return self._finalize_results(fused[:limit], include_source=include_source)
 
-    def _hybrid_request_limit(self, limit: int) -> int:
+    def _hybrid_request_limit(self, limit: int, ranking_keywords: Optional[list[str]] = None) -> int:
         """
         Keep hybrid candidate overfetch bounded without dropping top-rank quality.
         """
-        return max(limit * 3, HYBRID_REQUEST_MIN_LIMIT)
+        request_limit = max(limit * 3, HYBRID_REQUEST_MIN_LIMIT)
+        if ranking_keywords and len(ranking_keywords) >= 15:
+            request_limit = max(request_limit, HYBRID_COMPLEX_QUERY_MIN_LIMIT)
+        return request_limit
 
     def search_structured(
         self,
