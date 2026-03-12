@@ -29,6 +29,23 @@ TOP_RANK_BONUS_2_3 = 0.02
 QUERY_CACHE_SIZE = 256
 DISK_QUERY_CACHE_LIMIT = 512
 METADATA_TOKEN_CACHE_SIZE = 2048
+LIGHT_RESULT_PAYLOAD_FIELDS = [
+    "chunk_id",
+    "language",
+    "file_path",
+    "symbol_name",
+    "symbol_kind",
+    "symbol_type",
+    "line_start",
+    "line_end",
+    "description",
+    "keywords",
+    "path_context",
+    "signature",
+    "docstring",
+    "parent",
+]
+FULL_RESULT_PAYLOAD_FIELDS = LIGHT_RESULT_PAYLOAD_FIELDS + ["source"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +77,7 @@ class SearchResult:
     line_end: int
     source: str
     description: str
+    point_id: int | str | None = None
     signature: Optional[str] = None
     docstring: Optional[str] = None
     parent: Optional[str] = None
@@ -307,7 +325,7 @@ class CodeSearcher:
                 candidate_multiplier=rerank_candidate_multiplier,
             )
 
-        return fused[:limit]
+        return self._hydrate_results(fused[:limit])
 
     def search_structured(
         self,
@@ -417,7 +435,7 @@ class CodeSearcher:
                 candidate_multiplier=rerank_candidate_multiplier,
             )
 
-        return fused[:limit]
+        return self._hydrate_results(fused[:limit])
 
     def _result_key(self, result: SearchResult) -> str:
         """
@@ -471,6 +489,7 @@ class CodeSearcher:
                 line_end=representatives[key].line_end,
                 source=representatives[key].source,
                 description=representatives[key].description,
+                point_id=representatives[key].point_id,
                 signature=representatives[key].signature,
                 docstring=representatives[key].docstring,
                 parent=representatives[key].parent,
@@ -502,7 +521,7 @@ class CodeSearcher:
             return results[:limit]
 
         candidate_count = min(len(results), max(limit * max(1, int(candidate_multiplier)), 30))
-        candidates = results[:candidate_count]
+        candidates = self._hydrate_results(results[:candidate_count])
 
         documents = [item.source for item in candidates]
         reranked = self._reranker.rerank(query, documents, top_k=len(documents))
@@ -536,6 +555,7 @@ class CodeSearcher:
                     line_end=candidate.line_end,
                     source=candidate.source,
                     description=candidate.description,
+                    point_id=candidate.point_id,
                     signature=candidate.signature,
                     docstring=candidate.docstring,
                     parent=candidate.parent,
@@ -646,7 +666,7 @@ class CodeSearcher:
             using=using,
             query_filter=query_filter,
             limit=fetch_limit,
-            with_payload=True,
+            with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
         )
 
         if normalized_path_prefix and not results.points:
@@ -664,7 +684,7 @@ class CodeSearcher:
                 using=using,
                 query_filter=fallback_filter,
                 limit=max(fetch_limit, limit * 25),
-                with_payload=True,
+                with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
             )
 
         search_results = []
@@ -735,8 +755,9 @@ class CodeSearcher:
                     symbol_kind=symbol_kind_value,
                     line_start=point.payload["line_start"],
                     line_end=point.payload["line_end"],
-                    source=point.payload["source"],
+                    source=point.payload.get("source", ""),
                     description=point.payload["description"],
+                    point_id=getattr(point, "id", None),
                     signature=point.payload.get("signature"),
                     docstring=point.payload.get("docstring"),
                     parent=point.payload.get("parent"),
@@ -750,7 +771,7 @@ class CodeSearcher:
         if rerank_active:
             return self._blend_with_rerank(query, search_results, limit)
 
-        return search_results[:limit]
+        return self._hydrate_results(search_results[:limit])
 
     def _batch_search(self, requests: list[dict]) -> list[list[SearchResult]]:
         """
@@ -781,7 +802,7 @@ class CodeSearcher:
                     using=request["using"],
                     filter=query_filter,
                     limit=fetch_limit,
-                    with_payload=True,
+                    with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
                 )
             )
             contexts.append(
@@ -822,7 +843,7 @@ class CodeSearcher:
                     using=context["using"],
                     query_filter=fallback_filter,
                     limit=max(context["limit"] * 25, 30),
-                    with_payload=True,
+                    with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
                 )
                 results = self._points_to_results(
                     points=fallback_response.points,
@@ -1008,8 +1029,9 @@ class CodeSearcher:
                     symbol_kind=symbol_kind_value,
                     line_start=point.payload["line_start"],
                     line_end=point.payload["line_end"],
-                    source=point.payload["source"],
+                    source=point.payload.get("source", ""),
                     description=point.payload["description"],
+                    point_id=getattr(point, "id", None),
                     signature=point.payload.get("signature"),
                     docstring=point.payload.get("docstring"),
                     parent=point.payload.get("parent"),
@@ -1020,6 +1042,66 @@ class CodeSearcher:
 
         search_results.sort(key=lambda item: item.score, reverse=True)
         return search_results
+
+    def _hydrate_results(self, results: list[SearchResult]) -> list[SearchResult]:
+        """
+        Fetch full payloads only for final results that still need source content.
+        """
+        if not results:
+            return results
+
+        ids_to_fetch: list[int | str] = []
+        seen_ids: set[str] = set()
+        for result in results:
+            if result.source or result.point_id is None:
+                continue
+            key = str(result.point_id)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            ids_to_fetch.append(result.point_id)
+
+        if not ids_to_fetch:
+            return results
+
+        try:
+            records = self._client.retrieve(
+                collection_name=self._collection_name,
+                ids=ids_to_fetch,
+                with_payload=FULL_RESULT_PAYLOAD_FIELDS,
+                with_vectors=False,
+            )
+        except Exception:
+            return results
+
+        payload_by_id = {str(record.id): record.payload or {} for record in records}
+        hydrated: list[SearchResult] = []
+        for result in results:
+            payload = payload_by_id.get(str(result.point_id)) if result.point_id is not None else None
+            if payload is None:
+                hydrated.append(result)
+                continue
+
+            hydrated.append(
+                SearchResult(
+                    score=result.score,
+                    file_path=payload.get("file_path", result.file_path),
+                    symbol_name=payload.get("symbol_name", result.symbol_name),
+                    symbol_kind=payload.get("symbol_kind") or payload.get("symbol_type") or result.symbol_kind,
+                    line_start=payload.get("line_start", result.line_start),
+                    line_end=payload.get("line_end", result.line_end),
+                    source=payload.get("source", result.source),
+                    description=payload.get("description", result.description),
+                    point_id=result.point_id,
+                    signature=payload.get("signature", result.signature),
+                    docstring=payload.get("docstring", result.docstring),
+                    parent=payload.get("parent", result.parent),
+                    language=payload.get("language", result.language),
+                    path_context=payload.get("path_context", result.path_context),
+                )
+            )
+
+        return hydrated
 
     def _can_share_query_embedding(self) -> bool:
         """

@@ -11,7 +11,7 @@ from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
-from engine.src.searcher import CodeSearcher
+from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS
 
 
 @dataclass(frozen=True)
@@ -53,9 +53,10 @@ class _FakeProvider:
 
 
 class _FakePoint:
-    def __init__(self, score: float, payload: dict):
+    def __init__(self, score: float, payload: dict, point_id: str = "point-1"):
         self.score = score
         self.payload = payload
+        self.id = point_id
 
 
 class _FakeQueryResponse:
@@ -64,14 +65,22 @@ class _FakeQueryResponse:
 
 
 class _FakeClient:
-    def __init__(self, points: list[_FakePoint]):
+    def __init__(self, points: list[_FakePoint], records: list | None = None):
         self._points = points
+        self._records = records or []
+        self.last_query_with_payload = None
+        self.last_retrieve_with_payload = None
 
     def query_points(self, **kwargs):
+        self.last_query_with_payload = kwargs.get("with_payload")
         return _FakeQueryResponse(self._points)
 
     def query_batch_points(self, collection_name, requests):
         return [_FakeQueryResponse(self._points) for _ in requests]
+
+    def retrieve(self, **kwargs):
+        self.last_retrieve_with_payload = kwargs.get("with_payload")
+        return self._records
 
 
 class _BlockedImport:
@@ -341,6 +350,42 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("engine/src/searcher.py", description.description.replace("\\", "/"))
         self.assertIn("query", description.keywords)
         self.assertIn("searcher", description.keywords)
+
+    def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
+        payload = {
+            "file_path": str(Path("engine/src/searcher.py").resolve()),
+            "symbol_name": "_embed_query_cached",
+            "symbol_kind": "function",
+            "line_start": 10,
+            "line_end": 20,
+            "description": "Cache query embeddings for repeated searches.",
+            "keywords": ["query", "embedding", "cache"],
+            "path_context": "engine / src / searcher.py",
+        }
+        full_payload = dict(payload)
+        full_payload["source"] = "def _embed_query_cached(query, using): ..."
+
+        record = type("Record", (), {"id": "point-1", "payload": full_payload})()
+        client = _FakeClient(
+            [_FakePoint(0.8, payload, point_id="point-1")],
+            records=[record],
+        )
+        searcher = CodeSearcher(
+            client=client,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+
+        results = searcher.search_code(
+            query="How are query embeddings cached or reused in the search layer for repeated searches?",
+            limit=1,
+            use_keywords=False,
+        )
+
+        self.assertEqual(client.last_query_with_payload, LIGHT_RESULT_PAYLOAD_FIELDS)
+        self.assertIsNotNone(client.last_retrieve_with_payload)
+        self.assertEqual(results[0].source, full_payload["source"])
 
 
 class LazyImportBoundaryTests(unittest.TestCase):
