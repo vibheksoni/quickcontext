@@ -1013,6 +1013,51 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual([item["file_path"] for item in related], ["c.py"])
         self.assertEqual(related[0]["relations"][0]["relation"], "semantic_neighbor")
 
+    def test_tooling_related_semantic_neighbors_filters_to_scripts(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            results = [
+                SearchResult(0.9, "engine/src/qdrant_search.py", "RestQdrantSearchClient", "class", 1, 1, "", ""),
+                SearchResult(0.8, "scripts/search_phase_benchmark.py", "main", "function", 1, 1, "", ""),
+                SearchResult(0.7, "scripts/retrieval_benchmark.py", "main", "function", 1, 1, "", ""),
+            ]
+            with mock.patch.object(qc, "semantic_search", return_value=results):
+                related = qc._tooling_related_semantic_neighbors(
+                    query="How does the Qdrant phase benchmark separate client-side latency from Qdrant server time?",
+                    project_name="quickcontext",
+                    excluded_paths={"engine/src/qdrant_search.py"},
+                    related_file_limit=2,
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual([item["file_path"] for item in related], ["scripts/search_phase_benchmark.py", "scripts/retrieval_benchmark.py"])
+        self.assertEqual(related[0]["relations"][0]["relation"], "semantic_tooling_neighbor")
+
+    def test_looks_like_tooling_query_detects_benchmark_terms(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            self.assertTrue(qc._looks_like_tooling_query("How does the phase benchmark separate client-side latency from server time?"))
+            self.assertFalse(qc._looks_like_tooling_query("How are duplicate chunks collapsed before embedding?"))
+        finally:
+            qc.close()
+
     def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
         payload = {
             "file_path": str(Path("engine/src/searcher.py").resolve()),

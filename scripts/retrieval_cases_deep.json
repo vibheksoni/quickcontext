@@ -49,7 +49,7 @@
   },
   {
     "query": "How does the semantic search path avoid stale wrapper-heavy hits after moving QuickContext out of engine/__init__.py?",
-    "expected_paths": ["engine/src/searcher.py", "scripts/retrieval_cases_extended.json"]
+    "expected_paths": ["engine/src/searcher.py", "scripts/retrieval_benchmark.py"]
   },
   {
     "query": "How does the retrieval benchmark load case files and score top-rank hits against expected paths?",

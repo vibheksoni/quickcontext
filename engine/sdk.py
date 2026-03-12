@@ -59,6 +59,7 @@ from engine.src.parsing import (
     TraceNode,
 )
 from engine.src.differ import ChunkDiffer
+from engine.src.keywords import extract_keywords
 from engine.src.packer import (
     PackedOutput,
     PackedResult,
@@ -1276,11 +1277,17 @@ class QuickContext:
             anchor_limit=limit,
             related_file_limit=related_file_limit,
         )
+        tooling_neighbors = self._tooling_related_semantic_neighbors(
+            query=query,
+            project_name=project,
+            excluded_paths={item.file_path for item in anchors} | {item["file_path"] for item in semantic_neighbors},
+            related_file_limit=max(0, related_file_limit - len(semantic_neighbors)),
+        )
 
         related = self._related_files_for_results(
             results=anchors,
             related_seed_files=related_seed_files,
-            related_file_limit=max(0, related_file_limit - len(semantic_neighbors)),
+            related_file_limit=max(0, related_file_limit - len(semantic_neighbors) - len(tooling_neighbors)),
         )
         related_callers = self._related_callers_for_results(results)
 
@@ -1288,7 +1295,7 @@ class QuickContext:
             "query": query,
             "project_name": project,
             "results": anchors,
-            "related_files": semantic_neighbors + related,
+            "related_files": semantic_neighbors + tooling_neighbors + related,
             "related_callers": related_callers,
         }
 
@@ -1511,6 +1518,74 @@ class QuickContext:
             )
 
         return anchors, semantic_neighbors
+
+    def _tooling_related_semantic_neighbors(
+        self,
+        query: str,
+        project_name: str,
+        excluded_paths: set[str],
+        related_file_limit: int,
+    ) -> list[dict]:
+        """
+        Add script-centric semantic neighbors for benchmark and tooling questions.
+        """
+        if related_file_limit <= 0 or not self._looks_like_tooling_query(query):
+            return []
+
+        tooling_results = self.semantic_search(
+            query=query,
+            project_name=project_name,
+            limit=24,
+        )
+        related: list[dict] = []
+        for item in tooling_results:
+            file_path = str(item.file_path)
+            normalized = file_path.replace("\\", "/").lower()
+            if "/scripts/" not in normalized and not normalized.startswith("scripts/"):
+                continue
+            if file_path in excluded_paths:
+                continue
+            excluded_paths.add(file_path)
+            related.append(
+                {
+                    "file_path": file_path,
+                    "distance": 1,
+                    "relations": [
+                        {
+                            "relation": "semantic_tooling_neighbor",
+                            "seed_file": "",
+                            "module_path": "",
+                            "language": getattr(item, "language", None),
+                            "line": getattr(item, "line_start", 0),
+                        }
+                    ],
+                }
+            )
+            if len(related) >= related_file_limit:
+                break
+        return related
+
+    def _looks_like_tooling_query(self, query: str) -> bool:
+        """
+        Detect benchmark, instrumentation, and tooling-oriented questions.
+        """
+        keywords = set(extract_keywords(query, max_keywords=20))
+        return bool(
+            keywords.intersection(
+                {
+                    "benchmark",
+                    "latency",
+                    "server",
+                    "client",
+                    "coverage",
+                    "wrapper",
+                    "wrappers",
+                    "timing",
+                    "instrumentation",
+                    "phase",
+                }
+            )
+        )
 
     def _related_callers_for_results(self, results: list) -> list[dict]:
         """
