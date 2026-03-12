@@ -118,6 +118,12 @@ def main() -> None:
     print("phases:")
     for name in sorted(timings):
         print(f"  {name}_ms={round(timings[name], 2)} calls={counts[name]}")
+    response_meta = getattr(client, "last_response_meta", None)
+    if response_meta is not None:
+        if response_meta.server_time_ms is not None:
+            print(f"query_server_time_ms={round(response_meta.server_time_ms, 2)}")
+        print(f"query_response_bytes={response_meta.response_bytes}")
+        print(f"query_status_code={response_meta.status_code}")
     if results:
         top = results[0]
         print(f"top_file={top.file_path}")

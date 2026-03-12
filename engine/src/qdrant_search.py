@@ -23,6 +23,13 @@ class SearchRecord:
     payload: dict
 
 
+@dataclass(frozen=True, slots=True)
+class ResponseMeta:
+    server_time_ms: float | None
+    response_bytes: int
+    status_code: int
+
+
 class RestQdrantSearchClient:
     """
     Lightweight REST-only client for Qdrant search and retrieve operations.
@@ -33,6 +40,7 @@ class RestQdrantSearchClient:
         self._base_url = f"http://{config.host}:{config.port}"
         self._timeout = config.timeout
         self._session = requests.Session()
+        self._last_response_meta: ResponseMeta | None = None
         if config.api_key:
             self._session.headers["api-key"] = config.api_key
 
@@ -91,6 +99,10 @@ class RestQdrantSearchClient:
     def close(self) -> None:
         self._session.close()
 
+    @property
+    def last_response_meta(self) -> ResponseMeta | None:
+        return self._last_response_meta
+
     def _post_json(self, path: str, body: dict) -> dict:
         response = self._session.post(
             f"{self._base_url}{path}",
@@ -98,7 +110,14 @@ class RestQdrantSearchClient:
             timeout=self._timeout,
         )
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        server_time = payload.get("time")
+        self._last_response_meta = ResponseMeta(
+            server_time_ms=float(server_time) * 1000 if isinstance(server_time, (int, float)) else None,
+            response_bytes=len(response.content),
+            status_code=response.status_code,
+        )
+        return payload
 
     def _point_from_dict(self, item: dict) -> SearchPoint:
         return SearchPoint(
