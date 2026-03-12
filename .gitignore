@@ -291,4 +291,7 @@ openrouter_embedding_models.txt
 test/
 test_project/
 .*/
+!.github/
+!.github/workflows/
+!.github/workflows/ci.yml
 _ignore/
