@@ -251,8 +251,8 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(normalized_prefix, "engine/src")
         self.assertGreaterEqual(fetch_limit, 50)
         self.assertIsNotNone(query_filter)
-        must_conditions = query_filter.must or []
-        self.assertTrue(any(getattr(cond, "key", None) == "path_prefixes" for cond in must_conditions))
+        must_conditions = query_filter.get("must", [])
+        self.assertTrue(any(isinstance(cond, dict) and cond.get("key") == "path_prefixes" for cond in must_conditions))
 
     def test_batch_query_filter_does_not_reapply_keyword_overfetch(self) -> None:
         searcher = CodeSearcher(

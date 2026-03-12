@@ -208,10 +208,12 @@ class QuickContext:
         cache_key = f"{project_name}:rerank={rerank}"
 
         if cache_key not in self._searchers:
+            if self._config.qdrant is None:
+                raise RuntimeError("Qdrant is disabled (config.qdrant is None).")
+            from engine.src.qdrant_search import RestQdrantSearchClient
             from engine.src.searcher import CodeSearcher
-            collection = self._get_collection(project_name)
             self._searchers[cache_key] = CodeSearcher(
-                client=collection.client,
+                client=RestQdrantSearchClient(self._config.qdrant),
                 collection_name=project_name,
                 code_provider=self.code_provider,
                 desc_provider=self.desc_provider,
@@ -2272,6 +2274,10 @@ class QuickContext:
             self._conn.close()
         self._collections.clear()
         self._indexers.clear()
+        for searcher in self._searchers.values():
+            close = getattr(searcher, "close", None)
+            if callable(close):
+                close()
         self._searchers.clear()
 
     def __enter__(self) -> "QuickContext":

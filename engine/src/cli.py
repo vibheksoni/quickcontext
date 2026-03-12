@@ -721,94 +721,110 @@ def search(
     """
     config = ctx.obj["config"]
 
+    search_client = None
+    qc = None
     try:
-        with QuickContext(config) as qc:
-            project_name = project if project else detect_project_name(Path.cwd(), manual_override=None)
+        from engine.src.qdrant_search import RestQdrantSearchClient
+        from engine.src.searcher import CodeSearcher
 
-            if bias is not None:
-                from engine.src.search_modes import get_bias, apply_bias
-                bias_preset = get_bias(bias)
-                explicit_mode = mode if ctx.get_parameter_source("mode") == click.core.ParameterSource.COMMANDLINE else None
-                explicit_kw = use_keywords if use_keywords else None
-                explicit_kw_weight = keyword_weight if ctx.get_parameter_source("keyword_weight") == click.core.ParameterSource.COMMANDLINE else None
-                explicit_rerank = rerank if rerank else None
-                resolved = apply_bias(bias_preset, limit, mode=explicit_mode, use_keywords=explicit_kw, keyword_weight=explicit_kw_weight, rerank=explicit_rerank)
-                mode = resolved["vector_mode"]
-                limit = resolved["limit"]
-                use_keywords = resolved["use_keywords"]
-                keyword_weight = resolved["keyword_weight"]
-                rerank = resolved["rerank"]
-                bias_code_weight = resolved["code_weight"]
-                bias_desc_weight = resolved["desc_weight"]
+        qc = QuickContext(config)
+        project_name = project if project else detect_project_name(Path.cwd(), manual_override=None)
 
-            searcher = qc._get_searcher(project_name, rerank=rerank)
+        if bias is not None:
+            from engine.src.search_modes import get_bias, apply_bias
+            bias_preset = get_bias(bias)
+            explicit_mode = mode if ctx.get_parameter_source("mode") == click.core.ParameterSource.COMMANDLINE else None
+            explicit_kw = use_keywords if use_keywords else None
+            explicit_kw_weight = keyword_weight if ctx.get_parameter_source("keyword_weight") == click.core.ParameterSource.COMMANDLINE else None
+            explicit_rerank = rerank if rerank else None
+            resolved = apply_bias(bias_preset, limit, mode=explicit_mode, use_keywords=explicit_kw, keyword_weight=explicit_kw_weight, rerank=explicit_rerank)
+            mode = resolved["vector_mode"]
+            limit = resolved["limit"]
+            use_keywords = resolved["use_keywords"]
+            keyword_weight = resolved["keyword_weight"]
+            rerank = resolved["rerank"]
+            bias_code_weight = resolved["code_weight"]
+            bias_desc_weight = resolved["desc_weight"]
 
-            from engine.src.query_dsl import looks_like_structured_query, parse_structured_query
+        if config.qdrant is None:
+            raise RuntimeError("Qdrant is disabled in config. Search is unavailable.")
 
-            use_structured = structured or looks_like_structured_query(query)
-            if use_structured:
-                sub_queries = parse_structured_query(query)
-                results = searcher.search_structured(
-                    sub_queries=sub_queries,
-                    limit=limit,
-                    language=language,
-                    path_prefix=path,
-                    symbol_kind=symbol_kind,
-                    use_keywords=True,
-                    keyword_weight=keyword_weight,
-                    rerank=rerank,
-                    first_query_weight=first_query_weight,
-                    rrf_k=rrf_k,
-                    top_rank_bonus_1=rrf_bonus_top1,
-                    top_rank_bonus_2_3=rrf_bonus_top3,
-                    rerank_top3_retrieval_weight=rerank_top3_weight,
-                    rerank_top10_retrieval_weight=rerank_top10_weight,
-                    rerank_tail_retrieval_weight=rerank_tail_weight,
-                    rerank_candidate_multiplier=rerank_candidate_multiplier,
-                )
-                mode = "structured"
-            elif mode == "code":
-                results = searcher.search_code(query=query, limit=limit, language=language, path_prefix=path, symbol_kind=symbol_kind, use_keywords=use_keywords, keyword_weight=keyword_weight, rerank=rerank)
-            elif mode == "desc":
-                results = searcher.search_description(query=query, limit=limit, language=language, path_prefix=path, symbol_kind=symbol_kind, use_keywords=use_keywords, keyword_weight=keyword_weight, rerank=rerank)
-            elif bias is not None:
-                results = searcher.search_hybrid(
-                    query=query,
-                    limit=limit,
-                    code_weight=bias_code_weight,
-                    desc_weight=bias_desc_weight,
-                    language=language,
-                    path_prefix=path,
-                    symbol_kind=symbol_kind,
-                    use_keywords=use_keywords,
-                    keyword_weight=keyword_weight,
-                    rerank=rerank,
-                    rrf_k=rrf_k,
-                    top_rank_bonus_1=rrf_bonus_top1,
-                    top_rank_bonus_2_3=rrf_bonus_top3,
-                    rerank_top3_retrieval_weight=rerank_top3_weight,
-                    rerank_top10_retrieval_weight=rerank_top10_weight,
-                    rerank_tail_retrieval_weight=rerank_tail_weight,
-                    rerank_candidate_multiplier=rerank_candidate_multiplier,
-                )
-            else:
-                results = searcher.search_hybrid(
-                    query=query,
-                    limit=limit,
-                    language=language,
-                    path_prefix=path,
-                    symbol_kind=symbol_kind,
-                    use_keywords=use_keywords,
-                    keyword_weight=keyword_weight,
-                    rerank=rerank,
-                    rrf_k=rrf_k,
-                    top_rank_bonus_1=rrf_bonus_top1,
-                    top_rank_bonus_2_3=rrf_bonus_top3,
-                    rerank_top3_retrieval_weight=rerank_top3_weight,
-                    rerank_top10_retrieval_weight=rerank_top10_weight,
-                    rerank_tail_retrieval_weight=rerank_tail_weight,
-                    rerank_candidate_multiplier=rerank_candidate_multiplier,
-                )
+        search_client = RestQdrantSearchClient(config.qdrant)
+        reranker = qc._get_reranker() if rerank else None
+        searcher = CodeSearcher(
+            client=search_client,
+            collection_name=project_name,
+            code_provider=qc.code_provider,
+            desc_provider=qc.desc_provider,
+            reranker=reranker,
+        )
+
+        from engine.src.query_dsl import looks_like_structured_query, parse_structured_query
+
+        use_structured = structured or looks_like_structured_query(query)
+        if use_structured:
+            sub_queries = parse_structured_query(query)
+            results = searcher.search_structured(
+                sub_queries=sub_queries,
+                limit=limit,
+                language=language,
+                path_prefix=path,
+                symbol_kind=symbol_kind,
+                use_keywords=True,
+                keyword_weight=keyword_weight,
+                rerank=rerank,
+                first_query_weight=first_query_weight,
+                rrf_k=rrf_k,
+                top_rank_bonus_1=rrf_bonus_top1,
+                top_rank_bonus_2_3=rrf_bonus_top3,
+                rerank_top3_retrieval_weight=rerank_top3_weight,
+                rerank_top10_retrieval_weight=rerank_top10_weight,
+                rerank_tail_retrieval_weight=rerank_tail_weight,
+                rerank_candidate_multiplier=rerank_candidate_multiplier,
+            )
+            mode = "structured"
+        elif mode == "code":
+            results = searcher.search_code(query=query, limit=limit, language=language, path_prefix=path, symbol_kind=symbol_kind, use_keywords=use_keywords, keyword_weight=keyword_weight, rerank=rerank)
+        elif mode == "desc":
+            results = searcher.search_description(query=query, limit=limit, language=language, path_prefix=path, symbol_kind=symbol_kind, use_keywords=use_keywords, keyword_weight=keyword_weight, rerank=rerank)
+        elif bias is not None:
+            results = searcher.search_hybrid(
+                query=query,
+                limit=limit,
+                code_weight=bias_code_weight,
+                desc_weight=bias_desc_weight,
+                language=language,
+                path_prefix=path,
+                symbol_kind=symbol_kind,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=rerank,
+                rrf_k=rrf_k,
+                top_rank_bonus_1=rrf_bonus_top1,
+                top_rank_bonus_2_3=rrf_bonus_top3,
+                rerank_top3_retrieval_weight=rerank_top3_weight,
+                rerank_top10_retrieval_weight=rerank_top10_weight,
+                rerank_tail_retrieval_weight=rerank_tail_weight,
+                rerank_candidate_multiplier=rerank_candidate_multiplier,
+            )
+        else:
+            results = searcher.search_hybrid(
+                query=query,
+                limit=limit,
+                language=language,
+                path_prefix=path,
+                symbol_kind=symbol_kind,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=rerank,
+                rrf_k=rrf_k,
+                top_rank_bonus_1=rrf_bonus_top1,
+                top_rank_bonus_2_3=rrf_bonus_top3,
+                rerank_top3_retrieval_weight=rerank_top3_weight,
+                rerank_top10_retrieval_weight=rerank_top10_weight,
+                rerank_tail_retrieval_weight=rerank_tail_weight,
+                rerank_candidate_multiplier=rerank_candidate_multiplier,
+            )
 
             if not results:
                 console.print("[yellow]No results found[/yellow]")
@@ -908,6 +924,11 @@ def search(
     except Exception as exc:
         console.print(f"[red]Search failed:[/red] {exc}")
         sys.exit(1)
+    finally:
+        if search_client is not None:
+            search_client.close()
+        if qc is not None:
+            qc.close()
 
 
 @cli.command()

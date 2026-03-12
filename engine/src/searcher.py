@@ -7,9 +7,7 @@ import re
 from threading import Lock
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
-
-from qdrant_client import QdrantClient, models
+from typing import TYPE_CHECKING, Any, Optional
 
 from engine.src.keywords import (
     extract_keywords,
@@ -128,7 +126,7 @@ class CodeSearcher:
 
     def __init__(
         self,
-        client: QdrantClient,
+        client: Any,
         collection_name: str,
         code_provider: EmbeddingProvider,
         desc_provider: EmbeddingProvider,
@@ -151,6 +149,14 @@ class CodeSearcher:
         self._query_vector_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
         self._keyword_cache: OrderedDict[str, list[str]] = OrderedDict()
         self._metadata_token_cache: OrderedDict[str, list[str]] = OrderedDict()
+
+    def close(self) -> None:
+        """
+        Close the underlying search client if it supports cleanup.
+        """
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
 
     def search_code(
         self,
@@ -634,49 +640,28 @@ class CodeSearcher:
         filters = []
 
         if language:
-            filters.append(
-                models.FieldCondition(
-                    key="language",
-                    match=models.MatchValue(value=language),
-                )
-            )
+            filters.append(self._match_filter("language", language))
 
         if file_path:
-            filters.append(
-                models.FieldCondition(
-                    key="file_path",
-                    match=models.MatchValue(value=file_path),
-                )
-            )
+            filters.append(self._match_filter("file_path", file_path))
 
         normalized_path_prefix = None
         if path_prefix:
             normalized_path_prefix = path_prefix.replace("\\", "/").strip().strip("/").lower()
             if normalized_path_prefix:
-                filters.append(
-                    models.FieldCondition(
-                        key="path_prefixes",
-                        match=models.MatchValue(value=normalized_path_prefix),
-                    )
-                )
+                filters.append(self._match_filter("path_prefixes", normalized_path_prefix))
 
         if symbol_kind:
             filters.append(
-                models.Filter(
-                    should=[
-                        models.FieldCondition(
-                            key="symbol_kind",
-                            match=models.MatchValue(value=symbol_kind),
-                        ),
-                        models.FieldCondition(
-                            key="symbol_type",
-                            match=models.MatchValue(value=symbol_kind),
-                        ),
+                {
+                    "should": [
+                        self._match_filter("symbol_kind", symbol_kind),
+                        self._match_filter("symbol_type", symbol_kind),
                     ]
-                )
+                }
             )
 
-        query_filter = models.Filter(must=filters) if filters else None
+        query_filter = {"must": filters} if filters else None
 
         rerank_active = rerank and self._reranker is not None
         if rerank_active:
@@ -701,12 +686,9 @@ class CodeSearcher:
         if normalized_path_prefix and not results.points:
             fallback_filters = [
                 condition for condition in filters
-                if not (
-                    isinstance(condition, models.FieldCondition)
-                    and getattr(condition, "key", None) == "path_prefixes"
-                )
+                if not (isinstance(condition, dict) and condition.get("key") == "path_prefixes")
             ]
-            fallback_filter = models.Filter(must=fallback_filters) if fallback_filters else None
+            fallback_filter = {"must": fallback_filters} if fallback_filters else None
             results = self._client.query_points(
                 collection_name=self._collection_name,
                 query=query_vector,
@@ -814,7 +796,7 @@ class CodeSearcher:
         if not requests:
             return []
 
-        query_requests: list[models.QueryRequest] = []
+        query_requests: list[dict] = []
         contexts: list[dict] = []
 
         for request in requests:
@@ -829,13 +811,14 @@ class CodeSearcher:
                 apply_keyword_overfetch=False,
             )
             query_requests.append(
-                models.QueryRequest(
-                    query=request["query_vector"],
-                    using=request["using"],
-                    filter=query_filter,
-                    limit=fetch_limit,
-                    with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
-                )
+                {
+                    "query": request["query_vector"],
+                    "using": request["using"],
+                    "filter": query_filter,
+                    "limit": fetch_limit,
+                    "with_payload": LIGHT_RESULT_PAYLOAD_FIELDS,
+                    "with_vector": False,
+                }
             )
             contexts.append(
                 {
@@ -898,7 +881,7 @@ class CodeSearcher:
         ranking_keywords: list[str],
         rerank: bool,
         apply_keyword_overfetch: bool = True,
-    ) -> tuple[Optional[models.Filter], Optional[str], int]:
+    ) -> tuple[Optional[dict], Optional[str], int]:
         """
         Build Qdrant filter and fetch sizing for a search request.
 
@@ -907,49 +890,28 @@ class CodeSearcher:
         filters = []
 
         if language:
-            filters.append(
-                models.FieldCondition(
-                    key="language",
-                    match=models.MatchValue(value=language),
-                )
-            )
+            filters.append(self._match_filter("language", language))
 
         if file_path:
-            filters.append(
-                models.FieldCondition(
-                    key="file_path",
-                    match=models.MatchValue(value=file_path),
-                )
-            )
+            filters.append(self._match_filter("file_path", file_path))
 
         normalized_path_prefix = None
         if path_prefix:
             normalized_path_prefix = path_prefix.replace("\\", "/").strip().strip("/").lower()
             if normalized_path_prefix:
-                filters.append(
-                    models.FieldCondition(
-                        key="path_prefixes",
-                        match=models.MatchValue(value=normalized_path_prefix),
-                    )
-                )
+                filters.append(self._match_filter("path_prefixes", normalized_path_prefix))
 
         if symbol_kind:
             filters.append(
-                models.Filter(
-                    should=[
-                        models.FieldCondition(
-                            key="symbol_kind",
-                            match=models.MatchValue(value=symbol_kind),
-                        ),
-                        models.FieldCondition(
-                            key="symbol_type",
-                            match=models.MatchValue(value=symbol_kind),
-                        ),
+                {
+                    "should": [
+                        self._match_filter("symbol_kind", symbol_kind),
+                        self._match_filter("symbol_type", symbol_kind),
                     ]
-                )
+                }
             )
 
-        query_filter = models.Filter(must=filters) if filters else None
+        query_filter = {"must": filters} if filters else None
 
         rerank_active = rerank and self._reranker is not None
         if rerank_active:
@@ -970,7 +932,7 @@ class CodeSearcher:
         language: Optional[str],
         file_path: Optional[str],
         symbol_kind: Optional[str],
-    ) -> Optional[models.Filter]:
+    ) -> Optional[dict]:
         """
         Build a fallback filter without path-prefix constraints.
         """
@@ -1078,6 +1040,12 @@ class CodeSearcher:
 
         search_results.sort(key=lambda item: item.score, reverse=True)
         return search_results
+
+    def _match_filter(self, key: str, value: str) -> dict:
+        """
+        Build a simple exact-match filter clause for the REST search client.
+        """
+        return {"key": key, "match": {"value": value}}
 
     def _hydrate_results(self, results: list[SearchResult]) -> list[SearchResult]:
         """
