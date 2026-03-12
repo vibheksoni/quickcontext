@@ -1381,6 +1381,7 @@ class QuickContext:
             f"QuickContext semantic index for project '{project}' has {points} chunks.",
             "Use 'search' for standard semantic retrieval.",
             "Use structured mode with lex:/vec:/hyde: lines for intent-controlled retrieval.",
+            "Use semantic_search_bundle(...) for broader cross-file or architecture questions that need follow-up files.",
             "Use --rerank for higher precision when candidate count is broad.",
             "Use --path to scope retrieval and reduce noise.",
         ]
