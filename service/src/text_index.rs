@@ -19,7 +19,7 @@ const TEXT_INDEX_SCHEMA_VERSION: u32 = 2;
 const BM25_K1: f64 = 1.5;
 const BM25_B: f64 = 0.5;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
-const REFRESH_DEBOUNCE_MS: u128 = 1000;
+const REFRESH_DEBOUNCE_MS: u128 = 5000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TextDocRecord {

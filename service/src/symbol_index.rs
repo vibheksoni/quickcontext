@@ -25,7 +25,7 @@ use crate::types::{
 
 const STATE_KEY: &str = "state";
 const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot");
-const REFRESH_DEBOUNCE_MS: u128 = 1000;
+const REFRESH_DEBOUNCE_MS: u128 = 5000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SymbolRecord {
