@@ -9,12 +9,14 @@ from pathlib import Path
 import builtins
 
 from engine.__main__ import _find_command
+from engine.sdk import QuickContext
 from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.config import EngineConfig, QdrantConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
 from engine.src.cli import _optimize_search_config
+from engine.src.parsing import ImportEdge
 from engine.src.qdrant import QdrantConnection
 from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS, SearchResult
 
@@ -854,6 +856,93 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("engine/src/searcher.py", description.description.replace("\\", "/"))
         self.assertIn("query", description.keywords)
         self.assertIn("searcher", description.keywords)
+
+    def test_merge_related_edges_deduplicates_related_files(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            related_by_path: dict[str, dict] = {}
+            qc._merge_related_edges(
+                seed_file="a.py",
+                relation="imports",
+                edges=[
+                    ImportEdge(
+                        source_file="a.py",
+                        target_file="b.py",
+                        import_statement="import b",
+                        module_path="b",
+                        language="python",
+                        line=1,
+                    ),
+                    ImportEdge(
+                        source_file="a.py",
+                        target_file="b.py",
+                        import_statement="from b import c",
+                        module_path="b",
+                        language="python",
+                        line=2,
+                    ),
+                ],
+                related_by_path=related_by_path,
+                excluded_paths={"a.py"},
+            )
+        finally:
+            qc.close()
+
+        self.assertIn("b.py", related_by_path)
+        self.assertEqual(len(related_by_path["b.py"]["relations"]), 2)
+
+    def test_related_files_for_results_collects_import_graph_neighbors(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            result_item = type("ResultItem", (), {"file_path": "a.py"})()
+            graph_result = type(
+                "GraphResult",
+                (),
+                {
+                    "edges": [
+                        ImportEdge(
+                            source_file="a.py",
+                            target_file="b.py",
+                            import_statement="import b",
+                            module_path="b",
+                            language="python",
+                            line=1,
+                        )
+                    ]
+                },
+            )()
+            with mock.patch.object(qc, "import_graph", return_value=graph_result), mock.patch.object(
+                qc,
+                "find_importers",
+                return_value=type("GraphResult", (), {"edges": []})(),
+            ):
+                related = qc._related_files_for_results(
+                    results=[result_item],
+                    related_seed_files=1,
+                    related_file_limit=4,
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual(len(related), 1)
+        self.assertEqual(related[0]["file_path"], "b.py")
+        self.assertEqual(related[0]["relations"][0]["relation"], "imports")
 
     def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
         payload = {

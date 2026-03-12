@@ -37,6 +37,7 @@ from engine.src.parsing import (
     FileReadLine,
     FileReadResult,
     GrepResult,
+    ImportEdge,
     ImportGraphResult,
     PatternMatchCapture,
     PatternMatchItem,
@@ -1238,6 +1239,52 @@ class QuickContext:
             rerank_candidate_multiplier=rerank_candidate_multiplier,
         )
 
+    def semantic_search_bundle(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        limit: int = 5,
+        language: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        project_name: Optional[str] = None,
+        use_keywords: bool = False,
+        keyword_weight: float = 0.3,
+        rerank: bool = False,
+        related_seed_files: int = 1,
+        related_file_limit: int = 6,
+    ) -> dict:
+        """
+        Run semantic retrieval and expand related files from the import graph around top hits.
+
+        This is intended for deeper AI workflows that need both the best semantic anchors
+        and a small set of adjacent files to inspect next.
+        """
+        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+        results = self.semantic_search(
+            query=query,
+            mode=mode,
+            limit=limit,
+            language=language,
+            path_prefix=path_prefix,
+            project_name=project,
+            use_keywords=use_keywords,
+            keyword_weight=keyword_weight,
+            rerank=rerank,
+        )
+
+        related = self._related_files_for_results(
+            results=results,
+            related_seed_files=related_seed_files,
+            related_file_limit=related_file_limit,
+        )
+
+        return {
+            "query": query,
+            "project_name": project,
+            "results": results,
+            "related_files": related,
+        }
+
     def structured_search(
         self,
         query: str,
@@ -1328,6 +1375,90 @@ class QuickContext:
             lines.append("Index appears empty. Run index before relying on semantic search.")
 
         return "\n".join(lines)
+
+    def _related_files_for_results(
+        self,
+        results: list,
+        related_seed_files: int,
+        related_file_limit: int,
+    ) -> list[dict]:
+        """
+        Collect a small, deduplicated set of related files around the top semantic hits.
+        """
+        if not results or related_file_limit <= 0 or related_seed_files <= 0:
+            return []
+
+        seeds: list[str] = []
+        seen_seed_files: set[str] = set()
+        for result in results:
+            file_path = str(result.file_path)
+            if file_path in seen_seed_files:
+                continue
+            seen_seed_files.add(file_path)
+            seeds.append(file_path)
+            if len(seeds) >= related_seed_files:
+                break
+
+        related_by_path: dict[str, dict] = {}
+        excluded_paths = set(seeds)
+        project_root = Path.cwd().resolve()
+
+        for seed_file in seeds:
+            outgoing = self.import_graph(file=seed_file, path=project_root)
+            incoming = self.find_importers(file=seed_file, path=project_root)
+            self._merge_related_edges(
+                seed_file=seed_file,
+                relation="imports",
+                edges=outgoing.edges,
+                related_by_path=related_by_path,
+                excluded_paths=excluded_paths,
+            )
+            self._merge_related_edges(
+                seed_file=seed_file,
+                relation="imported_by",
+                edges=incoming.edges,
+                related_by_path=related_by_path,
+                excluded_paths=excluded_paths,
+            )
+
+        related = sorted(
+            related_by_path.values(),
+            key=lambda item: (item["distance"], item["file_path"]),
+        )
+        return related[:related_file_limit]
+
+    def _merge_related_edges(
+        self,
+        seed_file: str,
+        relation: str,
+        edges: list[ImportEdge],
+        related_by_path: dict[str, dict],
+        excluded_paths: set[str],
+    ) -> None:
+        """
+        Merge import-graph edges into a deduplicated related-file map.
+        """
+        for edge in edges:
+            candidate = edge.target_file if relation == "imports" else edge.source_file
+            if not candidate or candidate in excluded_paths:
+                continue
+            item = related_by_path.setdefault(
+                candidate,
+                {
+                    "file_path": candidate,
+                    "distance": 1,
+                    "relations": [],
+                },
+            )
+            item["relations"].append(
+                {
+                    "relation": relation,
+                    "seed_file": seed_file,
+                    "module_path": edge.module_path,
+                    "language": edge.language,
+                    "line": edge.line,
+                }
+            )
 
     def index_directory(
         self,
