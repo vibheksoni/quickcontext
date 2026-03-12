@@ -21,6 +21,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None, help="Path to quickcontext config JSON.")
     parser.add_argument("--project", default="quickcontext", help="Indexed project name.")
     parser.add_argument("--cases-file", required=True, help="JSON file containing benchmark cases.")
+    parser.add_argument("--strategy", choices=("semantic", "bundle", "auto"), default="bundle", help="Retrieval strategy to benchmark.")
     parser.add_argument("--limit", type=int, default=3, help="Semantic result limit.")
     parser.add_argument("--related-seed-files", type=int, default=1, help="Seed files for graph expansion.")
     parser.add_argument("--related-file-limit", type=int, default=8, help="Related files to return.")
@@ -73,13 +74,32 @@ def main() -> None:
             query = case["query"]
             expected_paths = [str(path) for path in case["expected_paths"]]
             started = time.perf_counter()
-            bundle = qc.semantic_search_bundle(
-                query=query,
-                project_name=args.project,
-                limit=args.limit,
-                related_seed_files=args.related_seed_files,
-                related_file_limit=args.related_file_limit,
-            )
+            if args.strategy == "semantic":
+                bundle = {
+                    "results": qc.semantic_search(
+                        query=query,
+                        project_name=args.project,
+                        limit=args.limit,
+                    ),
+                    "related_files": [],
+                    "related_callers": [],
+                }
+            elif args.strategy == "auto":
+                bundle = qc.semantic_search_auto(
+                    query=query,
+                    project_name=args.project,
+                    limit=args.limit,
+                    related_seed_files=args.related_seed_files,
+                    related_file_limit=args.related_file_limit,
+                )
+            else:
+                bundle = qc.semantic_search_bundle(
+                    query=query,
+                    project_name=args.project,
+                    limit=args.limit,
+                    related_seed_files=args.related_seed_files,
+                    related_file_limit=args.related_file_limit,
+                )
             latencies.append((time.perf_counter() - started) * 1000)
 
             result_paths = [item.file_path for item in bundle["results"]]
@@ -94,11 +114,12 @@ def main() -> None:
 
     print("Summary")
     print(f"  Cases: {len(hit_ranks)}")
+    print(f"  Strategy: {args.strategy}")
     print(f"  Hit@1: {hit1}/{len(hit_ranks)}")
     print(f"  Hit@3: {hit3}/{len(hit_ranks)}")
     print(f"  MRR: {mrr:.4f}")
-    print(f"  Mean semantic top-3 coverage: {sum(result_coverages) / len(result_coverages):.4f}")
-    print(f"  Mean bundle coverage: {sum(bundle_coverages) / len(bundle_coverages):.4f}")
+    print(f"  Mean anchor top-3 coverage: {sum(result_coverages) / len(result_coverages):.4f}")
+    print(f"  Mean context coverage: {sum(bundle_coverages) / len(bundle_coverages):.4f}")
     print(f"  Mean latency: {mean(latencies):.2f} ms")
     print(f"  Median latency: {median(latencies):.2f} ms")
 
