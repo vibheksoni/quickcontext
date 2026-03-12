@@ -16,7 +16,7 @@ from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
 from engine.src.cli import _optimize_search_config
 from engine.src.qdrant import QdrantConnection
-from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS
+from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS, SearchResult
 
 
 @dataclass(frozen=True)
@@ -272,6 +272,21 @@ class RegressionTests(unittest.TestCase):
             )
 
         self.assertEqual(len(results), 1)
+
+    def test_diversify_results_prefers_distinct_files_for_broad_queries(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        results = [
+            SearchResult(0.9, "a.py", "one", "function", 1, 1, "", ""),
+            SearchResult(0.8, "a.py", "two", "function", 2, 2, "", ""),
+            SearchResult(0.7, "b.py", "three", "function", 1, 1, "", ""),
+        ]
+        diversified = searcher._diversify_results(results, ["broad"] * 10, 3)
+        self.assertEqual([item.file_path for item in diversified], ["a.py", "b.py", "a.py"])
 
     def test_hybrid_request_limit_uses_lower_candidate_floor(self) -> None:
         searcher = CodeSearcher(

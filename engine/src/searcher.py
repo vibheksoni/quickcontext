@@ -377,7 +377,8 @@ class CodeSearcher:
                 candidate_multiplier=rerank_candidate_multiplier,
             )
 
-        return self._finalize_results(fused[:limit], include_source=include_source)
+        diversified = self._diversify_results(fused, ranking_keywords, limit)
+        return self._finalize_results(diversified, include_source=include_source)
 
     def _hybrid_request_limit(self, limit: int, ranking_keywords: Optional[list[str]] = None) -> int:
         """
@@ -497,7 +498,16 @@ class CodeSearcher:
                 candidate_multiplier=rerank_candidate_multiplier,
             )
 
-        return self._finalize_results(fused[:limit], include_source=include_source)
+        broad_keywords: list[str] = []
+        seen_keywords: set[str] = set()
+        for sub in sub_queries:
+            for keyword in self._extract_keywords_cached(sub.text):
+                if keyword in seen_keywords:
+                    continue
+                seen_keywords.add(keyword)
+                broad_keywords.append(keyword)
+        diversified = self._diversify_results(fused, broad_keywords, limit)
+        return self._finalize_results(diversified, include_source=include_source)
 
     def _result_key(self, result: SearchResult) -> str:
         """
@@ -824,7 +834,8 @@ class CodeSearcher:
         if rerank_active:
             return self._blend_with_rerank(query, search_results, limit)
 
-        return self._finalize_results(search_results[:limit], include_source=include_source)
+        diversified = self._diversify_results(search_results, ranking_keywords, limit)
+        return self._finalize_results(diversified, include_source=include_source)
 
     def _batch_search(self, requests: list[dict]) -> list[list[SearchResult]]:
         """
@@ -1167,6 +1178,54 @@ class CodeSearcher:
         if not include_source:
             return results
         return self._hydrate_results(results)
+
+    def _diversify_results(
+        self,
+        results: list[SearchResult],
+        ranking_keywords: list[str],
+        limit: int,
+    ) -> list[SearchResult]:
+        """
+        Prefer distinct files in early ranks for broad architecture questions.
+        """
+        if len(ranking_keywords) < 10 or limit <= 1:
+            return results[:limit]
+
+        unique: list[SearchResult] = []
+        duplicates: list[SearchResult] = []
+        seen_paths: set[str] = set()
+        for result in results:
+            if result.file_path in seen_paths:
+                duplicates.append(result)
+                continue
+            seen_paths.add(result.file_path)
+            unique.append(result)
+
+        return (unique + duplicates)[:limit]
+
+    def _diversify_results(
+        self,
+        results: list[SearchResult],
+        ranking_keywords: list[str],
+        limit: int,
+    ) -> list[SearchResult]:
+        """
+        Prefer distinct files in early ranks for broad architecture questions.
+        """
+        if len(ranking_keywords) < 10 or limit <= 1:
+            return results[:limit]
+
+        unique: list[SearchResult] = []
+        duplicates: list[SearchResult] = []
+        seen_paths: set[str] = set()
+        for result in results:
+            if result.file_path in seen_paths:
+                duplicates.append(result)
+                continue
+            seen_paths.add(result.file_path)
+            unique.append(result)
+
+        return (unique + duplicates)[:limit]
 
     def _can_share_query_embedding(self) -> bool:
         """
