@@ -1058,6 +1058,56 @@ class RegressionTests(unittest.TestCase):
         finally:
             qc.close()
 
+    def test_should_use_bundle_for_broad_cross_file_query(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            self.assertTrue(
+                qc._should_use_bundle_for_query(
+                    "How are file path prefixes generated during indexing and then used during retrieval filtering?"
+                )
+            )
+            self.assertFalse(qc._should_use_bundle_for_query("Where are query embeddings cached?"))
+        finally:
+            qc.close()
+
+    def test_semantic_search_auto_routes_between_search_and_bundle(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with mock.patch.object(qc, "semantic_search", return_value=["plain"]) as plain, mock.patch.object(
+                qc,
+                "semantic_search_bundle",
+                return_value={"query": "x", "project_name": "p", "results": ["bundle"], "related_files": [], "related_callers": []},
+            ) as bundle:
+                simple = qc.semantic_search_auto("Where are query embeddings cached?")
+                broad = qc.semantic_search_auto(
+                    "How are file path prefixes generated during indexing and then used during retrieval filtering?"
+                )
+        finally:
+            qc.close()
+
+        plain.assert_called_once()
+        bundle.assert_called_once()
+        self.assertEqual(simple["mode"], "search")
+        self.assertEqual(simple["results"], ["plain"])
+        self.assertEqual(broad["mode"], "bundle")
+        self.assertEqual(broad["results"], ["bundle"])
+
     def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
         payload = {
             "file_path": str(Path("engine/src/searcher.py").resolve()),

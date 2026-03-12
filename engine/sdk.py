@@ -1299,6 +1299,60 @@ class QuickContext:
             "related_callers": related_callers,
         }
 
+    def semantic_search_auto(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        limit: int = 5,
+        language: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        project_name: Optional[str] = None,
+        use_keywords: bool = False,
+        keyword_weight: float = 0.3,
+        rerank: bool = False,
+        related_seed_files: int = 1,
+        related_file_limit: int = 8,
+    ) -> dict:
+        """
+        Automatically choose between plain semantic search and the graph-aware bundle primitive.
+        """
+        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+        if self._should_use_bundle_for_query(query):
+            bundle = self.semantic_search_bundle(
+                query=query,
+                mode=mode,
+                limit=limit,
+                language=language,
+                path_prefix=path_prefix,
+                project_name=project,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=rerank,
+                related_seed_files=related_seed_files,
+                related_file_limit=related_file_limit,
+            )
+            bundle["mode"] = "bundle"
+            return bundle
+
+        return {
+            "query": query,
+            "project_name": project,
+            "mode": "search",
+            "results": self.semantic_search(
+                query=query,
+                mode=mode,
+                limit=limit,
+                language=language,
+                path_prefix=path_prefix,
+                project_name=project,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=rerank,
+            ),
+            "related_files": [],
+            "related_callers": [],
+        }
+
     def structured_search(
         self,
         query: str,
@@ -1380,6 +1434,7 @@ class QuickContext:
         lines = [
             f"QuickContext semantic index for project '{project}' has {points} chunks.",
             "Use 'search' for standard semantic retrieval.",
+            "Use semantic_search_auto(...) when you want the SDK to choose between fast direct retrieval and a deeper graph-aware bundle.",
             "Use structured mode with lex:/vec:/hyde: lines for intent-controlled retrieval.",
             "Use semantic_search_bundle(...) for broader cross-file or architecture questions that need follow-up files.",
             "Use --rerank for higher precision when candidate count is broad.",
@@ -1587,6 +1642,60 @@ class QuickContext:
                 }
             )
         )
+
+    def _should_use_bundle_for_query(self, query: str) -> bool:
+        """
+        Detect broad cross-file and pipeline questions that benefit from bundle expansion.
+        """
+        keywords = set(extract_keywords(query, max_keywords=20))
+        if len(keywords) < 6:
+            return False
+
+        flow_terms = {
+            "across",
+            "through",
+            "between",
+            "without",
+            "before",
+            "after",
+            "into",
+            "carried",
+            "carry",
+            "copied",
+            "copy",
+            "generated",
+            "route",
+            "routed",
+            "dependencies",
+            "dependency",
+            "importers",
+            "callers",
+            "cross",
+        }
+        architecture_terms = {
+            "path",
+            "prefix",
+            "payload",
+            "payloads",
+            "vector",
+            "vectors",
+            "index",
+            "indexed",
+            "indexing",
+            "filter",
+            "filters",
+            "collection",
+            "graph",
+            "context",
+            "benchmark",
+            "latency",
+            "server",
+            "client",
+            "coverage",
+            "wrapper",
+            "wrappers",
+        }
+        return bool(keywords.intersection(flow_terms)) and len(keywords.intersection(architecture_terms)) >= 2
 
     def _related_callers_for_results(self, results: list) -> list[dict]:
         """

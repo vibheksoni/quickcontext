@@ -80,13 +80,15 @@ Important config ideas:
 Useful SDK retrieval primitives:
 
 - `QuickContext.semantic_search(...)`: main semantic retrieval path
+- `QuickContext.semantic_search_auto(...)`: lets the SDK choose between fast direct retrieval and the deeper bundle path
 - `QuickContext.structured_search(...)`: typed multi-query retrieval
 - `QuickContext.semantic_search_bundle(...)`: semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper follow-up exploration
 
 Recommendation:
 
 - Use `semantic_search(...)` for fast single-hop retrieval.
-- Use `semantic_search_bundle(...)` when the question is broad, architectural, or likely to require cross-file follow-up context.
+- Use `semantic_search_auto(...)` as the safest default for AI workflows.
+- Use `semantic_search_bundle(...)` directly when you already know the question is broad, architectural, or likely to require cross-file follow-up context.
 
 ## Important Rust Modules
 

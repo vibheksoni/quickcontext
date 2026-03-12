@@ -11,10 +11,12 @@ It currently has two main parts:
 
 The SDK now also includes a graph-aware context helper:
 
+- `QuickContext.semantic_search_auto(...)`
+  Lets the SDK choose between fast direct retrieval and the deeper graph-aware bundle path.
 - `QuickContext.semantic_search_bundle(...)`
   Returns semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper codebase exploration.
 
-Use `semantic_search(...)` for fast direct retrieval and `semantic_search_bundle(...)` when the question is broad or likely to require cross-file follow-up context.
+Use `semantic_search(...)` for fast direct retrieval, `semantic_search_auto(...)` as the safest default for AI workflows, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
 
 ## Status
 
