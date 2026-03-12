@@ -944,6 +944,50 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(related[0]["file_path"], "b.py")
         self.assertEqual(related[0]["relations"][0]["relation"], "imports")
 
+    def test_related_callers_for_results_collects_callers_for_top_callable(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            result_item = type(
+                "ResultItem",
+                (),
+                {"symbol_name": "build_chunks", "symbol_kind": "function"},
+            )()
+            caller_result = type(
+                "CallerResult",
+                (),
+                {
+                    "callers": [
+                        type(
+                            "CallerRow",
+                            (),
+                            {
+                                "caller_name": "index_directory",
+                                "caller_kind": "function",
+                                "caller_file_path": "engine/sdk.py",
+                                "caller_line": 1200,
+                                "caller_language": "python",
+                            },
+                        )()
+                    ]
+                },
+            )()
+            with mock.patch.object(qc, "find_callers", return_value=caller_result):
+                related = qc._related_callers_for_results([result_item])
+        finally:
+            qc.close()
+
+        self.assertEqual(len(related), 1)
+        self.assertEqual(related[0]["symbol"], "build_chunks")
+        self.assertEqual(related[0]["caller_name"], "index_directory")
+
     def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
         payload = {
             "file_path": str(Path("engine/src/searcher.py").resolve()),

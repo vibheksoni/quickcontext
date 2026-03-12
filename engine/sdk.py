@@ -1277,12 +1277,14 @@ class QuickContext:
             related_seed_files=related_seed_files,
             related_file_limit=related_file_limit,
         )
+        related_callers = self._related_callers_for_results(results)
 
         return {
             "query": query,
             "project_name": project,
             "results": results,
             "related_files": related,
+            "related_callers": related_callers,
         }
 
     def structured_search(
@@ -1459,6 +1461,37 @@ class QuickContext:
                     "line": edge.line,
                 }
             )
+
+    def _related_callers_for_results(self, results: list) -> list[dict]:
+        """
+        Collect caller rows around the top callable semantic anchor.
+        """
+        if not results:
+            return []
+
+        top = results[0]
+        if str(getattr(top, "symbol_kind", "")).lower() not in {"function", "method"}:
+            return []
+
+        caller_rows = self.find_callers(symbol=top.symbol_name, path=Path.cwd(), limit=8)
+        related: list[dict] = []
+        seen: set[tuple[str, str, int]] = set()
+        for caller in caller_rows.callers:
+            key = (caller.caller_file_path, caller.caller_name, caller.caller_line)
+            if key in seen:
+                continue
+            seen.add(key)
+            related.append(
+                {
+                    "symbol": top.symbol_name,
+                    "caller_name": caller.caller_name,
+                    "caller_kind": caller.caller_kind,
+                    "caller_file_path": caller.caller_file_path,
+                    "caller_line": caller.caller_line,
+                    "language": caller.caller_language,
+                }
+            )
+        return related
 
     def index_directory(
         self,
