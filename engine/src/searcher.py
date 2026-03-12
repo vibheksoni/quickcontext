@@ -27,7 +27,7 @@ TOP_RANK_BONUS_2_3 = 0.02
 QUERY_CACHE_SIZE = 256
 DISK_QUERY_CACHE_LIMIT = 512
 METADATA_TOKEN_CACHE_SIZE = 2048
-HYBRID_REQUEST_MIN_LIMIT = 18
+HYBRID_REQUEST_MIN_LIMIT = 16
 TOKEN_SYNONYMS = {
     "remove": ("delete", "deletion"),
     "delete": ("remove", "removed"),
@@ -726,6 +726,7 @@ class CodeSearcher:
             final_score *= self._kind_score_multiplier(symbol_kind_value, len(ranking_keywords))
             final_score *= self._path_signal_multiplier(file_path_value, ranking_keywords)
             final_score += self._basename_hit_bonus(file_path_value, ranking_keywords)
+            final_score += self._provider_path_bonus(file_path_value, ranking_keywords)
             final_score *= self._container_symbol_penalty(symbol_name_value, symbol_kind_value, ranking_keywords)
             if ranking_keywords:
                 symbol_tokens = self._symbol_tokens(
@@ -986,6 +987,7 @@ class CodeSearcher:
             final_score *= self._kind_score_multiplier(symbol_kind_value, len(ranking_keywords))
             final_score *= self._path_signal_multiplier(file_path_value, ranking_keywords)
             final_score += self._basename_hit_bonus(file_path_value, ranking_keywords)
+            final_score += self._provider_path_bonus(file_path_value, ranking_keywords)
             final_score *= self._container_symbol_penalty(symbol_name_value, symbol_kind_value, ranking_keywords)
             if ranking_keywords:
                 symbol_tokens = self._symbol_tokens(
@@ -1489,6 +1491,28 @@ class CodeSearcher:
         if hits < 2:
             return 0.0
         return hits * 0.08
+
+    def _provider_path_bonus(self, file_path: str, ranking_keywords: list[str]) -> float:
+        """
+        Prefer provider modules for provider-loading and startup dependency queries.
+        """
+        if not ranking_keywords:
+            return 0.0
+
+        keyword_set = set(ranking_keywords)
+        if not keyword_set.intersection({"provider", "providers", "dependency", "dependencies"}):
+            return 0.0
+        if not keyword_set.intersection({"load", "loaded", "lazy", "start", "faster", "import"}):
+            return 0.0
+
+        normalized = file_path.replace("\\", "/").lower()
+        if "/providers/" not in normalized:
+            return 0.0
+
+        bonus = 0.06
+        if normalized.endswith("/factory.py"):
+            bonus += 0.03
+        return bonus
 
     def _container_symbol_penalty(
         self,

@@ -278,7 +278,7 @@ class RegressionTests(unittest.TestCase):
             desc_provider=_FakeProvider("desc", 2),
         )
 
-        self.assertEqual(searcher._hybrid_request_limit(5), 18)
+        self.assertEqual(searcher._hybrid_request_limit(5), 16)
         self.assertEqual(searcher._hybrid_request_limit(10), 30)
 
     def test_path_prefix_filter_builds_server_side_constraint(self) -> None:
@@ -398,6 +398,24 @@ class RegressionTests(unittest.TestCase):
             ["text", "index", "refresh"],
         )
         self.assertGreater(bonus, 0.0)
+
+    def test_provider_path_bonus_prefers_provider_modules_for_loading_queries(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        bonus = searcher._provider_path_bonus(
+            str(Path("engine/src/providers/fastembed_provider.py").resolve()),
+            ["provider", "dependencies", "loaded", "cli", "start", "faster"],
+        )
+        neutral = searcher._provider_path_bonus(
+            str(Path("engine/src/cli.py").resolve()),
+            ["provider", "dependencies", "loaded", "cli", "start", "faster"],
+        )
+        self.assertGreater(bonus, 0.0)
+        self.assertEqual(neutral, 0.0)
 
     def test_action_query_boosts_matching_symbol_action(self) -> None:
         searcher = CodeSearcher(
