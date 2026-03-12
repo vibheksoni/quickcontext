@@ -206,6 +206,9 @@ class QdrantIndexer:
         if chunk.chunk.visibility:
             payload["visibility"] = chunk.chunk.visibility
 
+        if chunk.chunk.role:
+            payload["role"] = chunk.chunk.role
+
         path_prefixes = self._build_path_prefixes(chunk.chunk.file_path)
         if path_prefixes:
             payload["path_prefixes"] = path_prefixes
@@ -461,6 +464,7 @@ class QdrantIndexer:
                     docstring=payload.get("docstring"),
                     parent=payload.get("parent"),
                     visibility=payload.get("visibility"),
+                    role=payload.get("role"),
                 ))
 
         return grouped

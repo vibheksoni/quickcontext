@@ -28,6 +28,7 @@ class CodeChunk:
         docstring: Documentation string if available
         parent: Parent symbol name (class for methods, module for functions)
         visibility: Access modifier (public, private, etc)
+        role: Architectural role classification if available
         file_hash: Hash of entire file content for change detection
     """
     chunk_id: str
@@ -44,6 +45,7 @@ class CodeChunk:
     docstring: Optional[str]
     parent: Optional[str]
     visibility: Optional[str]
+    role: Optional[str]
     file_hash: str
 
 
@@ -157,6 +159,7 @@ class ChunkBuilder:
             docstring=symbol.docstring,
             parent=symbol.parent,
             visibility=symbol.visibility,
+            role=symbol.role,
             file_hash=file_hash,
         )
 
@@ -199,6 +202,7 @@ class ChunkBuilder:
                 docstring=None,
                 parent=None,
                 visibility=None,
+                role=None,
                 file_hash=file_hash,
             ))
         else:
@@ -238,6 +242,7 @@ class ChunkBuilder:
                     docstring=None,
                     parent=None,
                     visibility=None,
+                    role=None,
                     file_hash=file_hash,
                 ))
 

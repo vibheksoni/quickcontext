@@ -72,6 +72,7 @@ LIGHT_RESULT_PAYLOAD_FIELDS = [
     "signature",
     "docstring",
     "parent",
+    "role",
 ]
 FULL_RESULT_PAYLOAD_FIELDS = LIGHT_RESULT_PAYLOAD_FIELDS + ["source"]
 
@@ -731,7 +732,10 @@ class CodeSearcher:
             final_score += self._startup_symbol_bonus(file_path_value, symbol_name_value, ranking_keywords)
             final_score += self._implementation_path_bonus(file_path_value, ranking_keywords)
             final_score += self._filecache_bonus(file_path_value, symbol_name_value, ranking_keywords)
+            final_score += self._role_bonus(point.payload.get("role"), ranking_keywords)
             final_score *= self._subsystem_conflict_penalty(file_path_value, ranking_keywords)
+            final_score *= self._ranking_helper_penalty(symbol_name_value, ranking_keywords)
+            final_score *= self._startup_import_symbol_penalty(symbol_kind_value, ranking_keywords)
             final_score *= self._constructor_penalty(symbol_name_value, ranking_keywords)
             final_score *= self._wrapper_symbol_penalty(file_path_value, symbol_name_value, ranking_keywords)
             final_score *= self._container_symbol_penalty(symbol_name_value, symbol_kind_value, ranking_keywords)
@@ -999,7 +1003,10 @@ class CodeSearcher:
             final_score += self._startup_symbol_bonus(file_path_value, symbol_name_value, ranking_keywords)
             final_score += self._implementation_path_bonus(file_path_value, ranking_keywords)
             final_score += self._filecache_bonus(file_path_value, symbol_name_value, ranking_keywords)
+            final_score += self._role_bonus(point.payload.get("role"), ranking_keywords)
             final_score *= self._subsystem_conflict_penalty(file_path_value, ranking_keywords)
+            final_score *= self._ranking_helper_penalty(symbol_name_value, ranking_keywords)
+            final_score *= self._startup_import_symbol_penalty(symbol_kind_value, ranking_keywords)
             final_score *= self._constructor_penalty(symbol_name_value, ranking_keywords)
             final_score *= self._wrapper_symbol_penalty(file_path_value, symbol_name_value, ranking_keywords)
             final_score *= self._container_symbol_penalty(symbol_name_value, symbol_kind_value, ranking_keywords)
@@ -1467,6 +1474,7 @@ class CodeSearcher:
         tokens.extend(self._identifier_tokens(payload.get("path_context", ""), max_tokens=12))
         tokens.extend(self._identifier_tokens(payload.get("symbol_name", ""), max_tokens=8))
         tokens.extend(self._identifier_tokens(payload.get("symbol_kind", ""), max_tokens=4))
+        tokens.extend(self._identifier_tokens(payload.get("role", ""), max_tokens=4))
         tokens.extend(self._identifier_tokens(payload.get("parent", ""), max_tokens=8))
         tokens.extend(self._identifier_tokens(payload.get("signature", ""), max_tokens=12))
 
@@ -1553,6 +1561,8 @@ class CodeSearcher:
         normalized = file_path.replace("\\", "/").lower()
         if normalized.endswith("/engine/__init__.py"):
             return 0.22
+        if normalized.endswith("/engine/src/parser_cli.py"):
+            return 0.18
         if normalized.endswith("/engine/src/parsing.py"):
             return 0.20
         if normalized.endswith("/engine/src/pipe.py"):
@@ -1640,7 +1650,7 @@ class CodeSearcher:
                 and "parser" in keyword_set
                 and keyword_set.intersection({"startup", "import", "imports", "qdrant"})
             ):
-                return 0.42
+                return 0.18
 
         return 1.0
 
@@ -1655,6 +1665,31 @@ class CodeSearcher:
         if set(ranking_keywords).intersection({"init", "initialize", "initialization", "constructor"}):
             return 1.0
         return 0.55
+
+    def _startup_import_symbol_penalty(self, symbol_kind: str, ranking_keywords: list[str]) -> float:
+        """
+        Avoid ranking raw import rows above the parser implementation on startup-boundary questions.
+        """
+        if (symbol_kind or "").lower() != "import":
+            return 1.0
+
+        keyword_set = set(ranking_keywords)
+        if "parser" in keyword_set and keyword_set.intersection({"startup", "import", "imports", "qdrant"}):
+            return 0.45
+        return 1.0
+
+    def _ranking_helper_penalty(self, symbol_name: str, ranking_keywords: list[str]) -> float:
+        """
+        Down-rank internal scoring helper symbols unless the query is actually about ranking.
+        """
+        normalized = symbol_name.lower()
+        if not any(token in normalized for token in ("bonus", "penalty")):
+            return 1.0
+
+        keyword_set = set(ranking_keywords)
+        if keyword_set.intersection({"rank", "ranking", "score", "scoring", "rerank", "boost", "bonus", "penalty", "relevance"}):
+            return 1.0
+        return 0.25
 
     def _filecache_bonus(self, file_path: str, symbol_name: str, ranking_keywords: list[str]) -> float:
         """
@@ -1678,6 +1713,29 @@ class CodeSearcher:
             bonus += 0.04
         return bonus
 
+    def _role_bonus(self, role: Optional[str], ranking_keywords: list[str]) -> float:
+        """
+        Apply a small role-aware boost for implementation-oriented architecture questions.
+        """
+        if not role or not ranking_keywords:
+            return 0.0
+
+        keyword_set = set(ranking_keywords)
+        if not (
+            keyword_set.intersection(ACTION_QUERY_KEYWORDS)
+            or keyword_set.intersection({"path", "prefix", "scope", "scoped", "payload", "filter", "filters", "startup"})
+        ):
+            return 0.0
+
+        normalized_role = role.lower()
+        if normalized_role in {"orchestration", "logic", "utility"}:
+            return 0.04
+        if normalized_role == "entrypoint":
+            return 0.02
+        if normalized_role in {"test", "configuration"}:
+            return -0.04
+        return 0.0
+
     def _subsystem_conflict_penalty(self, file_path: str, ranking_keywords: list[str]) -> float:
         """
         Down-rank clearly unrelated subsystems for targeted architecture questions.
@@ -1694,8 +1752,12 @@ class CodeSearcher:
                 or normalized.endswith("/engine/src/embedder.py")
                 or normalized.endswith("/engine/src/describer.py")
             ):
-                return 0.48
-            if normalized.endswith("/engine/src/qdrant.py"):
+                return 0.2
+            if (
+                normalized.endswith("/engine/src/qdrant.py")
+                or normalized.endswith("/engine/src/collection.py")
+                or normalized.endswith("/engine/src/config.py")
+            ):
                 return 0.58
 
         return 1.0

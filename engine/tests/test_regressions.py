@@ -165,6 +165,7 @@ class RegressionTests(unittest.TestCase):
             docstring=None,
             parent=None,
             visibility=None,
+            role=None,
             file_hash="a",
         )
         c2 = CodeChunk(
@@ -182,6 +183,7 @@ class RegressionTests(unittest.TestCase):
             docstring=None,
             parent=None,
             visibility=None,
+            role=None,
             file_hash="b",
         )
         c3 = CodeChunk(
@@ -199,6 +201,7 @@ class RegressionTests(unittest.TestCase):
             docstring=None,
             parent=None,
             visibility=None,
+            role=None,
             file_hash="c",
         )
 
@@ -428,11 +431,16 @@ class RegressionTests(unittest.TestCase):
             str(Path("engine/src/parsing.py").resolve()),
             ["parser", "commands", "qdrant", "imports", "startup"],
         )
+        parser_cli_bonus = searcher._startup_boundary_bonus(
+            str(Path("engine/src/parser_cli.py").resolve()),
+            ["parser", "commands", "qdrant", "imports", "startup"],
+        )
         neutral = searcher._startup_boundary_bonus(
             str(Path("engine/src/searcher.py").resolve()),
             ["parser", "commands", "qdrant", "imports", "startup"],
         )
         self.assertGreater(bonus, 0.0)
+        self.assertGreater(parser_cli_bonus, 0.0)
         self.assertEqual(neutral, 0.0)
 
     def test_implementation_path_bonus_prefers_searcher_and_indexer(self) -> None:
@@ -476,6 +484,20 @@ class RegressionTests(unittest.TestCase):
             ["parser", "commands", "qdrant", "imports", "startup"],
         )
         self.assertGreater(bonus, 0.0)
+        self.assertEqual(neutral, 0.0)
+
+    def test_role_bonus_prefers_logic_and_penalizes_configuration_for_action_queries(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        logic_bonus = searcher._role_bonus("logic", ["search", "path", "filters"])
+        config_penalty = searcher._role_bonus("configuration", ["search", "path", "filters"])
+        neutral = searcher._role_bonus("definition", ["class", "struct"])
+        self.assertGreater(logic_bonus, 0.0)
+        self.assertLess(config_penalty, 0.0)
         self.assertEqual(neutral, 0.0)
 
     def test_wrapper_symbol_penalty_downranks_sdk_wrappers_for_internal_queries(self) -> None:
@@ -558,6 +580,42 @@ class RegressionTests(unittest.TestCase):
         self.assertLess(penalty, 1.0)
         self.assertEqual(neutral, 1.0)
 
+    def test_startup_import_symbol_penalty_downranks_import_rows(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        penalty = searcher._startup_import_symbol_penalty(
+            "import",
+            ["parser", "commands", "qdrant", "imports", "startup"],
+        )
+        neutral = searcher._startup_import_symbol_penalty(
+            "function",
+            ["parser", "commands", "qdrant", "imports", "startup"],
+        )
+        self.assertLess(penalty, 1.0)
+        self.assertEqual(neutral, 1.0)
+
+    def test_ranking_helper_penalty_downranks_bonus_helpers_for_non_ranking_queries(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        penalty = searcher._ranking_helper_penalty(
+            "_startup_boundary_bonus",
+            ["parser", "commands", "qdrant", "imports", "startup"],
+        )
+        neutral = searcher._ranking_helper_penalty(
+            "_startup_boundary_bonus",
+            ["ranking", "score", "boost"],
+        )
+        self.assertLess(penalty, 1.0)
+        self.assertEqual(neutral, 1.0)
+
     def test_filecache_bonus_prefers_cache_module_for_unchanged_detection(self) -> None:
         searcher = CodeSearcher(
             client=None,
@@ -601,6 +659,12 @@ class RegressionTests(unittest.TestCase):
             ["parser", "commands", "qdrant", "imports", "startup"],
         )
         self.assertLess(qdrant_penalty, 1.0)
+
+        config_penalty = searcher._subsystem_conflict_penalty(
+            str(Path("engine/src/config.py").resolve()),
+            ["parser", "commands", "qdrant", "imports", "startup"],
+        )
+        self.assertLess(config_penalty, 1.0)
 
     def test_action_query_boosts_matching_symbol_action(self) -> None:
         searcher = CodeSearcher(
@@ -717,6 +781,7 @@ class RegressionTests(unittest.TestCase):
             docstring="Cache query embedding vectors in memory and on disk for repeated searches.",
             parent="CodeSearcher",
             visibility=None,
+            role=None,
             file_hash="hash",
         )
 
