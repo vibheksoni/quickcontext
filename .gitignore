@@ -289,6 +289,8 @@ scripts/*
 !scripts/retrieval_benchmark.py
 !scripts/retrieval_cases_extended.json
 !scripts/search_phase_benchmark.py
+!scripts/symbol_benchmark.py
+!scripts/symbol_cases.json
 quickcontext.local.json
 deepwiki_util/
 openrouter/

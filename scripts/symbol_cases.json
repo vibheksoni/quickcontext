@@ -1,0 +1,61 @@
+[
+  {
+    "query": "CollectionManager",
+    "expected_path": "engine/src/collection.py",
+    "expected_name": "CollectionManager"
+  },
+  {
+    "query": "CodeSearcher._embed_query_with_provider_cached",
+    "expected_path": "engine/src/searcher.py",
+    "expected_name": "_embed_query_with_provider_cached",
+    "expected_parent": "CodeSearcher"
+  },
+  {
+    "query": "QuickContext._get_searcher",
+    "expected_path": "engine/sdk.py",
+    "expected_name": "_get_searcher",
+    "expected_parent": "QuickContext"
+  },
+  {
+    "query": "CollectionManager.active_collection",
+    "expected_path": "engine/src/collection.py",
+    "expected_name": "active_collection",
+    "expected_parent": "CollectionManager"
+  },
+  {
+    "query": "QdrantConnection.connect",
+    "expected_path": "engine/src/qdrant.py",
+    "expected_name": "connect",
+    "expected_parent": "QdrantConnection"
+  },
+  {
+    "query": "RustParserService.scan_files",
+    "expected_path": "engine/src/parsing.py",
+    "expected_name": "scan_files",
+    "expected_parent": "RustParserService"
+  },
+  {
+    "query": "FileSignatureCache.is_unchanged_from_metadata",
+    "expected_path": "engine/src/filecache.py",
+    "expected_name": "is_unchanged_from_metadata",
+    "expected_parent": "FileSignatureCache"
+  },
+  {
+    "query": "ChunkBuilder.build_chunks",
+    "expected_path": "engine/src/chunker.py",
+    "expected_name": "build_chunks",
+    "expected_parent": "ChunkBuilder"
+  },
+  {
+    "query": "QdrantIndexer.delete_by_file",
+    "expected_path": "engine/src/indexer.py",
+    "expected_name": "delete_by_file",
+    "expected_parent": "QdrantIndexer"
+  },
+  {
+    "query": "CodeSearcher.search_hybrid",
+    "expected_path": "engine/src/searcher.py",
+    "expected_name": "search_hybrid",
+    "expected_parent": "CodeSearcher"
+  }
+]
