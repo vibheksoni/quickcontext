@@ -290,6 +290,7 @@ scripts/*
 !scripts/retrieval_cases_extended.json
 !scripts/retrieval_cases_hard.json
 !scripts/retrieval_cases_deep.json
+!scripts/bundle_benchmark.py
 !scripts/search_phase_benchmark.py
 !scripts/symbol_benchmark.py
 !scripts/symbol_cases.json
