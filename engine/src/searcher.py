@@ -27,6 +27,7 @@ TOP_RANK_BONUS_2_3 = 0.02
 QUERY_CACHE_SIZE = 256
 DISK_QUERY_CACHE_LIMIT = 512
 METADATA_TOKEN_CACHE_SIZE = 2048
+HYBRID_REQUEST_MIN_LIMIT = 18
 TOKEN_SYNONYMS = {
     "remove": ("delete", "deletion"),
     "delete": ("remove", "removed"),
@@ -301,7 +302,7 @@ class CodeSearcher:
         """
         ranking_keywords = self._extract_keywords_cached(query)
         blend_keywords = ranking_keywords if use_keywords else []
-        request_limit = max(limit * 3, 30)
+        request_limit = self._hybrid_request_limit(limit)
 
         code_vector, desc_vector = self._hybrid_query_vectors(query)
 
@@ -357,6 +358,12 @@ class CodeSearcher:
             )
 
         return self._finalize_results(fused[:limit], include_source=include_source)
+
+    def _hybrid_request_limit(self, limit: int) -> int:
+        """
+        Keep hybrid candidate overfetch bounded without dropping top-rank quality.
+        """
+        return max(limit * 3, HYBRID_REQUEST_MIN_LIMIT)
 
     def search_structured(
         self,

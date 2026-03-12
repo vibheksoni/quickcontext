@@ -270,6 +270,17 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
 
+    def test_hybrid_request_limit_uses_lower_candidate_floor(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+
+        self.assertEqual(searcher._hybrid_request_limit(5), 18)
+        self.assertEqual(searcher._hybrid_request_limit(10), 30)
+
     def test_path_prefix_filter_builds_server_side_constraint(self) -> None:
         searcher = CodeSearcher(
             client=None,
