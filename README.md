@@ -9,6 +9,11 @@ It currently has two main parts:
 - `service/`: a Rust binary for parsing, grep, skeleton generation, text search, protocol search, pattern search, symbol and caller lookup, import graph analysis, and local IPC
 - `engine/`: a Python SDK and CLI for indexing, Qdrant collection management, chunking, deduplication, embeddings, retrieval, watch mode, and edit operations
 
+The SDK now also includes a graph-aware context helper:
+
+- `QuickContext.semantic_search_bundle(...)`
+  Returns semantic anchors plus related import-graph files and caller context for deeper codebase exploration.
+
 ## Status
 
 This repository is still a work in progress.

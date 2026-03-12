@@ -77,6 +77,12 @@ Important config ideas:
 - `engine/src/pipe.py`: IPC client
 - `engine/src/watcher.py`: filesystem watch and refresh
 
+Useful SDK retrieval primitives:
+
+- `QuickContext.semantic_search(...)`: main semantic retrieval path
+- `QuickContext.structured_search(...)`: typed multi-query retrieval
+- `QuickContext.semantic_search_bundle(...)`: semantic anchors plus related import-graph files and caller context for deeper follow-up exploration
+
 ## Important Rust Modules
 
 - `service/src/main.rs`: service CLI
