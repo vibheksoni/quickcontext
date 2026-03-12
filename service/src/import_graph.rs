@@ -1,9 +1,32 @@
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use crate::extract::{extract_path_with_options, ExtractOptions};
+use crate::extract::{collect_file_signatures_fast, extract_path_with_options, ExtractOptions};
 use crate::lang::LanguageSpec;
 use crate::types::{ImportEdge, ImportGraphResult, SymbolKind};
+
+const REFRESH_DEBOUNCE_MS: u128 = 5000;
+
+#[derive(Debug, Clone)]
+struct ProjectImportGraph {
+    config_fingerprint: u64,
+    respect_gitignore: bool,
+    file_signatures: HashMap<String, u64>,
+    outgoing: HashMap<String, Vec<ImportEdge>>,
+    incoming: HashMap<String, Vec<ImportEdge>>,
+    total_files: usize,
+    total_imports: usize,
+    last_refresh_check_ms: u128,
+}
+
+#[derive(Default)]
+struct ImportGraphManager {
+    by_project_root: HashMap<String, Arc<RwLock<ProjectImportGraph>>>,
+}
+
+static GLOBAL_IMPORT_GRAPH_MANAGER: OnceLock<Mutex<ImportGraphManager>> = OnceLock::new();
 
 
 pub fn import_graph(
@@ -19,8 +42,25 @@ pub fn import_graph(
     let canonical_root = project_root
         .canonicalize()
         .map_err(|e| format!("failed to resolve project root: {e}"))?;
+    let fingerprint = config_fingerprint(specs, respect_gitignore);
 
-    let graph = build_graph(&canonical_root, specs, respect_gitignore)?;
+    let graph_lock = {
+        let mut manager = manager()
+            .lock()
+            .map_err(|_| "import graph lock poisoned".to_string())?;
+        manager.get_or_build(&canonical_root, specs, respect_gitignore, fingerprint)?
+    };
+    refresh_graph_if_needed(
+        &graph_lock,
+        &canonical_root,
+        specs,
+        respect_gitignore,
+        fingerprint,
+    )?;
+
+    let graph = graph_lock
+        .read()
+        .map_err(|_| "import graph read lock poisoned".to_string())?;
 
     let file_key = normalize(&canonical_file);
     let imports = graph
@@ -53,8 +93,25 @@ pub fn find_importers(
     let canonical_root = project_root
         .canonicalize()
         .map_err(|e| format!("failed to resolve project root: {e}"))?;
+    let fingerprint = config_fingerprint(specs, respect_gitignore);
 
-    let graph = build_graph(&canonical_root, specs, respect_gitignore)?;
+    let graph_lock = {
+        let mut manager = manager()
+            .lock()
+            .map_err(|_| "import graph lock poisoned".to_string())?;
+        manager.get_or_build(&canonical_root, specs, respect_gitignore, fingerprint)?
+    };
+    refresh_graph_if_needed(
+        &graph_lock,
+        &canonical_root,
+        specs,
+        respect_gitignore,
+        fingerprint,
+    )?;
+
+    let graph = graph_lock
+        .read()
+        .map_err(|_| "import graph read lock poisoned".to_string())?;
 
     let file_key = normalize(&canonical_file);
     let importers = graph
@@ -74,11 +131,61 @@ pub fn find_importers(
 }
 
 
-struct DependencyGraph {
-    outgoing: HashMap<String, Vec<ImportEdge>>,
-    incoming: HashMap<String, Vec<ImportEdge>>,
-    total_files: usize,
-    total_imports: usize,
+fn manager() -> &'static Mutex<ImportGraphManager> {
+    GLOBAL_IMPORT_GRAPH_MANAGER.get_or_init(|| Mutex::new(ImportGraphManager::default()))
+}
+
+impl ImportGraphManager {
+    fn get_or_build(
+        &mut self,
+        project_root: &Path,
+        specs: &[LanguageSpec],
+        respect_gitignore: bool,
+        config_fingerprint: u64,
+    ) -> Result<Arc<RwLock<ProjectImportGraph>>, String> {
+        let key = project_root.to_string_lossy().to_string();
+        if let Some(existing) = self.by_project_root.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+
+        let graph = build_graph(project_root, specs, respect_gitignore, config_fingerprint)?;
+        let project_lock = Arc::new(RwLock::new(graph));
+        self.by_project_root.insert(key, Arc::clone(&project_lock));
+        Ok(project_lock)
+    }
+}
+
+fn refresh_graph_if_needed(
+    graph_lock: &Arc<RwLock<ProjectImportGraph>>,
+    project_root: &Path,
+    specs: &[LanguageSpec],
+    respect_gitignore: bool,
+    config_fingerprint: u64,
+) -> Result<(), String> {
+    let mut graph = graph_lock
+        .write()
+        .map_err(|_| "import graph write lock poisoned".to_string())?;
+
+    if now_ms().saturating_sub(graph.last_refresh_check_ms) < REFRESH_DEBOUNCE_MS {
+        return Ok(());
+    }
+    graph.last_refresh_check_ms = now_ms();
+
+    if graph.respect_gitignore != respect_gitignore || graph.config_fingerprint != config_fingerprint {
+        *graph = build_graph(project_root, specs, respect_gitignore, config_fingerprint)?;
+        return Ok(());
+    }
+
+    let current_signatures = collect_file_signatures_fast(
+        project_root,
+        specs,
+        ExtractOptions { respect_gitignore },
+    );
+    if current_signatures != graph.file_signatures {
+        *graph = build_graph(project_root, specs, respect_gitignore, config_fingerprint)?;
+    }
+
+    Ok(())
 }
 
 
@@ -86,7 +193,13 @@ fn build_graph(
     root: &Path,
     specs: &[LanguageSpec],
     respect_gitignore: bool,
-) -> Result<DependencyGraph, String> {
+    config_fingerprint: u64,
+) -> Result<ProjectImportGraph, String> {
+    let file_signatures = collect_file_signatures_fast(
+        root,
+        specs,
+        ExtractOptions { respect_gitignore },
+    );
     let extracted = extract_path_with_options(
         root,
         specs,
@@ -149,12 +262,36 @@ fn build_graph(
         }
     }
 
-    Ok(DependencyGraph {
+    Ok(ProjectImportGraph {
+        config_fingerprint,
+        respect_gitignore,
+        file_signatures,
         outgoing,
         incoming,
         total_files: all_files.len(),
         total_imports,
+        last_refresh_check_ms: now_ms(),
     })
+}
+
+fn config_fingerprint(specs: &[LanguageSpec], respect_gitignore: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    respect_gitignore.hash(&mut hasher);
+
+    let mut lang_names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
+    lang_names.sort_unstable();
+    for lang in lang_names {
+        lang.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 
