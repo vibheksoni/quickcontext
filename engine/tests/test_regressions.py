@@ -3,14 +3,18 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 from dataclasses import dataclass
 from pathlib import Path
 import builtins
 
 from engine.src.chunker import ChunkBuilder, CodeChunk
+from engine.src.config import EngineConfig, QdrantConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
+from engine.src.cli import _optimize_search_config
+from engine.src.qdrant import QdrantConnection
 from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS
 
 
@@ -487,6 +491,29 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(client.last_query_with_payload, LIGHT_RESULT_PAYLOAD_FIELDS)
         self.assertIsNotNone(client.last_retrieve_with_payload)
         self.assertEqual(results[0].source, full_payload["source"])
+
+    def test_qdrant_connect_skips_eager_verification_by_default(self) -> None:
+        fake_client = mock.Mock()
+
+        with mock.patch("engine.src.qdrant.QdrantClient", return_value=fake_client) as ctor:
+            conn = QdrantConnection(QdrantConfig())
+            conn.connect()
+
+        ctor.assert_called_once()
+        fake_client.get_collections.assert_not_called()
+
+    def test_qdrant_connect_verifies_when_requested(self) -> None:
+        fake_client = mock.Mock()
+
+        with mock.patch("engine.src.qdrant.QdrantClient", return_value=fake_client):
+            conn = QdrantConnection(QdrantConfig())
+            conn.connect(verify=True)
+
+        fake_client.get_collections.assert_called_once()
+
+    def test_optimize_search_config_prefers_rest_for_local_qdrant(self) -> None:
+        optimized = _optimize_search_config(EngineConfig(qdrant=QdrantConfig(prefer_grpc=True)))
+        self.assertFalse(optimized.qdrant.prefer_grpc)
 
 
 class LazyImportBoundaryTests(unittest.TestCase):

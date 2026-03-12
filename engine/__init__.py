@@ -132,7 +132,7 @@ class QuickContext:
             self._conn = QdrantConnection(self._config.qdrant)
         return self._conn
 
-    def connect(self) -> "QuickContext":
+    def connect(self, verify: bool = False) -> "QuickContext":
         """
         Connect to Qdrant server. No-op if Qdrant is disabled.
 
@@ -141,7 +141,7 @@ class QuickContext:
         """
         if self._config.qdrant is None:
             return self
-        self.connection.connect()
+        self.connection.connect(verify=verify)
         return self
 
     def _get_collection(self, project_name: str) -> "CollectionManager":

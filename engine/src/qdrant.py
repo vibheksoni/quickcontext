@@ -18,7 +18,7 @@ class QdrantConnection:
         self._config = config
         self._client: QdrantClient | None = None
 
-    def connect(self) -> QdrantClient:
+    def connect(self, verify: bool = False) -> QdrantClient:
         """
         Create and return a QdrantClient. Reuses existing connection if alive.
 
@@ -26,18 +26,20 @@ class QdrantConnection:
         Raises: ConnectionError — If Qdrant is unreachable.
         """
         if self._client is not None:
+            if verify:
+                try:
+                    self._client.get_collections()
+                except Exception as exc:
+                    self._client = None
+                    raise ConnectionError(
+                        f"Failed to connect to Qdrant at {self._config.url}: {exc}"
+                    ) from exc
             return self._client
 
         try:
-            self._client = QdrantClient(
-                host=self._config.host,
-                port=self._config.port,
-                grpc_port=self._config.grpc_port,
-                prefer_grpc=self._config.prefer_grpc,
-                api_key=self._config.api_key,
-                timeout=self._config.timeout,
-            )
-            self._client.get_collections()
+            self._client = self._build_client(prefer_grpc=self._config.prefer_grpc)
+            if verify:
+                self._client.get_collections()
         except (UnexpectedResponse, ResponseHandlingException, Exception) as exc:
             self._client = None
             raise ConnectionError(
@@ -46,6 +48,20 @@ class QdrantConnection:
 
         return self._client
 
+    def _build_client(self, prefer_grpc: bool) -> QdrantClient:
+        """
+        Build a Qdrant client with the requested transport preference.
+        """
+        return QdrantClient(
+            host=self._config.host,
+            port=self._config.port,
+            grpc_port=self._config.grpc_port,
+            prefer_grpc=prefer_grpc,
+            api_key=self._config.api_key,
+            timeout=self._config.timeout,
+            check_compatibility=False,
+        )
+
     @property
     def client(self) -> QdrantClient:
         """
@@ -53,7 +69,7 @@ class QdrantConnection:
         Raises: ConnectionError — If not connected and connection fails.
         """
         if self._client is None:
-            return self.connect()
+            return self.connect(verify=False)
         return self._client
 
     def is_alive(self) -> bool:
@@ -79,7 +95,7 @@ class QdrantConnection:
             self._client = None
 
     def __enter__(self) -> "QdrantConnection":
-        self.connect()
+        self.connect(verify=False)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

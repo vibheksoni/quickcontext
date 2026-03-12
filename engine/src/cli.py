@@ -11,7 +11,7 @@ from engine.src.config import EngineConfig
 from engine.src.project import detect_project_name
 
 
-console = Console(force_terminal=True, legacy_windows=False)
+console = Console(legacy_windows=False)
 
 
 def _load_config(config_path: str | None) -> EngineConfig:
@@ -24,6 +24,19 @@ def _load_config(config_path: str | None) -> EngineConfig:
     if config_path:
         return EngineConfig.from_json(config_path)
     return EngineConfig.auto()
+
+
+def _optimize_search_config(config: EngineConfig) -> EngineConfig:
+    """
+    Prefer REST for local one-shot search traffic where it is measurably faster.
+    """
+    if config.qdrant is None:
+        return config
+
+    host = (config.qdrant.host or "").lower()
+    if config.qdrant.prefer_grpc and host in {"localhost", "127.0.0.1"}:
+        return replace(config, qdrant=replace(config.qdrant, prefer_grpc=False))
+    return config
 
 
 @click.group()
@@ -43,7 +56,7 @@ def status(ctx: click.Context) -> None:
     """
     Show engine status: Qdrant connection, collection info, embedding providers.
     """
-    config = ctx.obj["config"]
+    config = _optimize_search_config(ctx.obj["config"])
     qc = QuickContext(config)
 
     table = Table(title="quickcontext status")
@@ -54,7 +67,7 @@ def status(ctx: click.Context) -> None:
     if config.qdrant is not None:
         alive = False
         try:
-            qc.connect()
+            qc.connect(verify=True)
             alive = True
         except ConnectionError:
             pass
@@ -122,7 +135,7 @@ def mcp_hints(ctx: click.Context, project: str | None) -> None:
     """
     Print dynamic search instructions suitable for MCP/system prompts.
     """
-    config = ctx.obj["config"]
+    config = _optimize_search_config(ctx.obj["config"])
 
     try:
         with QuickContext(config) as qc:
