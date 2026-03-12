@@ -604,6 +604,24 @@ class PipeClient:
             raise PipeProtocolError("invalid import graph response payload")
         return data
 
+    def import_neighbors(self, file: str, path: Optional[str] = None, respect_gitignore: bool = True) -> dict:
+        """Gets both outgoing and incoming import edges for a file."""
+        payload: dict[str, object] = {
+            "method": "import_neighbors",
+            "file": file,
+            "respect_gitignore": respect_gitignore,
+        }
+        if path is not None:
+            payload["path"] = path
+
+        resp = self.request(payload)
+        if resp.get("status") == "error":
+            raise PipeError(resp.get("message", "import neighbors failed"))
+        data = resp.get("data", {})
+        if not isinstance(data, dict):
+            raise PipeProtocolError("invalid import neighbors response payload")
+        return data
+
     def find_importers(self, file: str, path: Optional[str] = None, respect_gitignore: bool = True) -> dict:
         """Finds files that import a given file (incoming edges).
 

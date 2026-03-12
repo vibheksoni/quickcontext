@@ -206,6 +206,18 @@ pub struct ImportGraphResult {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportNeighborsResult {
+    pub file_path: String,
+    pub project_root: String,
+    pub imports: Vec<ImportEdge>,
+    pub importers: Vec<ImportEdge>,
+    pub total_files: usize,
+    pub total_imports: usize,
+    pub duration_ms: u128,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextSearchMatch {
     pub file_path: String,
     pub score: f64,

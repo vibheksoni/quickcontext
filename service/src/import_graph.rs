@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::extract::{collect_file_signatures_fast, extract_path_with_options, ExtractOptions};
 use crate::lang::LanguageSpec;
-use crate::types::{ImportEdge, ImportGraphResult, SymbolKind};
+use crate::types::{ImportEdge, ImportGraphResult, ImportNeighborsResult, SymbolKind};
 
 const REFRESH_DEBOUNCE_MS: u128 = 5000;
 
@@ -271,6 +271,63 @@ fn build_graph(
         total_files: all_files.len(),
         total_imports,
         last_refresh_check_ms: now_ms(),
+    })
+}
+
+
+pub fn import_neighbors(
+    file_path: &Path,
+    project_root: &Path,
+    specs: &[LanguageSpec],
+    respect_gitignore: bool,
+) -> Result<ImportNeighborsResult, String> {
+    let start = std::time::Instant::now();
+    let canonical_file = file_path
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve file path: {e}"))?;
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve project root: {e}"))?;
+    let fingerprint = config_fingerprint(specs, respect_gitignore);
+
+    let graph_lock = {
+        let mut manager = manager()
+            .lock()
+            .map_err(|_| "import graph lock poisoned".to_string())?;
+        manager.get_or_build(&canonical_root, specs, respect_gitignore, fingerprint)?
+    };
+    refresh_graph_if_needed(
+        &graph_lock,
+        &canonical_root,
+        specs,
+        respect_gitignore,
+        fingerprint,
+    )?;
+
+    let graph = graph_lock
+        .read()
+        .map_err(|_| "import graph read lock poisoned".to_string())?;
+
+    let file_key = normalize(&canonical_file);
+    let imports = graph
+        .outgoing
+        .get(&file_key)
+        .cloned()
+        .unwrap_or_default();
+    let importers = graph
+        .incoming
+        .get(&file_key)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(ImportNeighborsResult {
+        file_path: canonical_file.to_string_lossy().to_string(),
+        project_root: canonical_root.to_string_lossy().to_string(),
+        imports,
+        importers,
+        total_files: graph.total_files,
+        total_imports: graph.total_imports,
+        duration_ms: start.elapsed().as_millis(),
     })
 }
 

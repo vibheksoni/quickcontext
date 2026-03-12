@@ -656,6 +656,45 @@ class ImportGraphResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ImportNeighborsResult:
+    """
+    Import graph query result with both outgoing and incoming edges.
+    """
+
+    file_path: str
+    project_root: str
+    imports: list[ImportEdge]
+    importers: list[ImportEdge]
+    total_files: int
+    total_imports: int
+    duration_ms: int
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "ImportNeighborsResult":
+        imports_raw = data.get("imports", [])
+        importers_raw = data.get("importers", [])
+        imports = [
+            ImportEdge.from_dict(item)
+            for item in imports_raw
+            if isinstance(item, dict)
+        ]
+        importers = [
+            ImportEdge.from_dict(item)
+            for item in importers_raw
+            if isinstance(item, dict)
+        ]
+        return ImportNeighborsResult(
+            file_path=str(data.get("file_path", "")),
+            project_root=str(data.get("project_root", "")),
+            imports=imports,
+            importers=importers,
+            total_files=int(data.get("total_files", 0)),
+            total_imports=int(data.get("total_imports", 0)),
+            duration_ms=int(data.get("duration_ms", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SkeletonSymbol:
     """
     Symbol entry in a skeleton file node.
@@ -2127,6 +2166,32 @@ class RustParserService:
             respect_gitignore=respect_gitignore,
         )
         return ImportGraphResult.from_dict(raw)
+
+    def import_neighbors(
+        self,
+        file: str | Path,
+        path: str | Path | None = None,
+        respect_gitignore: bool = True,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> ImportNeighborsResult:
+        """
+        Get both imports and importers for a file in one request.
+        """
+        input_file = str(Path(file).resolve())
+        input_path = str(Path(path).resolve()) if path is not None else str(Path.cwd().resolve())
+
+        if ensure_server:
+            self._client.ensure_server(timeout_ms=timeout_ms)
+        elif not self.connected:
+            self.connect(timeout_ms=timeout_ms)
+
+        raw = self._client.import_neighbors(
+            file=input_file,
+            path=input_path,
+            respect_gitignore=respect_gitignore,
+        )
+        return ImportNeighborsResult.from_dict(raw)
 
     def text_search(
         self,

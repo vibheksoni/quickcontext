@@ -361,6 +361,16 @@ async fn dispatch(req: Request, specs: &[LanguageSpec], cancel: &CancellationTok
             respect_gitignore.unwrap_or(true),
             specs,
         ),
+        Request::ImportNeighbors {
+            file,
+            path,
+            respect_gitignore,
+        } => handle_import_neighbors(
+            &file,
+            path.as_deref(),
+            respect_gitignore.unwrap_or(true),
+            specs,
+        ),
         Request::FindImporters {
             file,
             path,
@@ -1115,6 +1125,26 @@ fn handle_import_graph(
     let root = Path::new(project_root);
 
     match import_graph::import_graph(file, root, specs, respect_gitignore) {
+        Ok(result) => match serde_json::to_value(&result) {
+            Ok(val) => Response::ok_data(val),
+            Err(e) => Response::error(format!("serialization failed: {e}")),
+        },
+        Err(e) => Response::error(e),
+    }
+}
+
+
+fn handle_import_neighbors(
+    file_str: &str,
+    path_str: Option<&str>,
+    respect_gitignore: bool,
+    specs: &[LanguageSpec],
+) -> Response {
+    let file = Path::new(file_str);
+    let project_root = path_str.unwrap_or(".");
+    let root = Path::new(project_root);
+
+    match import_graph::import_neighbors(file, root, specs, respect_gitignore) {
         Ok(result) => match serde_json::to_value(&result) {
             Ok(val) => Response::ok_data(val),
             Err(e) => Response::error(format!("serialization failed: {e}")),

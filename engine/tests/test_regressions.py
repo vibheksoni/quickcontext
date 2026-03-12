@@ -911,11 +911,11 @@ class RegressionTests(unittest.TestCase):
         )
         try:
             result_item = type("ResultItem", (), {"file_path": "a.py"})()
-            graph_result = type(
-                "GraphResult",
+            neighbor_result = type(
+                "NeighborResult",
                 (),
                 {
-                    "edges": [
+                    "imports": [
                         ImportEdge(
                             source_file="a.py",
                             target_file="b.py",
@@ -924,13 +924,14 @@ class RegressionTests(unittest.TestCase):
                             language="python",
                             line=1,
                         )
-                    ]
+                    ],
+                    "importers": [],
                 },
             )()
-            with mock.patch.object(qc, "import_graph", return_value=graph_result), mock.patch.object(
+            with mock.patch.object(
                 qc,
-                "find_importers",
-                return_value=type("GraphResult", (), {"edges": []})(),
+                "import_neighbors",
+                return_value=neighbor_result,
             ):
                 related = qc._related_files_for_results(
                     results=[result_item],

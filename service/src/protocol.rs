@@ -101,6 +101,14 @@ pub enum Request {
         #[serde(default)]
         respect_gitignore: Option<bool>,
     },
+    #[serde(rename = "import_neighbors")]
+    ImportNeighbors {
+        file: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        respect_gitignore: Option<bool>,
+    },
     #[serde(rename = "find_importers")]
     FindImporters {
         file: String,

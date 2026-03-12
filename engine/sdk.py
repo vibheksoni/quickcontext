@@ -39,6 +39,7 @@ from engine.src.parsing import (
     GrepResult,
     ImportEdge,
     ImportGraphResult,
+    ImportNeighborsResult,
     PatternMatchCapture,
     PatternMatchItem,
     PatternMatchResult,
@@ -704,6 +705,25 @@ class QuickContext:
         Returns: ImportGraphResult — Importer edges and graph metadata.
         """
         return self.parser_service.find_importers(
+            file=file,
+            path=path,
+            respect_gitignore=respect_gitignore,
+            ensure_server=ensure_server,
+            timeout_ms=timeout_ms,
+        )
+
+    def import_neighbors(
+        self,
+        file: str | Path,
+        path: str | Path | None = None,
+        respect_gitignore: bool = True,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> ImportNeighborsResult:
+        """
+        Get both imports and importers for a file in one request.
+        """
+        return self.parser_service.import_neighbors(
             file=file,
             path=path,
             respect_gitignore=respect_gitignore,
@@ -1488,19 +1508,18 @@ class QuickContext:
         project_root = Path.cwd().resolve()
 
         for seed_file in seeds:
-            outgoing = self.import_graph(file=seed_file, path=project_root)
-            incoming = self.find_importers(file=seed_file, path=project_root)
+            neighbors = self.import_neighbors(file=seed_file, path=project_root)
             self._merge_related_edges(
                 seed_file=seed_file,
                 relation="imports",
-                edges=outgoing.edges,
+                edges=neighbors.imports,
                 related_by_path=related_by_path,
                 excluded_paths=excluded_paths,
             )
             self._merge_related_edges(
                 seed_file=seed_file,
                 relation="imported_by",
-                edges=incoming.edges,
+                edges=neighbors.importers,
                 related_by_path=related_by_path,
                 excluded_paths=excluded_paths,
             )
