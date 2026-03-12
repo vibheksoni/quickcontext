@@ -130,6 +130,7 @@ pub fn symbol_lookup(
     } else {
         HashSet::new()
     };
+    let qualified_query = parse_qualified_symbol_query(query);
 
     let mut score_by_symbol_id: HashMap<usize, f64> = HashMap::new();
 
@@ -152,6 +153,17 @@ pub fn symbol_lookup(
     if let Some(ids) = project_index.name_to_symbol_ids.get(&query.to_ascii_lowercase()) {
         for id in ids {
             *score_by_symbol_id.entry(*id).or_insert(0.0) += query_tokens.len().max(1) as f64 + 2.0;
+        }
+    }
+
+    if let Some((parent_query, name_query)) = qualified_query.as_ref() {
+        for symbol in &project_index.symbols {
+            let parent = symbol.parent.as_deref().unwrap_or_default().to_ascii_lowercase();
+            if parent == *parent_query && symbol.name_lower == *name_query {
+                *score_by_symbol_id.entry(symbol.id).or_insert(0.0) += query_tokens.len().max(1) as f64 + 4.5;
+            } else if parent == *parent_query {
+                *score_by_symbol_id.entry(symbol.id).or_insert(0.0) += 1.25;
+            }
         }
     }
 
@@ -1111,6 +1123,31 @@ fn symbol_lookup_kind_multiplier(
     }
 }
 
+fn parse_qualified_symbol_query(query: &str) -> Option<(String, String)> {
+    let normalized = query.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Some(idx) = normalized.rfind("::") {
+        let parent = normalized[..idx].trim();
+        let name = normalized[idx + 2..].trim();
+        if !parent.is_empty() && !name.is_empty() {
+            return Some((parent.to_ascii_lowercase(), name.to_ascii_lowercase()));
+        }
+    }
+
+    if let Some(idx) = normalized.rfind('.') {
+        let parent = normalized[..idx].trim();
+        let name = normalized[idx + 1..].trim();
+        if !parent.is_empty() && !name.is_empty() {
+            return Some((parent.to_ascii_lowercase(), name.to_ascii_lowercase()));
+        }
+    }
+
+    None
+}
+
 fn persistence_path(root: &Path) -> Result<PathBuf, String> {
     let dir = root.join(".quickcontext");
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create index dir: {e}"))?;
@@ -1278,5 +1315,26 @@ mod tests {
     fn test_symbol_lookup_coverage_multiplier_is_neutral_for_single_token_queries() {
         let multiplier = symbol_lookup_coverage_multiplier(1, 0.5, false);
         assert_eq!(multiplier, 1.0);
+    }
+
+    #[test]
+    fn test_parse_qualified_symbol_query_supports_dot_and_colons() {
+        assert_eq!(
+            parse_qualified_symbol_query("CodeSearcher._embed_query_cached"),
+            Some(("codesearcher".to_string(), "_embed_query_cached".to_string()))
+        );
+        assert_eq!(
+            parse_qualified_symbol_query("crate::module::symbol_name"),
+            Some(("crate::module".to_string(), "symbol_name".to_string()))
+        );
+        assert_eq!(parse_qualified_symbol_query("CollectionManager"), None);
+    }
+
+    #[test]
+    fn test_qualified_symbol_bonus_prefers_exact_member_over_parent_only_match() {
+        let base = 1.0;
+        let partial_parent_score = base + 1.25;
+        let exact_member_score = base + 4.5;
+        assert!(exact_member_score > partial_parent_score);
     }
 }
