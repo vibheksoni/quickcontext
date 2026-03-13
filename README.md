@@ -9,14 +9,16 @@ It currently has two main parts:
 - `service/`: a Rust binary for parsing, grep, skeleton generation, text search, protocol search, pattern search, symbol and caller lookup, import graph analysis, and local IPC
 - `engine/`: a Python SDK and CLI for indexing, Qdrant collection management, chunking, deduplication, embeddings, retrieval, watch mode, and edit operations
 
-The SDK now also includes a graph-aware context helper:
+The SDK now includes AI-facing retrieval helpers:
 
+- `QuickContext.retrieve_context_auto(...)`
+  Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, and falls back to semantic or bundle retrieval for broader natural-language questions.
 - `QuickContext.semantic_search_auto(...)`
-  Lets the SDK choose between fast direct retrieval and the deeper graph-aware bundle path.
+  Lets the SDK choose between fast direct semantic retrieval and the deeper graph-aware bundle path.
 - `QuickContext.semantic_search_bundle(...)`
   Returns semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper codebase exploration.
 
-Use `semantic_search(...)` for fast direct retrieval, `semantic_search_auto(...)` as the safest default for AI workflows, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
+Use `retrieve_context_auto(...)` as the default for AI workflows, `semantic_search(...)` for direct semantic retrieval, `semantic_search_auto(...)` when you specifically want semantic-only auto-routing, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
 
 ## Status
 
@@ -193,6 +195,7 @@ cargo test --manifest-path service/Cargo.toml
 python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py
 venv/Scripts/python.exe -m unittest engine.tests.test_regressions
 venv/Scripts/python.exe scripts/retrieval_benchmark.py --config quickcontext.json --project quickcontext
+venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/context_retrieval_cases.json --strategy context-auto
 ```
 
 For local performance work, keep benchmark notes in `BENCHMARK_LOCAL.md`. That file is intentionally gitignored.

@@ -1134,6 +1134,146 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(broad["mode"], "bundle")
         self.assertEqual(broad["results"], ["bundle"])
 
+    def test_extract_symbol_query_candidate_prefers_identifier_targets(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            self.assertEqual(
+                qc._extract_symbol_query_candidate("Where is CodeSearcher.search_hybrid defined?"),
+                "CodeSearcher.search_hybrid",
+            )
+            self.assertEqual(
+                qc._extract_symbol_query_candidate("QuickContext._get_searcher"),
+                "QuickContext._get_searcher",
+            )
+            self.assertIsNone(
+                qc._extract_symbol_query_candidate(
+                    "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?"
+                )
+            )
+        finally:
+            qc.close()
+
+    def test_retrieve_context_auto_routes_symbol_queries_to_symbol_lookup(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            result = SearchResult(
+                1.0,
+                "engine/src/searcher.py",
+                "search_hybrid",
+                "function",
+                1,
+                10,
+                "def search_hybrid(...): ...",
+                "search_hybrid(query, limit=10)",
+                parent="CodeSearcher",
+                language="python",
+            )
+            with mock.patch.object(qc, "_symbol_lookup_search_results", return_value=[result]) as symbol_search, mock.patch.object(
+                qc,
+                "semantic_search_auto",
+                side_effect=AssertionError("semantic_search_auto should not run for symbol query"),
+            ):
+                payload = qc.retrieve_context_auto("Where is CodeSearcher.search_hybrid defined?")
+        finally:
+            qc.close()
+
+        symbol_search.assert_called_once()
+        self.assertEqual(payload["mode"], "symbol")
+        self.assertEqual(payload["results"][0].symbol_name, "search_hybrid")
+
+    def test_retrieve_context_auto_falls_back_to_semantic_auto_when_symbol_results_are_empty(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with mock.patch.object(qc, "_symbol_lookup_search_results", return_value=[]), mock.patch.object(
+                qc,
+                "semantic_search_auto",
+                return_value={"query": "x", "project_name": "p", "mode": "search", "results": ["semantic"], "related_files": [], "related_callers": []},
+            ) as semantic_auto:
+                payload = qc.retrieve_context_auto("Where is CodeSearcher.search_hybrid defined?")
+        finally:
+            qc.close()
+
+        semantic_auto.assert_called_once()
+        self.assertEqual(payload["mode"], "search")
+        self.assertEqual(payload["results"], ["semantic"])
+        self.assertIsNone(payload["symbol_query"])
+
+    def test_retrieve_context_auto_uses_symbol_bundle_for_broad_symbol_queries(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            result = SearchResult(
+                1.0,
+                "engine/src/searcher.py",
+                "search_hybrid",
+                "function",
+                1,
+                10,
+                "def search_hybrid(...): ...",
+                "search_hybrid(query, limit=10)",
+                parent="CodeSearcher",
+                language="python",
+            )
+            with mock.patch.object(qc, "_symbol_lookup_search_results", return_value=[result]), mock.patch.object(
+                qc,
+                "_should_use_bundle_for_query",
+                return_value=True,
+            ), mock.patch.object(
+                qc,
+                "_should_use_graph_related_for_query",
+                return_value=True,
+            ), mock.patch.object(
+                qc,
+                "_related_files_for_results",
+                return_value=[{"file_path": "engine/src/qdrant_search.py", "distance": 1, "relations": []}],
+            ) as related_files, mock.patch.object(
+                qc,
+                "_related_callers_for_results",
+                return_value=[{"symbol": "search_hybrid", "caller_name": "semantic_search"}],
+            ) as related_callers:
+                payload = qc.retrieve_context_auto(
+                    "How do imports and callers around CodeSearcher.search_hybrid flow across the codebase?"
+                )
+        finally:
+            qc.close()
+
+        related_files.assert_called_once()
+        related_callers.assert_called_once()
+        self.assertEqual(payload["mode"], "symbol_bundle")
+        self.assertEqual(payload["results"][0].symbol_name, "search_hybrid")
+        self.assertEqual(payload["related_callers"][0]["caller_name"], "semantic_search")
+
     def test_semantic_search_bundle_can_skip_graph_related_expansion(self) -> None:
         qc = QuickContext(
             EngineConfig(

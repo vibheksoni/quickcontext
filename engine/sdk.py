@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+import re
 import time
 from typing import Optional, TYPE_CHECKING
 
@@ -1387,6 +1388,78 @@ class QuickContext:
             "related_callers": [],
         }
 
+    def retrieve_context_auto(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        limit: int = 5,
+        language: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        project_name: Optional[str] = None,
+        use_keywords: bool = False,
+        keyword_weight: float = 0.3,
+        rerank: bool = False,
+        related_seed_files: int = 1,
+        related_file_limit: int = 8,
+    ) -> dict:
+        """
+        Automatically choose the best retrieval primitive for AI workflows.
+
+        Exact symbol-oriented questions use the Rust symbol index first so the SDK can
+        return the real definition source without paying an embedding round trip. Broader
+        natural-language questions fall back to semantic_search_auto(...).
+        """
+        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+        symbol_query = self._extract_symbol_query_candidate(query)
+        if symbol_query:
+            results = self._symbol_lookup_search_results(
+                query=symbol_query,
+                limit=limit,
+                language=language,
+                path_prefix=path_prefix,
+            )
+            if results:
+                if self._should_use_bundle_for_query(query):
+                    return {
+                        "query": query,
+                        "project_name": project,
+                        "mode": "symbol_bundle",
+                        "symbol_query": symbol_query,
+                        "results": results,
+                        "related_files": self._related_files_for_results(
+                            results=results,
+                            related_seed_files=related_seed_files,
+                            related_file_limit=related_file_limit,
+                        ) if self._should_use_graph_related_for_query(query) else [],
+                        "related_callers": self._related_callers_for_results(results),
+                    }
+
+                return {
+                    "query": query,
+                    "project_name": project,
+                    "mode": "symbol",
+                    "symbol_query": symbol_query,
+                    "results": results,
+                    "related_files": [],
+                    "related_callers": [],
+                }
+
+        payload = self.semantic_search_auto(
+            query=query,
+            mode=mode,
+            limit=limit,
+            language=language,
+            path_prefix=path_prefix,
+            project_name=project,
+            use_keywords=use_keywords,
+            keyword_weight=keyword_weight,
+            rerank=rerank,
+            related_seed_files=related_seed_files,
+            related_file_limit=related_file_limit,
+        )
+        payload["symbol_query"] = None
+        return payload
+
     def structured_search(
         self,
         query: str,
@@ -1468,6 +1541,7 @@ class QuickContext:
         lines = [
             f"QuickContext semantic index for project '{project}' has {points} chunks.",
             "Use 'search' for standard semantic retrieval.",
+            "Use retrieve_context_auto(...) as the default AI entrypoint when queries may be exact symbols, broad architecture questions, or a mix of both.",
             "Use semantic_search_auto(...) when you want the SDK to choose between fast direct retrieval and a deeper graph-aware bundle.",
             "Use structured mode with lex:/vec:/hyde: lines for intent-controlled retrieval.",
             "Use semantic_search_bundle(...) for broader cross-file or architecture questions that need follow-up files.",
@@ -1479,6 +1553,310 @@ class QuickContext:
             lines.append("Index appears empty. Run index before relying on semantic search.")
 
         return "\n".join(lines)
+
+    def _extract_symbol_query_candidate(self, query: str) -> Optional[str]:
+        """
+        Extract a likely symbol target from an identifier-heavy query.
+        """
+        raw_query = query.strip()
+        if not raw_query:
+            return None
+
+        normalized_query = self._normalize_symbol_candidate(raw_query)
+        if normalized_query and self._symbol_candidate_score(normalized_query, query) >= 5:
+            return normalized_query
+
+        candidates: list[str] = []
+        for item in re.findall(r"`([^`]+)`", query):
+            normalized = self._normalize_symbol_candidate(item)
+            if normalized:
+                candidates.append(normalized)
+
+        token_pattern = r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::|#)[A-Za-z_][A-Za-z0-9_]*)*"
+        for item in re.findall(token_pattern, query):
+            normalized = self._normalize_symbol_candidate(item)
+            if normalized:
+                candidates.append(normalized)
+
+        best_candidate: str | None = None
+        best_score = 0
+        seen: set[str] = set()
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            score = self._symbol_candidate_score(candidate, query)
+            if score > best_score:
+                best_candidate = candidate
+                best_score = score
+
+        if best_score >= 5:
+            return best_candidate
+        return None
+
+    def _normalize_symbol_candidate(self, candidate: str) -> Optional[str]:
+        """
+        Normalize symbol-like tokens extracted from user queries.
+        """
+        normalized = candidate.strip().strip("`'\"")
+        normalized = re.sub(r"\(\)$", "", normalized)
+        normalized = re.sub(r"^[^A-Za-z_]+|[^A-Za-z0-9_:.#]+$", "", normalized)
+        if not normalized:
+            return None
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|::|#)[A-Za-z_][A-Za-z0-9_]*)*", normalized):
+            return None
+        return normalized
+
+    def _symbol_candidate_score(self, candidate: str, query: str) -> int:
+        """
+        Score how likely a candidate token is to be the intended symbol target.
+        """
+        lower_query = query.lower()
+        keywords = set(extract_keywords(query, max_keywords=20))
+        score = 0
+
+        if query.strip().strip("`'\"").strip("?!.,") == candidate:
+            score += 5
+        if f"`{candidate}`".lower() in lower_query:
+            score += 2
+        if "." in candidate or "::" in candidate or "#" in candidate:
+            score += 4
+        if "_" in candidate:
+            score += 1
+        if any(char.isupper() for char in candidate):
+            score += 2
+        if re.search(r"[a-z][A-Z]", candidate):
+            score += 1
+        if len(keywords) <= 5:
+            score += 1
+        if keywords.intersection({"function", "method", "class", "symbol", "definition", "define", "defined"}):
+            score += 2
+        if candidate.lower() in {
+            "where",
+            "which",
+            "defined",
+            "definition",
+            "function",
+            "method",
+            "class",
+            "symbol",
+        }:
+            score -= 6
+        if "." not in candidate and "::" not in candidate and "#" not in candidate and candidate.islower() and "_" not in candidate:
+            score -= 2
+
+        return score
+
+    def _symbol_lookup_search_results(
+        self,
+        query: str,
+        limit: int,
+        language: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+    ) -> list:
+        """
+        Run symbol lookup and hydrate top symbol hits into SearchResult rows with source.
+        """
+        lookup = self.symbol_lookup(
+            query=query,
+            path=Path.cwd(),
+            limit=max(limit * 2, 8),
+        )
+        prioritized = self._prioritize_symbol_lookup_results(lookup.results, query)
+        filtered = self._filter_symbol_lookup_results(
+            results=prioritized,
+            language=language,
+            path_prefix=path_prefix,
+        )
+        return self._hydrate_symbol_lookup_results(filtered[: max(limit, 1)])
+
+    def _filter_symbol_lookup_results(
+        self,
+        results: list[object],
+        language: Optional[str],
+        path_prefix: Optional[str],
+    ) -> list:
+        """
+        Apply language and path-prefix filters to raw symbol lookup rows.
+        """
+        normalized_prefix = self._normalize_symbol_path_prefix(path_prefix)
+        filtered: list = []
+        for item in results:
+            item_language = str(getattr(item, "language", "")).lower()
+            if language and item_language != language.lower():
+                continue
+
+            file_path = str(getattr(item, "file_path", ""))
+            if normalized_prefix and not self._symbol_path_matches_prefix(file_path, normalized_prefix):
+                continue
+
+            filtered.append(item)
+        return filtered
+
+    def _normalize_symbol_path_prefix(self, path_prefix: Optional[str]) -> Optional[str]:
+        if not path_prefix:
+            return None
+        return path_prefix.replace("\\", "/").strip("/").lower()
+
+    def _prioritize_symbol_lookup_results(self, results: list, query: str) -> list:
+        """
+        Re-rank symbol lookup rows so exact member hits beat nearby sibling noise.
+        """
+        parent_query, name_query = self._split_symbol_candidate(query)
+        if not name_query:
+            return list(results)
+
+        name_lower = name_query.lower()
+        parent_lower = parent_query.lower() if parent_query else None
+        container_kinds = {"class", "struct", "module", "interface", "trait", "enum"}
+
+        def score(item: object) -> tuple[int, int, str]:
+            value = 0
+            item_name = str(getattr(item, "name", "")).lower()
+            item_parent = str(getattr(item, "parent", "") or "").lower()
+            item_kind = str(getattr(item, "kind", "")).lower()
+
+            if item_name == name_lower:
+                value += 6
+            if parent_lower and item_parent == parent_lower:
+                value += 4 if item_name == name_lower else 1
+            if item_name == name_lower and item_kind in {"function", "method", "class", "struct", "interface", "trait"}:
+                value += 2
+            if parent_lower and item_name == parent_lower and item_kind in container_kinds:
+                value += 3
+
+            return (-value, int(getattr(item, "line_start", 0)), str(getattr(item, "file_path", "")))
+
+        return sorted(results, key=score)
+
+    def _split_symbol_candidate(self, candidate: str) -> tuple[Optional[str], str]:
+        if "::" in candidate:
+            parent, name = candidate.rsplit("::", 1)
+            return parent or None, name
+        for separator in (".", "#"):
+            if separator in candidate:
+                parent, name = candidate.rsplit(separator, 1)
+                return parent or None, name
+        return None, candidate
+
+    def _symbol_path_matches_prefix(self, file_path: str, normalized_prefix: str) -> bool:
+        normalized_path = file_path.replace("\\", "/").lower()
+        if normalized_path.startswith(normalized_prefix):
+            return True
+        return f"/{normalized_prefix}" in normalized_path
+
+    def _hydrate_symbol_lookup_results(self, results: list) -> list:
+        """
+        Hydrate symbol lookup rows into SearchResult objects with source text.
+        """
+        from engine.src.searcher import SearchResult
+
+        hydrated: list[SearchResult] = []
+        seen: set[tuple[str, str, str | None, int, int]] = set()
+        for rank, item in enumerate(results, 1):
+            key = (
+                str(getattr(item, "file_path", "")),
+                str(getattr(item, "name", "")),
+                getattr(item, "parent", None),
+                int(getattr(item, "line_start", 0)),
+                int(getattr(item, "line_end", 0)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            source, signature, docstring = self._read_symbol_context(item)
+            hydrated.append(
+                SearchResult(
+                    score=max(0.0, 1.0 - ((rank - 1) * 0.05)),
+                    file_path=self._normalize_symbol_file_path(str(getattr(item, "file_path", ""))),
+                    symbol_name=str(getattr(item, "name", "")),
+                    symbol_kind=str(getattr(item, "kind", "")),
+                    line_start=int(getattr(item, "line_start", 0)),
+                    line_end=int(getattr(item, "line_end", 0)),
+                    source=source,
+                    description=self._build_symbol_description(item, docstring, signature),
+                    signature=signature,
+                    docstring=docstring,
+                    parent=getattr(item, "parent", None),
+                    language=getattr(item, "language", None),
+                    path_context=self._build_symbol_path_context(
+                        self._normalize_symbol_file_path(str(getattr(item, "file_path", "")))
+                    ),
+                )
+            )
+        return hydrated
+
+    def _normalize_symbol_file_path(self, file_path: str) -> str:
+        if file_path.startswith("\\\\?\\"):
+            return file_path[4:]
+        if file_path.startswith("//?/"):
+            return file_path[4:]
+        return file_path
+
+    def _read_symbol_context(self, item: object) -> tuple[str, Optional[str], Optional[str]]:
+        """
+        Read precise source for a symbol lookup hit.
+        """
+        name = str(getattr(item, "name", ""))
+        parent = getattr(item, "parent", None)
+        file_path = str(getattr(item, "file_path", ""))
+        qualified_name = f"{parent}.{name}" if parent else name
+
+        try:
+            extracted = self.extract_symbol(file=file_path, symbol=qualified_name)
+            for symbol in extracted.symbols:
+                if symbol.name != name:
+                    continue
+                if parent is not None and symbol.parent != parent:
+                    continue
+                return symbol.source, symbol.signature or getattr(item, "signature", None), symbol.docstring
+        except Exception:
+            pass
+
+        try:
+            line_start = max(1, int(getattr(item, "line_start", 0)) + 1)
+            line_end = max(line_start, int(getattr(item, "line_end", 0)) + 1)
+            snippet = self.file_read(
+                file=file_path,
+                start_line=line_start,
+                end_line=line_end,
+            )
+            return (
+                "\n".join(line.text for line in snippet.lines),
+                getattr(item, "signature", None),
+                None,
+            )
+        except Exception:
+            return "", getattr(item, "signature", None), None
+
+    def _build_symbol_description(
+        self,
+        item: object,
+        docstring: Optional[str],
+        signature: Optional[str],
+    ) -> str:
+        """
+        Build a compact description for hydrated symbol lookup results.
+        """
+        if docstring:
+            return docstring.strip()
+        if signature:
+            return signature
+
+        kind = str(getattr(item, "kind", "symbol")).replace("_", " ").strip()
+        name = str(getattr(item, "name", ""))
+        parent = getattr(item, "parent", None)
+        if parent:
+            return f"{kind} {parent}.{name}".strip()
+        return f"{kind} {name}".strip()
+
+    def _build_symbol_path_context(self, file_path: str) -> str:
+        parts = [segment for segment in Path(file_path).parts if segment not in ("", "/", "\\")]
+        if not parts:
+            return ""
+        return " / ".join(parts[-5:])
 
     def _related_files_for_results(
         self,

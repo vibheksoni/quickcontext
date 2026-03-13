@@ -1,0 +1,50 @@
+[
+  {
+    "query": "CodeSearcher.search_hybrid",
+    "expected_paths": ["engine/src/searcher.py"]
+  },
+  {
+    "query": "Where is CodeSearcher.search_hybrid defined?",
+    "expected_paths": ["engine/src/searcher.py"]
+  },
+  {
+    "query": "QuickContext._get_searcher",
+    "expected_paths": ["engine/sdk.py"]
+  },
+  {
+    "query": "Where is CollectionManager.active_collection defined?",
+    "expected_paths": ["engine/src/collection.py"]
+  },
+  {
+    "query": "QdrantConnection.connect",
+    "expected_paths": ["engine/src/qdrant.py"]
+  },
+  {
+    "query": "RustParserService.scan_files",
+    "expected_paths": ["engine/src/parsing.py"]
+  },
+  {
+    "query": "How does CodeSearcher.search_hybrid merge code and description vectors?",
+    "expected_paths": ["engine/src/searcher.py"]
+  },
+  {
+    "query": "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?",
+    "expected_paths": ["engine/src/parsing.py", "engine/src/pipe.py"]
+  },
+  {
+    "query": "How does full indexing avoid replacing unchanged data when it builds a shadow collection?",
+    "expected_paths": ["engine/__init__.py", "engine/src/collection.py"]
+  },
+  {
+    "query": "How are call edges built for symbol caller tracing?",
+    "expected_paths": ["service/src/symbol_index.rs"]
+  },
+  {
+    "query": "How does path-scoped semantic search work in this codebase?",
+    "expected_paths": ["engine/src/searcher.py", "engine/src/indexer.py", "engine/__init__.py"]
+  },
+  {
+    "query": "How does the searcher hydrate lightweight vector search results back into full source snippets?",
+    "expected_paths": ["engine/src/searcher.py"]
+  }
+]

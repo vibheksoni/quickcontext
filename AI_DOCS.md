@@ -79,15 +79,17 @@ Important config ideas:
 
 Useful SDK retrieval primitives:
 
+- `QuickContext.retrieve_context_auto(...)`: default AI entrypoint; routes exact symbol questions to symbol lookup and broader questions to semantic or bundle retrieval
 - `QuickContext.semantic_search(...)`: main semantic retrieval path
-- `QuickContext.semantic_search_auto(...)`: lets the SDK choose between fast direct retrieval and the deeper bundle path
+- `QuickContext.semantic_search_auto(...)`: semantic-only auto-routing between fast direct retrieval and the deeper bundle path
 - `QuickContext.structured_search(...)`: typed multi-query retrieval
 - `QuickContext.semantic_search_bundle(...)`: semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper follow-up exploration
 
 Recommendation:
 
-- Use `semantic_search(...)` for fast single-hop retrieval.
-- Use `semantic_search_auto(...)` as the safest default for AI workflows.
+- Use `retrieve_context_auto(...)` as the safest default for AI workflows.
+- Use `semantic_search(...)` for fast single-hop semantic retrieval.
+- Use `semantic_search_auto(...)` when you specifically want semantic-only auto-routing.
 - Use `semantic_search_bundle(...)` directly when you already know the question is broad, architectural, or likely to require cross-file follow-up context.
 
 ## Important Rust Modules
@@ -138,6 +140,7 @@ Validation commands:
 - `python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py`
 - `venv/Scripts/python.exe -m unittest engine.tests.test_regressions`
 - `venv/Scripts/python.exe scripts/retrieval_benchmark.py --config quickcontext.json --project quickcontext`
+- `venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/context_retrieval_cases.json --strategy context-auto`
 
 Benchmarking guidance:
 
