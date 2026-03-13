@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use redb::{Database, ReadableDatabase, TableDefinition};
+use bincode::config::standard;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
@@ -1174,7 +1175,8 @@ fn persist_index(root: &Path, index: &ProjectIndex) -> Result<(), String> {
         call_edges_ready: index.call_edges_ready,
     };
 
-    let encoded = serde_json::to_vec(&persisted).map_err(|e| format!("failed to encode index: {e}"))?;
+    let encoded = bincode::serde::encode_to_vec(&persisted, standard())
+        .map_err(|e| format!("failed to encode index: {e}"))?;
 
     let txn = db.begin_write().map_err(|e| format!("failed to begin write txn: {e}"))?;
     {
@@ -1204,8 +1206,11 @@ fn load_persisted_index(root: &Path) -> Result<Option<PersistedIndex>, String> {
         Err(_) => return Ok(None),
     };
 
-    let decoded: PersistedIndex = serde_json::from_slice(raw.value())
-        .map_err(|e| format!("failed to decode persisted index: {e}"))?;
+    let decoded: PersistedIndex = match bincode::serde::decode_from_slice::<PersistedIndex, _>(raw.value(), standard()) {
+        Ok((value, _consumed)) => value,
+        Err(_) => serde_json::from_slice(raw.value())
+            .map_err(|e| format!("failed to decode persisted index: {e}"))?,
+    };
     if decoded.schema_version != SYMBOL_INDEX_SCHEMA_VERSION {
         return Ok(None);
     }

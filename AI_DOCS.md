@@ -60,6 +60,7 @@ Important config ideas:
 - local example config uses `fastembed`
 - cloud example config uses `litellm`
 - embedding dimensions must match the Qdrant collection vector dimensions
+- the Rust symbol index snapshot lives in `.quickcontext/symbol_index.redb` and uses a compact binary payload format for faster cold loads
 
 ## Important Python Modules
 
