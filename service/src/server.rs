@@ -862,11 +862,53 @@ fn handle_extract(
     }
 
     match extract_path_with_options(path, specs, options) {
-        Ok(results) => match serde_json::to_value(&results) {
-            Ok(val) => Response::ok_data(val),
-            Err(e) => Response::error(format!("serialization failed: {e}")),
-        },
+        Ok(results) => {
+            if is_stats_only {
+                let stats = build_extract_stats(&results);
+                return match serde_json::to_value(&stats) {
+                    Ok(val) => Response::ok_data(val),
+                    Err(e) => Response::error(format!("serialization failed: {e}")),
+                };
+            }
+
+            if is_compact {
+                let compact_results: Vec<crate::types::CompactExtractionResult> =
+                    results.iter().map(crate::types::CompactExtractionResult::from_full).collect();
+                let stats = build_extract_stats(&results);
+                return match serde_json::to_value(serde_json::json!({
+                    "results": compact_results,
+                    "stats": stats,
+                })) {
+                    Ok(val) => Response::ok_data(val),
+                    Err(e) => Response::error(format!("serialization failed: {e}")),
+                };
+            }
+
+            match serde_json::to_value(&results) {
+                Ok(val) => Response::ok_data(val),
+                Err(e) => Response::error(format!("serialization failed: {e}")),
+            }
+        }
         Err(e) => Response::error(e),
+    }
+}
+
+
+fn build_extract_stats(results: &[crate::types::ExtractionResult]) -> crate::types::ExtractStats {
+    let mut languages: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut total_symbols = 0usize;
+
+    for result in results {
+        total_symbols += result.symbols.len();
+        let entry = languages.entry(result.language.clone()).or_insert(0);
+        *entry += result.symbols.len();
+    }
+
+    crate::types::ExtractStats {
+        total_files: results.len(),
+        total_symbols,
+        languages,
+        duration_ms: 0,
     }
 }
 

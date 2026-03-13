@@ -1704,6 +1704,18 @@ class RustParserService:
             self.connect(timeout_ms=timeout_ms)
 
         raw = self._client.extract(input_path, compact=True, respect_gitignore=respect_gitignore)
+        if isinstance(raw, list):
+            results = [
+                CompactExtractionResult.from_dict(item)
+                for item in raw
+                if isinstance(item, dict)
+            ]
+            return results, ExtractStats(
+                total_files=len(results),
+                total_symbols=sum(item.symbol_count for item in results),
+                languages={},
+                duration_ms=0,
+            )
         results = [
             CompactExtractionResult.from_dict(item)
             for item in raw.get("results", [])

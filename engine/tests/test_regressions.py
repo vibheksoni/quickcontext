@@ -16,7 +16,7 @@ from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
 from engine.src.cli import _optimize_search_config
-from engine.src.parsing import ImportEdge
+from engine.src.parsing import CompactExtractionResult, ExtractStats, ImportEdge, RustParserService
 from engine.src.qdrant import QdrantConnection
 from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS, SearchResult
 
@@ -1644,6 +1644,42 @@ class RegressionTests(unittest.TestCase):
     def test_optimize_search_config_prefers_rest_for_local_qdrant(self) -> None:
         optimized = _optimize_search_config(EngineConfig(qdrant=QdrantConfig(prefer_grpc=True)))
         self.assertFalse(optimized.qdrant.prefer_grpc)
+
+    def test_extract_compact_accepts_file_style_list_payload(self) -> None:
+        service = RustParserService()
+        try:
+            service._client = mock.Mock()
+            service._client.ensure_server = mock.Mock()
+            service._client.extract.return_value = [
+                {
+                    "file_path": str(Path("engine/src/searcher.py").resolve()),
+                    "language": "python",
+                    "symbols": [
+                        {
+                            "name": "search_hybrid",
+                            "kind": "function",
+                            "language": "python",
+                            "file_path": str(Path("engine/src/searcher.py").resolve()),
+                            "line_start": 281,
+                            "line_end": 380,
+                            "signature": "search_hybrid(self, query, limit=10)",
+                            "parent": "CodeSearcher",
+                        }
+                    ],
+                    "symbol_count": 1,
+                }
+            ]
+
+            results, stats = service.extract_compact("engine/src/searcher.py")
+        finally:
+            service.close()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(type(results[0]).__name__, "CompactExtractionResult")
+        self.assertEqual(results[0].symbols[0].name, "search_hybrid")
+        self.assertEqual(type(stats).__name__, "ExtractStats")
+        self.assertEqual(stats.total_files, 1)
+        self.assertEqual(stats.total_symbols, 1)
 
 
 class LazyImportBoundaryTests(unittest.TestCase):
