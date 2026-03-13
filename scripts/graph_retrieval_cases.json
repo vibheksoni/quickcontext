@@ -1,0 +1,18 @@
+[
+  {
+    "query": "Which files import this module and what dependencies does it have?",
+    "expected_paths": ["service/src/import_graph.rs", "engine/src/parsing.py", "engine/sdk.py"]
+  },
+  {
+    "query": "How do caller tracing and call graph traversal work in this codebase?",
+    "expected_paths": ["service/src/symbol_index.rs", "engine/src/parsing.py", "engine/sdk.py"]
+  },
+  {
+    "query": "How does the code find importers for a file and merge import neighbors?",
+    "expected_paths": ["service/src/import_graph.rs", "engine/src/parsing.py", "engine/sdk.py"]
+  },
+  {
+    "query": "How are call edges built and then used for caller lookup?",
+    "expected_paths": ["service/src/symbol_index.rs", "engine/src/parsing.py", "service/src/types.rs"]
+  }
+]
