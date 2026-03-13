@@ -79,7 +79,7 @@ Important config ideas:
 
 Useful SDK retrieval primitives:
 
-- `QuickContext.retrieve_context_auto(...)`: default AI entrypoint; routes exact symbol questions to symbol lookup, expands behavior-oriented exact-symbol questions with helper symbols from the same implementation file using compact symbol metadata plus line-range source reads, and sends broader questions to semantic or bundle retrieval
+- `QuickContext.retrieve_context_auto(...)`: default AI entrypoint; routes exact symbol questions to symbol lookup, expands behavior-oriented exact-symbol questions with helper symbols from the same implementation file using compact symbol metadata plus line-range source reads, and augments non-symbol search-mode queries with filtered lexical companion files from Rust text search
 - `QuickContext.semantic_search(...)`: main semantic retrieval path
 - `QuickContext.semantic_search_auto(...)`: semantic-only auto-routing between fast direct retrieval and the deeper bundle path
 - `QuickContext.structured_search(...)`: typed multi-query retrieval

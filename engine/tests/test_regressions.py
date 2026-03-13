@@ -1222,6 +1222,65 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(payload["results"], ["semantic"])
         self.assertIsNone(payload["symbol_query"])
 
+    def test_retrieve_context_auto_adds_lexical_related_files_for_search_mode(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            semantic_result = SearchResult(
+                1.0,
+                str(Path("engine/src/parsing.py").resolve()),
+                "connect",
+                "function",
+                1,
+                10,
+                "def connect(...): ...",
+                "connect(path)",
+                parent=None,
+                language="python",
+            )
+            text_match = type(
+                "TextMatch",
+                (),
+                {
+                    "file_path": str(Path("engine/src/pipe.py").resolve()),
+                    "language": "python",
+                    "snippet_line_start": 12,
+                },
+            )()
+            with mock.patch.object(
+                qc,
+                "semantic_search_auto",
+                return_value={
+                    "query": "x",
+                    "project_name": "p",
+                    "mode": "search",
+                    "results": [semantic_result],
+                    "related_files": [],
+                    "related_callers": [],
+                },
+            ), mock.patch.object(
+                qc,
+                "text_search",
+                return_value=type("TextResult", (), {"matches": [text_match]})(),
+            ):
+                payload = qc.retrieve_context_auto(
+                    "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?"
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual(payload["mode"], "search")
+        self.assertEqual(len(payload["related_files"]), 1)
+        self.assertEqual(payload["related_files"][0]["file_path"], str(Path("engine/src/pipe.py").resolve()))
+        self.assertEqual(payload["related_files"][0]["relations"][0]["relation"], "lexical_neighbor")
+
     def test_retrieve_context_auto_uses_symbol_bundle_for_broad_symbol_queries(self) -> None:
         qc = QuickContext(
             EngineConfig(
