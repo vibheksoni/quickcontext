@@ -111,6 +111,7 @@ class QuickContext:
         self._indexers: dict = {}
         self._searchers: dict = {}
         self._file_caches: dict[str, FileSignatureCache] = {}
+        self._symbol_file_extract_cache: dict[str, tuple[int, int, list]] = {}
         self._reranker: "ColBERTReranker | None" = None
 
     @property
@@ -1792,14 +1793,10 @@ class QuickContext:
             return []
 
         try:
-            extracted_files = self.extract_symbols(anchor_file)
+            extracted_symbols = self._load_file_symbols(anchor_file)
         except Exception:
             return []
 
-        if not extracted_files:
-            return []
-
-        extracted = extracted_files[0]
         anchor_name = str(getattr(anchor, "symbol_name", ""))
         anchor_parent = getattr(anchor, "parent", None)
         anchor_line_start = int(getattr(anchor, "line_start", 0))
@@ -1808,7 +1805,7 @@ class QuickContext:
         source_lower = anchor_source.lower()
 
         candidates: list[tuple[tuple[int, int, int, int, str], object]] = []
-        for symbol in extracted.symbols:
+        for symbol in extracted_symbols:
             if symbol.name == anchor_name and symbol.parent == anchor_parent and symbol.line_start == anchor_line_start:
                 continue
             if str(symbol.kind).lower() not in {"function", "method", "class", "struct", "interface", "trait"}:
@@ -2062,6 +2059,38 @@ class QuickContext:
             return file_path[4:]
         return file_path
 
+    def _load_file_symbols(self, file_path: str) -> list:
+        """
+        Load extracted symbols for one file with stat-based cache invalidation.
+        """
+        normalized_path = self._normalize_symbol_file_path(file_path)
+        path = Path(normalized_path)
+        try:
+            resolved = str(path.resolve())
+            stat = path.stat()
+            cache_key = resolved
+            cached = self._symbol_file_extract_cache.get(cache_key)
+            if cached and cached[0] == int(stat.st_mtime_ns) and cached[1] == int(stat.st_size):
+                return cached[2]
+        except Exception:
+            cache_key = normalized_path
+            cached = self._symbol_file_extract_cache.get(cache_key)
+            if cached:
+                return cached[2]
+            stat = None
+
+        extracted_files = self.extract_symbols(normalized_path)
+        symbols = extracted_files[0].symbols if extracted_files else []
+        if stat is not None:
+            self._symbol_file_extract_cache[cache_key] = (
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+                symbols,
+            )
+        else:
+            self._symbol_file_extract_cache[cache_key] = (0, 0, symbols)
+        return symbols
+
     def _read_symbol_context(self, item: object) -> tuple[str, Optional[str], Optional[str]]:
         """
         Read precise source for a symbol lookup hit.
@@ -2072,8 +2101,7 @@ class QuickContext:
         qualified_name = f"{parent}.{name}" if parent else name
 
         try:
-            extracted = self.extract_symbol(file=file_path, symbol=qualified_name)
-            for symbol in extracted.symbols:
+            for symbol in self._load_file_symbols(file_path):
                 if symbol.name != name:
                     continue
                 if parent is not None and symbol.parent != parent:
