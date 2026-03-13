@@ -1929,12 +1929,11 @@ class QuickContext:
 
         import_query = bool(keywords.intersection({"import", "imports", "importer", "importers", "dependency", "dependencies", "neighbor", "neighbors", "module"}))
         call_query = bool(keywords.intersection({"call", "calls", "caller", "callers", "trace", "tracing", "traversal", "lookup", "edge", "edges"}))
+        traversal_query = bool(keywords.intersection({"trace", "tracing", "traversal"}))
 
         score = 0
         if relation == "graph_lexical_neighbor":
             score += 2
-        if "/service/src/" in file_path:
-            score += 1
         if import_query:
             score += len(path_tokens.intersection({"import", "imports", "importer", "importers", "graph", "dependency", "dependencies", "neighbor", "neighbors", "module"})) * 2
             if file_path.endswith("/engine/src/parsing.py"):
@@ -1944,8 +1943,17 @@ class QuickContext:
             if file_path.endswith("/engine/src/parsing.py"):
                 score += 1
 
-        if file_path.endswith("/engine/sdk.py") or file_path.endswith("/engine/src/cli.py") or file_path.endswith("/engine/src/pipe.py"):
+        if file_path.endswith("/engine/sdk.py"):
+            if import_query:
+                score += 2
+            if traversal_query:
+                score += 5
+            score -= 2
+        elif file_path.endswith("/engine/src/cli.py") or file_path.endswith("/engine/src/pipe.py"):
             score -= 3
+
+        if traversal_query and file_path.endswith("/service/src/types.rs"):
+            score -= 1
 
         return score
 
