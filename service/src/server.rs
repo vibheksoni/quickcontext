@@ -1320,12 +1320,20 @@ fn handle_warm_project(
     specs: &[LanguageSpec],
 ) -> Response {
     let path = Path::new(path_str);
-    let symbol_count = match warm_symbol_project(path, specs, respect_gitignore) {
-        Ok(count) => count,
-        Err(e) => return Response::error(e),
-    };
-    let text_doc_count = match crate::text_index::warm_index(path, specs, respect_gitignore) {
-        Ok(count) => count,
+    let warm_result: Result<(usize, usize), String> = std::thread::scope(|scope| {
+        let symbol_job = scope.spawn(|| warm_symbol_project(path, specs, respect_gitignore));
+        let text_job = scope.spawn(|| crate::text_index::warm_index(path, specs, respect_gitignore));
+
+        let symbol_count = symbol_job
+            .join()
+            .map_err(|_| "symbol warm thread panicked".to_string())??;
+        let text_doc_count = text_job
+            .join()
+            .map_err(|_| "text warm thread panicked".to_string())??;
+        Ok((symbol_count, text_doc_count))
+    });
+    let (symbol_count, text_doc_count) = match warm_result {
+        Ok(value) => value,
         Err(e) => return Response::error(e),
     };
 
