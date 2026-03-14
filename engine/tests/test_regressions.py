@@ -2118,7 +2118,7 @@ class RegressionTests(unittest.TestCase):
             )
         )
         try:
-            with mock.patch.object(qc, "warm_project", return_value={"symbol_count": 1, "text_doc_count": 1}) as warm:
+            with mock.patch.object(qc, "_background_warm_once", return_value=None) as warm:
                 started = qc.start_background_warm(".", idle_delay_seconds=0.01)
                 started_again = qc.start_background_warm(".", idle_delay_seconds=0.01)
                 for _ in range(20):
@@ -2143,7 +2143,7 @@ class RegressionTests(unittest.TestCase):
             )
         )
         try:
-            with mock.patch.object(qc, "warm_project", return_value={"symbol_count": 1, "text_doc_count": 1}) as warm:
+            with mock.patch.object(qc, "_background_warm_once", return_value=None) as warm:
                 qc.start_background_warm(".", idle_delay_seconds=0.01)
                 with qc._activity_scope():
                     time.sleep(0.03)
@@ -2173,7 +2173,10 @@ class RegressionTests(unittest.TestCase):
             qc.close()
 
         self.assertIs(result, mock.sentinel.lookup)
-        start.assert_called_once_with("service")
+        start.assert_called_once_with(
+            "service",
+            idle_delay_seconds=qc._background_warm_auto_delay_seconds,
+        )
 
     def test_context_manager_does_not_start_background_warm_implicitly(self) -> None:
         qc = QuickContext(
@@ -2189,6 +2192,86 @@ class RegressionTests(unittest.TestCase):
             with qc:
                 pass
         start.assert_not_called()
+
+    def test_background_warm_uses_dedicated_parser_service(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        service = mock.Mock()
+        with mock.patch("engine.sdk.RustParserService", return_value=service) as service_cls:
+            qc._background_warm_once(".")
+
+        service_cls.assert_called_once()
+        service.warm_project.assert_called_once_with(path=".")
+        service.close.assert_called_once()
+
+    def test_collect_symbol_helper_results_keeps_helper_source(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        anchor = SearchResult(
+            score=1.0,
+            file_path=str(Path("engine/src/searcher.py").resolve()),
+            symbol_name="search_hybrid",
+            symbol_kind="method",
+            line_start=10,
+            line_end=20,
+            source="return self.search_code(query) + self.search_description(query)",
+            description="hybrid search",
+            parent="CodeSearcher",
+            language="python",
+        )
+        helpers = [
+            _Symbol(
+                name="search_code",
+                kind="method",
+                language="python",
+                file_path=anchor.file_path,
+                line_start=30,
+                line_end=35,
+                byte_start=0,
+                byte_end=10,
+                source="def search_code(self, query):\n    return []",
+                signature="search_code(self, query)",
+                parent="CodeSearcher",
+            ),
+            _Symbol(
+                name="search_description",
+                kind="method",
+                language="python",
+                file_path=anchor.file_path,
+                line_start=40,
+                line_end=45,
+                byte_start=0,
+                byte_end=10,
+                source="def search_description(self, query):\n    return []",
+                signature="search_description(self, query)",
+                parent="CodeSearcher",
+            ),
+        ]
+
+        with mock.patch.object(qc, "_load_file_symbols", return_value=helpers):
+            results = qc._collect_symbol_helper_results(
+                query="How does CodeSearcher.search_hybrid merge code and description vectors?",
+                anchor=anchor,
+                helper_limit=2,
+            )
+
+        self.assertEqual(len(results), 2)
+        self.assertIn("def search_code", results[0].source)
+        self.assertIn("def search_description", results[1].source)
 
 
 class LazyImportBoundaryTests(unittest.TestCase):

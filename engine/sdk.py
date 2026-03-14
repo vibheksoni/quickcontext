@@ -123,6 +123,7 @@ class QuickContext:
         self._background_warm_stop = Event()
         self._background_warm_path: str | None = None
         self._background_warm_started = False
+        self._background_warm_auto_delay_seconds = 0.5
 
     @property
     def config(self) -> EngineConfig:
@@ -202,7 +203,7 @@ class QuickContext:
                 return
 
             try:
-                self.warm_project(resolved_path)
+                self._background_warm_once(resolved_path)
             except Exception:
                 return
 
@@ -211,8 +212,18 @@ class QuickContext:
         thread.start()
         return True
 
+    def _background_warm_once(self, path: str | Path) -> None:
+        service = RustParserService()
+        try:
+            service.warm_project(path=path)
+        finally:
+            service.close()
+
     def _ensure_background_warm_started(self, path: str | Path = ".") -> None:
-        self.start_background_warm(path)
+        self.start_background_warm(
+            path,
+            idle_delay_seconds=self._background_warm_auto_delay_seconds,
+        )
 
     def _get_collection(self, project_name: str) -> "CollectionManager":
         """
@@ -2461,7 +2472,7 @@ class QuickContext:
             return []
 
         try:
-            extracted_symbols = self._load_file_compact_symbols(anchor_file)
+            extracted_symbols = self._load_file_symbols(anchor_file)
         except Exception:
             return []
 
