@@ -12,6 +12,7 @@ IS_WINDOWS = os.name == "nt"
 WINDOWS_PIPE_NAME = r"\\.\pipe\quickcontext"
 SOCKET_PATH_ENV_VAR = "QC_SOCKET_PATH"
 MAX_FRAME_SIZE = 256 * 1024 * 1024
+_LAUNCHED_SERVER_PROCESSES: list[subprocess.Popen] = []
 
 if IS_WINDOWS:
     import ctypes
@@ -1267,7 +1268,12 @@ class PipeClient:
         else:
             popen_kwargs["start_new_session"] = True
 
-        subprocess.Popen([str(svc), "serve"], **popen_kwargs)
+        proc = subprocess.Popen([str(svc), "serve"], **popen_kwargs)
+        _LAUNCHED_SERVER_PROCESSES[:] = [
+            item for item in _LAUNCHED_SERVER_PROCESSES
+            if item.poll() is None
+        ]
+        _LAUNCHED_SERVER_PROCESSES.append(proc)
 
         self.connect(timeout_ms=timeout_ms)
 
