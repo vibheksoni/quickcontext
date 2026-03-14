@@ -11,7 +11,8 @@ import builtins
 from engine.__main__ import _find_command
 from engine.sdk import QuickContext
 from engine.src.chunker import ChunkBuilder, CodeChunk
-from engine.src.config import EngineConfig, QdrantConfig
+from engine.src.collection import CollectionManager
+from engine.src.config import CollectionVectorConfig, EngineConfig, QdrantConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
@@ -90,6 +91,76 @@ class _FakeClient:
         self.last_retrieve_with_payload = kwargs.get("with_payload")
         self.retrieve_calls += 1
         return self._records
+
+
+class _FakeCollectionSummary:
+    def __init__(self, name: str):
+        self.name = name
+
+
+class _FakeAliasSummary:
+    def __init__(self, alias_name: str, collection_name: str):
+        self.alias_name = alias_name
+        self.collection_name = collection_name
+
+
+class _FakeCollectionList:
+    def __init__(self, collections: list[str]):
+        self.collections = [_FakeCollectionSummary(name) for name in collections]
+
+
+class _FakeAliasList:
+    def __init__(self, aliases: dict[str, str]):
+        self.aliases = [
+            _FakeAliasSummary(alias_name=name, collection_name=target)
+            for name, target in aliases.items()
+        ]
+
+
+class _FakeCollectionClient:
+    def __init__(self, collections: list[str], aliases: dict[str, str] | None = None):
+        self.collections = set(collections)
+        self.aliases = dict(aliases or {})
+        self.payload_index_calls: list[tuple[str, str]] = []
+
+    def get_collections(self):
+        return _FakeCollectionList(sorted(self.collections))
+
+    def get_collection(self, name: str):
+        resolved = self.aliases.get(name, name)
+        if resolved not in self.collections:
+            raise RuntimeError(f"missing collection: {name}")
+        return object()
+
+    def get_collection_aliases(self, collection_name: str):
+        aliases = {
+            alias_name: target
+            for alias_name, target in self.aliases.items()
+            if alias_name == collection_name
+        }
+        return _FakeAliasList(aliases)
+
+    def get_aliases(self):
+        return _FakeAliasList(self.aliases)
+
+    def create_collection(self, collection_name: str, vectors_config):
+        self.collections.add(collection_name)
+
+    def create_payload_index(self, collection_name: str, field_name: str, field_schema):
+        self.payload_index_calls.append((collection_name, field_name))
+
+    def update_collection_aliases(self, change_aliases_operations):
+        for op in change_aliases_operations:
+            create_alias = getattr(op, "create_alias", None)
+            if create_alias is not None:
+                self.aliases[create_alias.alias_name] = create_alias.collection_name
+                continue
+            delete_alias = getattr(op, "delete_alias", None)
+            if delete_alias is not None:
+                self.aliases.pop(delete_alias.alias_name, None)
+
+    def delete_collection(self, name: str):
+        self.collections.discard(name)
 
 
 class _BlockedImport:
@@ -233,6 +304,31 @@ class RegressionTests(unittest.TestCase):
                 file_mtime=int(stat.st_mtime),
             )
             self.assertIsNone(changed)
+
+    def test_collection_shadow_swap_and_cleanup_keeps_new_active_version(self) -> None:
+        client = _FakeCollectionClient(
+            collections=["demo_v1", "demo_v2"],
+            aliases={"demo": "demo_v2"},
+        )
+        config = EngineConfig(
+            qdrant=QdrantConfig(),
+            code_embedding=None,
+            desc_embedding=None,
+            llm=None,
+            vectors=[CollectionVectorConfig(name="code", dimension=8, distance="cosine")],
+        )
+        manager = CollectionManager(client=client, config=config, collection_name="demo")
+
+        shadow_name = manager.create_shadow()
+        old_collection = manager.swap_alias(shadow_name)
+        deleted = manager.cleanup_old_versions()
+
+        self.assertEqual(shadow_name, "demo_v3")
+        self.assertEqual(old_collection, "demo_v2")
+        self.assertEqual(manager.resolve_alias(), "demo_v3")
+        self.assertEqual(set(deleted), {"demo_v1", "demo_v2"})
+        self.assertIn("demo_v3", client.collections)
+        self.assertNotIn("demo_v2", client.collections)
 
     def test_searcher_can_share_query_embedding_when_providers_match(self) -> None:
         provider = _FakeProvider("shared-model", 2)
