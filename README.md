@@ -24,6 +24,7 @@ The SDK now includes AI-facing retrieval helpers:
 
 Use `retrieve_context_auto(...)` as the default for AI workflows, `semantic_search(...)` for direct semantic retrieval, `semantic_search_auto(...)` when you specifically want semantic-only auto-routing, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
 If you run the service as a long-lived process, call `warm_project('.')` once after startup to preload local indices before the first heavy query. If you do not want to pay that startup cost up front, call `start_background_warm('.')` and let the SDK defer the same warmup until the session goes idle.
+Entering `with QuickContext(...)` keeps subsystems lazy: parser-only flows do not preconnect Qdrant, and vector features still connect on first use.
 
 ## Status
 

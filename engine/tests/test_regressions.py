@@ -2193,6 +2193,21 @@ class RegressionTests(unittest.TestCase):
                 pass
         start.assert_not_called()
 
+    def test_context_manager_does_not_connect_eagerly(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=QdrantConfig(),
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        with mock.patch.object(qc, "connect", return_value=qc) as connect:
+            with qc:
+                pass
+        connect.assert_not_called()
+
     def test_background_warm_uses_dedicated_parser_service(self) -> None:
         qc = QuickContext(
             EngineConfig(

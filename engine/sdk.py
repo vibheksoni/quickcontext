@@ -4194,7 +4194,6 @@ class QuickContext:
         self._searchers.clear()
 
     def __enter__(self) -> "QuickContext":
-        self.connect()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:

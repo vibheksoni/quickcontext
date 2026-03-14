@@ -32,6 +32,12 @@ Flow:
 3. Rust handles parser, search, and other heavy operations.
 4. Python handles indexing, embeddings, Qdrant collections, retrieval composition, and SDK ergonomics.
 
+`QuickContext` keeps that split lazy in practice:
+
+- entering `with QuickContext(...)` does not force a Qdrant connection up front
+- parser-only and text-first workflows can start without paying vector-store startup cost
+- Qdrant still connects lazily on first vector or collection operation
+
 ## IPC Transport
 
 The protocol is the same on all supported platforms:
