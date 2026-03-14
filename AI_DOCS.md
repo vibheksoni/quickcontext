@@ -83,6 +83,7 @@ Useful SDK retrieval primitives:
 
 - `QuickContext.retrieve_context_auto(...)`: default AI entrypoint; routes exact symbol questions to symbol lookup, expands behavior-oriented exact-symbol questions with helper symbols from the same implementation file using compact symbol metadata plus line-range source reads, can use Rust text search as the primary path for strong non-symbol technical queries, and attaches scoped graph-lexical companions for import/dependency-style graph questions
 - `QuickContext.warm_project(...)`: preload persisted Rust symbol and text indices for a project root before the first real query
+- `QuickContext.start_background_warm(...)`: schedule the same Rust warmup to run once the SDK session goes idle instead of blocking startup
 - `QuickContext.semantic_search(...)`: main semantic retrieval path
 - `QuickContext.semantic_search_auto(...)`: semantic-only auto-routing between fast direct retrieval and the deeper bundle path
 - `QuickContext.structured_search(...)`: typed multi-query retrieval
@@ -95,6 +96,7 @@ Recommendation:
 - Use `semantic_search_auto(...)` when you specifically want semantic-only auto-routing.
 - Use `semantic_search_bundle(...)` directly when you already know the question is broad, architectural, or likely to require cross-file follow-up context.
 - Use `warm_project(...)` once near startup when you expect a long-lived service session and want the first heavy query to be cheaper.
+- Use `start_background_warm(...)` when you want that same project warmup to happen opportunistically after the session goes idle instead of paying the cost up front.
 
 ## Important Rust Modules
 

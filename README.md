@@ -15,13 +15,15 @@ The SDK now includes AI-facing retrieval helpers:
   Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, expands behavior-oriented symbol questions with helper symbols from the same implementation file, and falls back to semantic or bundle retrieval for broader natural-language questions.
 - `QuickContext.warm_project(...)`
   Optional startup warmup for the long-lived Rust service. It preloads the persisted Rust symbol and text indices for a project so the first real query is cheaper.
+- `QuickContext.start_background_warm(...)`
+  Optional idle warmup for long-lived SDK sessions. It schedules the same project warmup to happen once the session goes idle instead of blocking startup.
 - `QuickContext.semantic_search_auto(...)`
   Lets the SDK choose between fast direct semantic retrieval and the deeper graph-aware bundle path.
 - `QuickContext.semantic_search_bundle(...)`
   Returns semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper codebase exploration.
 
 Use `retrieve_context_auto(...)` as the default for AI workflows, `semantic_search(...)` for direct semantic retrieval, `semantic_search_auto(...)` when you specifically want semantic-only auto-routing, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
-If you run the service as a long-lived process, call `warm_project('.')` once after startup to preload local indices before the first heavy query.
+If you run the service as a long-lived process, call `warm_project('.')` once after startup to preload local indices before the first heavy query. If you do not want to pay that startup cost up front, call `start_background_warm('.')` and let the SDK defer the same warmup until the session goes idle.
 
 ## Status
 

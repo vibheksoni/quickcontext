@@ -24,6 +24,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--query", required=True, help="Query to benchmark.")
     parser.add_argument("--repeats", type=int, default=3, help="Number of cold-vs-warm trials.")
     parser.add_argument("--limit", type=int, default=4, help="Result limit for retrieve_context_auto.")
+    parser.add_argument("--background-idle-ms", type=int, default=300, help="Idle delay before measuring background warm mode.")
     return parser.parse_args()
 
 
@@ -52,12 +53,30 @@ def _measure_query(config: EngineConfig, query: str, project: str, limit: int, d
         return latency_ms, warm_stats
 
 
+def _measure_background_query(
+    config: EngineConfig,
+    query: str,
+    project: str,
+    limit: int,
+    warm_path: str,
+    background_idle_ms: int,
+) -> float:
+    _stop_service()
+    with QuickContext(config) as qc:
+        qc.start_background_warm(warm_path, idle_delay_seconds=0.05)
+        time.sleep(max(background_idle_ms, 1) / 1000.0)
+        started = time.perf_counter()
+        qc.retrieve_context_auto(query=query, project_name=project, limit=limit)
+        return (time.perf_counter() - started) * 1000
+
+
 def main() -> None:
     args = _parse_args()
     config = _optimize_search_config(_load_config(args.config))
 
     cold_latencies: list[float] = []
     warm_latencies: list[float] = []
+    background_latencies: list[float] = []
     last_warm_stats: dict | None = None
 
     for _ in range(max(1, args.repeats)):
@@ -65,6 +84,15 @@ def main() -> None:
         cold_latencies.append(cold_ms)
         warm_ms, warm_stats = _measure_query(config, args.query, args.project, args.limit, True, args.path)
         warm_latencies.append(warm_ms)
+        background_ms = _measure_background_query(
+            config,
+            args.query,
+            args.project,
+            args.limit,
+            args.path,
+            args.background_idle_ms,
+        )
+        background_latencies.append(background_ms)
         last_warm_stats = warm_stats
 
     print("Summary")
@@ -77,9 +105,12 @@ def main() -> None:
     print(f"  Cold median latency: {median(cold_latencies):.2f} ms")
     print(f"  Warm mean latency: {mean(warm_latencies):.2f} ms")
     print(f"  Warm median latency: {median(warm_latencies):.2f} ms")
+    print(f"  Background warm mean latency: {mean(background_latencies):.2f} ms")
+    print(f"  Background warm median latency: {median(background_latencies):.2f} ms")
     print()
     print(f"  Cold runs: {[round(item, 2) for item in cold_latencies]}")
     print(f"  Warm runs: {[round(item, 2) for item in warm_latencies]}")
+    print(f"  Background runs: {[round(item, 2) for item in background_latencies]}")
 
 
 if __name__ == "__main__":

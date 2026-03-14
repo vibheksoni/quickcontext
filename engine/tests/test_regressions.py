@@ -2107,6 +2107,89 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(payload["symbol_count"], 10)
         self.assertEqual(payload["text_doc_count"], 5)
 
+    def test_background_warm_starts_only_once(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with mock.patch.object(qc, "warm_project", return_value={"symbol_count": 1, "text_doc_count": 1}) as warm:
+                started = qc.start_background_warm(".", idle_delay_seconds=0.01)
+                started_again = qc.start_background_warm(".", idle_delay_seconds=0.01)
+                for _ in range(20):
+                    if warm.call_count:
+                        break
+                    time.sleep(0.01)
+        finally:
+            qc.close()
+
+        self.assertTrue(started)
+        self.assertFalse(started_again)
+        warm.assert_called_once()
+
+    def test_background_warm_waits_for_activity_to_finish(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with mock.patch.object(qc, "warm_project", return_value={"symbol_count": 1, "text_doc_count": 1}) as warm:
+                qc.start_background_warm(".", idle_delay_seconds=0.01)
+                with qc._activity_scope():
+                    time.sleep(0.03)
+                    self.assertFalse(warm.called)
+                time.sleep(0.05)
+        finally:
+            qc.close()
+
+        warm.assert_called_once()
+
+    def test_symbol_lookup_uses_requested_path_for_background_warm(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            qc._parser_service = mock.Mock()
+            qc._parser_service.symbol_lookup.return_value = mock.sentinel.lookup
+            with mock.patch.object(qc, "start_background_warm", return_value=True) as start:
+                result = qc.symbol_lookup("CollectionManager", path="service")
+        finally:
+            qc.close()
+
+        self.assertIs(result, mock.sentinel.lookup)
+        start.assert_called_once_with("service")
+
+    def test_context_manager_does_not_start_background_warm_implicitly(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        with mock.patch.object(qc, "start_background_warm", return_value=True) as start:
+            with qc:
+                pass
+        start.assert_not_called()
+
 
 class LazyImportBoundaryTests(unittest.TestCase):
     def _reload_module(self, module_name: str):

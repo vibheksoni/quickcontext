@@ -1,7 +1,9 @@
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 import re
 import time
+from threading import Event, Lock, Thread
 from typing import Optional, TYPE_CHECKING
 
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
@@ -114,6 +116,13 @@ class QuickContext:
         self._symbol_file_compact_cache: dict[str, tuple[int, int, list]] = {}
         self._symbol_file_extract_cache: dict[str, tuple[int, int, list]] = {}
         self._reranker: "ColBERTReranker | None" = None
+        self._activity_lock = Lock()
+        self._active_operations = 0
+        self._last_activity_at = time.monotonic()
+        self._background_warm_thread: Thread | None = None
+        self._background_warm_stop = Event()
+        self._background_warm_path: str | None = None
+        self._background_warm_started = False
 
     @property
     def config(self) -> EngineConfig:
@@ -149,6 +158,61 @@ class QuickContext:
             return self
         self.connection.connect(verify=verify)
         return self
+
+    @contextmanager
+    def _activity_scope(self):
+        with self._activity_lock:
+            self._active_operations += 1
+            self._last_activity_at = time.monotonic()
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._active_operations = max(0, self._active_operations - 1)
+                self._last_activity_at = time.monotonic()
+
+    def start_background_warm(
+        self,
+        path: str | Path = ".",
+        idle_delay_seconds: float = 0.05,
+    ) -> bool:
+        """
+        Start a best-effort background warm after the session goes idle.
+        """
+        resolved_path = str(Path(path).resolve())
+        with self._activity_lock:
+            if self._background_warm_started and self._background_warm_path == resolved_path:
+                return False
+            if self._background_warm_thread is not None and self._background_warm_thread.is_alive():
+                return False
+            self._background_warm_started = True
+            self._background_warm_path = resolved_path
+            self._background_warm_stop.clear()
+
+        def _runner() -> None:
+            while not self._background_warm_stop.is_set():
+                with self._activity_lock:
+                    active = self._active_operations
+                    idle_for = time.monotonic() - self._last_activity_at
+                if active == 0 and idle_for >= idle_delay_seconds:
+                    break
+                self._background_warm_stop.wait(0.05)
+
+            if self._background_warm_stop.is_set():
+                return
+
+            try:
+                self.warm_project(resolved_path)
+            except Exception:
+                return
+
+        thread = Thread(target=_runner, name="quickcontext-warm", daemon=True)
+        self._background_warm_thread = thread
+        thread.start()
+        return True
+
+    def _ensure_background_warm_started(self, path: str | Path = ".") -> None:
+        self.start_background_warm(path)
 
     def _get_collection(self, project_name: str) -> "CollectionManager":
         """
@@ -553,16 +617,18 @@ class QuickContext:
         timeout_ms: int — Startup/connect timeout in milliseconds.
         Returns: SymbolLookupResult — Typed symbol lookup payload.
         """
-        return self.parser_service.symbol_lookup(
-            query=query,
-            path=path,
-            respect_gitignore=respect_gitignore,
-            limit=limit,
-            intent_mode=intent_mode,
-            intent_level=intent_level,
-            ensure_server=ensure_server,
-            timeout_ms=timeout_ms,
-        )
+        self._ensure_background_warm_started(path or Path.cwd())
+        with self._activity_scope():
+            return self.parser_service.symbol_lookup(
+                query=query,
+                path=path,
+                respect_gitignore=respect_gitignore,
+                limit=limit,
+                intent_mode=intent_mode,
+                intent_level=intent_level,
+                ensure_server=ensure_server,
+                timeout_ms=timeout_ms,
+            )
 
     def find_callers(
         self,
@@ -584,14 +650,16 @@ class QuickContext:
         timeout_ms: int — Startup/connect timeout in milliseconds.
         Returns: CallerLookupResult — Typed caller lookup payload.
         """
-        return self.parser_service.find_callers(
-            symbol=symbol,
-            path=path,
-            respect_gitignore=respect_gitignore,
-            limit=limit,
-            ensure_server=ensure_server,
-            timeout_ms=timeout_ms,
-        )
+        self._ensure_background_warm_started(path or Path.cwd())
+        with self._activity_scope():
+            return self.parser_service.find_callers(
+                symbol=symbol,
+                path=path,
+                respect_gitignore=respect_gitignore,
+                limit=limit,
+                ensure_server=ensure_server,
+                timeout_ms=timeout_ms,
+            )
 
     def trace_call_graph(
         self,
@@ -615,15 +683,17 @@ class QuickContext:
         timeout_ms: int — Startup/connect timeout in milliseconds.
         Returns: CallGraphTraceResult — Typed call graph trace payload.
         """
-        return self.parser_service.trace_call_graph(
-            symbol=symbol,
-            path=path,
-            respect_gitignore=respect_gitignore,
-            direction=direction,
-            max_depth=max_depth,
-            ensure_server=ensure_server,
-            timeout_ms=timeout_ms,
-        )
+        self._ensure_background_warm_started(path or Path.cwd())
+        with self._activity_scope():
+            return self.parser_service.trace_call_graph(
+                symbol=symbol,
+                path=path,
+                respect_gitignore=respect_gitignore,
+                direction=direction,
+                max_depth=max_depth,
+                ensure_server=ensure_server,
+                timeout_ms=timeout_ms,
+            )
 
     def skeleton(
         self,
@@ -758,16 +828,18 @@ class QuickContext:
         timeout_ms: int — Startup/connect timeout in milliseconds.
         Returns: TextSearchResult — Typed BM25 search result payload.
         """
-        return self.parser_service.text_search(
-            query=query,
-            path=path,
-            respect_gitignore=respect_gitignore,
-            limit=limit,
-            intent_mode=intent_mode,
-            intent_level=intent_level,
-            ensure_server=ensure_server,
-            timeout_ms=timeout_ms,
-        )
+        self._ensure_background_warm_started(path or Path.cwd())
+        with self._activity_scope():
+            return self.parser_service.text_search(
+                query=query,
+                path=path,
+                respect_gitignore=respect_gitignore,
+                limit=limit,
+                intent_mode=intent_mode,
+                intent_level=intent_level,
+                ensure_server=ensure_server,
+                timeout_ms=timeout_ms,
+            )
 
     def warm_project(
         self,
@@ -1239,11 +1311,36 @@ class QuickContext:
         rerank_candidate_multiplier: int — Candidate multiplier before reranking.
         Returns: list — SearchResult list.
         """
-        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
-        searcher = self._get_searcher(project, rerank=rerank)
+        self._ensure_background_warm_started()
+        with self._activity_scope():
+            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            searcher = self._get_searcher(project, rerank=rerank)
 
-        if mode == "code":
-            return searcher.search_code(
+            if mode == "code":
+                return searcher.search_code(
+                    query=query,
+                    limit=limit,
+                    language=language,
+                    path_prefix=path_prefix,
+                    use_keywords=use_keywords,
+                    keyword_weight=keyword_weight,
+                    rerank=rerank,
+                    include_source=include_source,
+                )
+
+            if mode == "desc":
+                return searcher.search_description(
+                    query=query,
+                    limit=limit,
+                    language=language,
+                    path_prefix=path_prefix,
+                    use_keywords=use_keywords,
+                    keyword_weight=keyword_weight,
+                    rerank=rerank,
+                    include_source=include_source,
+                )
+
+            return searcher.search_hybrid(
                 query=query,
                 limit=limit,
                 language=language,
@@ -1251,38 +1348,15 @@ class QuickContext:
                 use_keywords=use_keywords,
                 keyword_weight=keyword_weight,
                 rerank=rerank,
+                rrf_k=rrf_k,
+                top_rank_bonus_1=top_rank_bonus_1,
+                top_rank_bonus_2_3=top_rank_bonus_2_3,
+                rerank_top3_retrieval_weight=rerank_top3_retrieval_weight,
+                rerank_top10_retrieval_weight=rerank_top10_retrieval_weight,
+                rerank_tail_retrieval_weight=rerank_tail_retrieval_weight,
+                rerank_candidate_multiplier=rerank_candidate_multiplier,
                 include_source=include_source,
             )
-
-        if mode == "desc":
-            return searcher.search_description(
-                query=query,
-                limit=limit,
-                language=language,
-                path_prefix=path_prefix,
-                use_keywords=use_keywords,
-                keyword_weight=keyword_weight,
-                rerank=rerank,
-                include_source=include_source,
-            )
-
-        return searcher.search_hybrid(
-            query=query,
-            limit=limit,
-            language=language,
-            path_prefix=path_prefix,
-            use_keywords=use_keywords,
-            keyword_weight=keyword_weight,
-            rerank=rerank,
-            rrf_k=rrf_k,
-            top_rank_bonus_1=top_rank_bonus_1,
-            top_rank_bonus_2_3=top_rank_bonus_2_3,
-            rerank_top3_retrieval_weight=rerank_top3_retrieval_weight,
-            rerank_top10_retrieval_weight=rerank_top10_retrieval_weight,
-            rerank_tail_retrieval_weight=rerank_tail_retrieval_weight,
-            rerank_candidate_multiplier=rerank_candidate_multiplier,
-            include_source=include_source,
-        )
 
     def semantic_search_bundle(
         self,
@@ -1306,58 +1380,60 @@ class QuickContext:
         This is intended for deeper AI workflows that need both the best semantic anchors
         and a small set of adjacent files to inspect next.
         """
-        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
-        tooling_query = self._looks_like_tooling_query(query)
-        semantic_limit = max(limit, 1) * 4
-        if tooling_query:
-            semantic_limit = max(semantic_limit, 20)
-        results = self.semantic_search(
-            query=query,
-            mode=mode,
-            limit=semantic_limit,
-            language=language,
-            path_prefix=path_prefix,
-            project_name=project,
-            use_keywords=use_keywords,
-            keyword_weight=keyword_weight,
-            rerank=rerank,
-            include_source=False,
-        )
-        anchors, semantic_neighbors = self._split_semantic_bundle_results(
-            results=results,
-            anchor_limit=limit,
-            related_file_limit=related_file_limit,
-        )
-        tooling_neighbors = self._tooling_related_semantic_neighbors(
-            results=results,
-            tooling_query=tooling_query,
-            excluded_paths={item.file_path for item in anchors},
-            related_file_limit=related_file_limit,
-        )
-        tooling_paths = {item["file_path"] for item in tooling_neighbors}
-        prioritized_related = tooling_neighbors + [
-            item
-            for item in semantic_neighbors
-            if item["file_path"] not in tooling_paths
-        ]
-
-        related = []
-        if include_graph_related:
-            related = self._related_files_for_results(
-                results=anchors,
-                related_seed_files=related_seed_files,
-                related_file_limit=max(0, related_file_limit - len(prioritized_related)),
+        self._ensure_background_warm_started()
+        with self._activity_scope():
+            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            tooling_query = self._looks_like_tooling_query(query)
+            semantic_limit = max(limit, 1) * 4
+            if tooling_query:
+                semantic_limit = max(semantic_limit, 20)
+            results = self.semantic_search(
+                query=query,
+                mode=mode,
+                limit=semantic_limit,
+                language=language,
+                path_prefix=path_prefix,
+                project_name=project,
+                use_keywords=use_keywords,
+                keyword_weight=keyword_weight,
+                rerank=rerank,
+                include_source=False,
             )
-        related_callers = self._related_callers_for_results(results)
-        final_anchors = self._hydrate_search_result_sources(anchors) if include_source else anchors
+            anchors, semantic_neighbors = self._split_semantic_bundle_results(
+                results=results,
+                anchor_limit=limit,
+                related_file_limit=related_file_limit,
+            )
+            tooling_neighbors = self._tooling_related_semantic_neighbors(
+                results=results,
+                tooling_query=tooling_query,
+                excluded_paths={item.file_path for item in anchors},
+                related_file_limit=related_file_limit,
+            )
+            tooling_paths = {item["file_path"] for item in tooling_neighbors}
+            prioritized_related = tooling_neighbors + [
+                item
+                for item in semantic_neighbors
+                if item["file_path"] not in tooling_paths
+            ]
 
-        return {
-            "query": query,
-            "project_name": project,
-            "results": final_anchors,
-            "related_files": prioritized_related[:related_file_limit] + related,
-            "related_callers": related_callers,
-        }
+            related = []
+            if include_graph_related:
+                related = self._related_files_for_results(
+                    results=anchors,
+                    related_seed_files=related_seed_files,
+                    related_file_limit=max(0, related_file_limit - len(prioritized_related)),
+                )
+            related_callers = self._related_callers_for_results(results)
+            final_anchors = self._hydrate_search_result_sources(anchors) if include_source else anchors
+
+            return {
+                "query": query,
+                "project_name": project,
+                "results": final_anchors,
+                "related_files": prioritized_related[:related_file_limit] + related,
+                "related_callers": related_callers,
+            }
 
     def semantic_search_auto(
         self,
@@ -1377,44 +1453,46 @@ class QuickContext:
         """
         Automatically choose between plain semantic search and the graph-aware bundle primitive.
         """
-        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
-        if self._should_use_bundle_for_query(query):
-            bundle = self.semantic_search_bundle(
-                query=query,
-                mode=mode,
-                limit=limit,
-                language=language,
-                path_prefix=path_prefix,
-                project_name=project,
-                use_keywords=use_keywords,
-                keyword_weight=keyword_weight,
-                rerank=rerank,
-                related_seed_files=related_seed_files,
-                related_file_limit=related_file_limit,
-                include_graph_related=self._should_use_graph_related_for_query(query),
-            )
-            bundle["mode"] = "bundle"
-            return bundle
+        self._ensure_background_warm_started()
+        with self._activity_scope():
+            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            if self._should_use_bundle_for_query(query):
+                bundle = self.semantic_search_bundle(
+                    query=query,
+                    mode=mode,
+                    limit=limit,
+                    language=language,
+                    path_prefix=path_prefix,
+                    project_name=project,
+                    use_keywords=use_keywords,
+                    keyword_weight=keyword_weight,
+                    rerank=rerank,
+                    related_seed_files=related_seed_files,
+                    related_file_limit=related_file_limit,
+                    include_graph_related=self._should_use_graph_related_for_query(query),
+                )
+                bundle["mode"] = "bundle"
+                return bundle
 
-        return {
-            "query": query,
-            "project_name": project,
-            "mode": "search",
-            "results": self.semantic_search(
-                query=query,
-                mode=mode,
-                limit=limit,
-                language=language,
-                path_prefix=path_prefix,
-                project_name=project,
-                use_keywords=use_keywords,
-                keyword_weight=keyword_weight,
-                rerank=rerank,
-                include_source=include_source,
-            ),
-            "related_files": [],
-            "related_callers": [],
-        }
+            return {
+                "query": query,
+                "project_name": project,
+                "mode": "search",
+                "results": self.semantic_search(
+                    query=query,
+                    mode=mode,
+                    limit=limit,
+                    language=language,
+                    path_prefix=path_prefix,
+                    project_name=project,
+                    use_keywords=use_keywords,
+                    keyword_weight=keyword_weight,
+                    rerank=rerank,
+                    include_source=include_source,
+                ),
+                "related_files": [],
+                "related_callers": [],
+            }
 
     def retrieve_context_auto(
         self,
@@ -1437,73 +1515,93 @@ class QuickContext:
         return the real definition source without paying an embedding round trip. Broader
         natural-language questions fall back to semantic_search_auto(...).
         """
-        project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
-        symbol_query = self._extract_symbol_query_candidate(query)
-        if symbol_query:
-            expand_symbol_context = self._should_expand_symbol_context_results(query)
-            results = self._symbol_lookup_search_results(
-                query=symbol_query,
-                limit=1 if expand_symbol_context else limit,
-                language=language,
-                path_prefix=path_prefix,
-            )
-            if results:
-                if expand_symbol_context:
-                    results = self._expand_symbol_context_results(
-                        query=query,
-                        results=results,
-                        limit=limit,
-                    )
-                if self._should_use_bundle_for_query(query):
+        self._ensure_background_warm_started()
+        with self._activity_scope():
+            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            symbol_query = self._extract_symbol_query_candidate(query)
+            if symbol_query:
+                expand_symbol_context = self._should_expand_symbol_context_results(query)
+                results = self._symbol_lookup_search_results(
+                    query=symbol_query,
+                    limit=1 if expand_symbol_context else limit,
+                    language=language,
+                    path_prefix=path_prefix,
+                )
+                if results:
+                    if expand_symbol_context:
+                        results = self._expand_symbol_context_results(
+                            query=query,
+                            results=results,
+                            limit=limit,
+                        )
+                    if self._should_use_bundle_for_query(query):
+                        return {
+                            "query": query,
+                            "project_name": project,
+                            "mode": "symbol_bundle",
+                            "symbol_query": symbol_query,
+                            "results": results,
+                            "related_files": self._related_files_for_results(
+                                results=results,
+                                related_seed_files=related_seed_files,
+                                related_file_limit=related_file_limit,
+                            ) if self._should_use_graph_related_for_query(query) else [],
+                            "related_callers": self._related_callers_for_results(results),
+                        }
+
                     return {
                         "query": query,
                         "project_name": project,
-                        "mode": "symbol_bundle",
+                        "mode": "symbol",
                         "symbol_query": symbol_query,
                         "results": results,
-                        "related_files": self._related_files_for_results(
-                            results=results,
-                            related_seed_files=related_seed_files,
-                            related_file_limit=related_file_limit,
-                        ) if self._should_use_graph_related_for_query(query) else [],
-                        "related_callers": self._related_callers_for_results(results),
+                        "related_files": [],
+                        "related_callers": [],
                     }
 
-                return {
-                    "query": query,
-                    "project_name": project,
-                    "mode": "symbol",
-                    "symbol_query": symbol_query,
-                    "results": results,
-                    "related_files": [],
-                    "related_callers": [],
-                }
+            should_use_bundle = self._should_use_bundle_for_query(query)
+            should_use_graph_related = self._should_use_graph_related_for_query(query)
 
-        should_use_bundle = self._should_use_bundle_for_query(query)
-        should_use_graph_related = self._should_use_graph_related_for_query(query)
+            if not should_use_graph_related:
+                try:
+                    text_result = self.text_search(
+                        query=query,
+                        path=Path.cwd(),
+                        limit=max(limit + related_file_limit, 8),
+                        intent_mode=True,
+                        intent_level=2,
+                    )
+                except Exception:
+                    text_result = None
+                if text_result and self._should_use_text_primary_for_query(query, text_result):
+                    return self._text_primary_payload(
+                        query=query,
+                        project_name=project,
+                        text_result=text_result,
+                        limit=limit,
+                        related_file_limit=related_file_limit,
+                    )
 
-        if not should_use_graph_related:
-            try:
-                text_result = self.text_search(
+            if should_use_bundle:
+                bundle = self.semantic_search_bundle(
                     query=query,
-                    path=Path.cwd(),
-                    limit=max(limit + related_file_limit, 8),
-                    intent_mode=True,
-                    intent_level=2,
-                )
-            except Exception:
-                text_result = None
-            if text_result and self._should_use_text_primary_for_query(query, text_result):
-                return self._text_primary_payload(
-                    query=query,
-                    project_name=project,
-                    text_result=text_result,
+                    mode=mode,
                     limit=limit,
+                    language=language,
+                    path_prefix=path_prefix,
+                    project_name=project,
+                    use_keywords=use_keywords,
+                    keyword_weight=keyword_weight,
+                    rerank=rerank,
+                    related_seed_files=related_seed_files,
                     related_file_limit=related_file_limit,
+                    include_graph_related=should_use_graph_related,
                 )
+                bundle["mode"] = "bundle"
+                bundle["symbol_query"] = None
+                return bundle
 
-        if should_use_bundle:
-            bundle = self.semantic_search_bundle(
+            payload = self.semantic_search_auto(
                 query=query,
                 mode=mode,
                 limit=limit,
@@ -1515,61 +1613,43 @@ class QuickContext:
                 rerank=rerank,
                 related_seed_files=related_seed_files,
                 related_file_limit=related_file_limit,
-                include_graph_related=should_use_graph_related,
+                include_source=False,
             )
-            bundle["mode"] = "bundle"
-            bundle["symbol_query"] = None
-            return bundle
-
-        payload = self.semantic_search_auto(
-            query=query,
-            mode=mode,
-            limit=limit,
-            language=language,
-            path_prefix=path_prefix,
-            project_name=project,
-            use_keywords=use_keywords,
-            keyword_weight=keyword_weight,
-            rerank=rerank,
-            related_seed_files=related_seed_files,
-            related_file_limit=related_file_limit,
-            include_source=False,
-        )
-        payload["symbol_query"] = None
-        if payload.get("mode") == "search":
-            lexical_related = self._lexical_related_files_for_query(
-                query=query,
-                results=payload["results"],
-                related_file_limit=related_file_limit,
-            )
-            if self._should_add_graph_lexical_companions(query):
-                graph_related = self._graph_lexical_related_files_for_query(
+            payload["symbol_query"] = None
+            if payload.get("mode") == "search":
+                lexical_related = self._lexical_related_files_for_query(
                     query=query,
                     results=payload["results"],
-                    existing_related=lexical_related,
                     related_file_limit=related_file_limit,
                 )
-                reserved_graph = graph_related[:1]
-                seen_graph_paths = {entry["file_path"] for entry in reserved_graph}
-                payload["related_files"] = reserved_graph + [
-                    item for item in lexical_related
-                    if item["file_path"] not in seen_graph_paths
-                ] + [
-                    item for item in graph_related[1:]
-                    if item["file_path"] not in {entry["file_path"] for entry in lexical_related}
-                ]
-                payload["related_files"] = payload["related_files"][:related_file_limit]
-            else:
-                payload["related_files"] = lexical_related
-            if self._should_use_graph_related_for_query(query):
-                payload["results"], payload["related_files"] = self._promote_graph_related_results(
-                    query=query,
-                    results=payload["results"],
-                    related_files=payload["related_files"],
-                    limit=limit,
-                )
-            payload["results"] = self._hydrate_search_result_sources(payload["results"])
-        return payload
+                if self._should_add_graph_lexical_companions(query):
+                    graph_related = self._graph_lexical_related_files_for_query(
+                        query=query,
+                        results=payload["results"],
+                        existing_related=lexical_related,
+                        related_file_limit=related_file_limit,
+                    )
+                    reserved_graph = graph_related[:1]
+                    seen_graph_paths = {entry["file_path"] for entry in reserved_graph}
+                    payload["related_files"] = reserved_graph + [
+                        item for item in lexical_related
+                        if item["file_path"] not in seen_graph_paths
+                    ] + [
+                        item for item in graph_related[1:]
+                        if item["file_path"] not in {entry["file_path"] for entry in lexical_related}
+                    ]
+                    payload["related_files"] = payload["related_files"][:related_file_limit]
+                else:
+                    payload["related_files"] = lexical_related
+                if self._should_use_graph_related_for_query(query):
+                    payload["results"], payload["related_files"] = self._promote_graph_related_results(
+                        query=query,
+                        results=payload["results"],
+                        related_files=payload["related_files"],
+                        limit=limit,
+                    )
+                payload["results"] = self._hydrate_search_result_sources(payload["results"])
+            return payload
 
     def structured_search(
         self,
@@ -4041,6 +4121,9 @@ class QuickContext:
         """
         Close all connections and release resources.
         """
+        self._background_warm_stop.set()
+        if self._background_warm_thread is not None and self._background_warm_thread.is_alive():
+            self._background_warm_thread.join(timeout=0.2)
         for cache in self._file_caches.values():
             cache.save()
         self._file_caches.clear()
