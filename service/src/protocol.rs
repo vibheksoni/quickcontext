@@ -131,6 +131,12 @@ pub enum Request {
         #[serde(default)]
         intent_level: Option<u8>,
     },
+    #[serde(rename = "warm_project")]
+    WarmProject {
+        path: String,
+        #[serde(default)]
+        respect_gitignore: Option<bool>,
+    },
     #[serde(rename = "protocol_search")]
     ProtocolSearch {
         query: String,

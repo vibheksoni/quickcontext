@@ -769,6 +769,23 @@ class QuickContext:
             timeout_ms=timeout_ms,
         )
 
+    def warm_project(
+        self,
+        path: str | Path = ".",
+        respect_gitignore: bool = True,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """
+        Warm persisted Rust symbol and text indices for a project path.
+        """
+        return self.parser_service.warm_project(
+            path=path,
+            respect_gitignore=respect_gitignore,
+            ensure_server=ensure_server,
+            timeout_ms=timeout_ms,
+        )
+
     def pattern_search(
         self,
         pattern: str,

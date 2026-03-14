@@ -686,6 +686,26 @@ class PipeClient:
             raise PipeProtocolError("invalid text search response payload")
         return data
 
+    def warm_project(
+        self,
+        path: str,
+        respect_gitignore: bool = True,
+    ) -> dict:
+        """Warms persisted Rust indices for a project path."""
+        payload: dict[str, object] = {
+            "method": "warm_project",
+            "path": path,
+            "respect_gitignore": respect_gitignore,
+        }
+
+        resp = self.request(payload)
+        if resp.get("status") == "error":
+            raise PipeError(resp.get("message", "warm project failed"))
+        data = resp.get("data", {})
+        if not isinstance(data, dict):
+            raise PipeProtocolError("invalid warm project response payload")
+        return data
+
     def protocol_search(
         self,
         query: str,

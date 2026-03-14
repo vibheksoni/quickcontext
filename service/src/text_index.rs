@@ -109,6 +109,37 @@ pub fn search_candidates(
     Ok((candidates, searched_files))
 }
 
+pub fn warm_index(
+    root: &Path,
+    specs: &[LanguageSpec],
+    respect_gitignore: bool,
+) -> Result<usize, String> {
+    let project_root = root
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve path: {e}"))?;
+    let fingerprint = config_fingerprint(specs, respect_gitignore);
+
+    let project_lock = {
+        let mut manager = manager()
+            .lock()
+            .map_err(|_| "text index lock poisoned".to_string())?;
+        manager.get_or_build(&project_root, specs, respect_gitignore, fingerprint)?
+    };
+
+    refresh_index_if_needed(
+        &project_lock,
+        &project_root,
+        specs,
+        respect_gitignore,
+        fingerprint,
+    )?;
+
+    let index = project_lock
+        .read()
+        .map_err(|_| "text index read lock poisoned".to_string())?;
+    Ok(index.docs.len())
+}
+
 
 fn refresh_index_if_needed(
     project_lock: &Arc<RwLock<ProjectTextIndex>>,

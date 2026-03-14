@@ -2246,6 +2246,29 @@ class RustParserService:
         )
         return TextSearchResult.from_dict(raw)
 
+    def warm_project(
+        self,
+        path: str | Path,
+        respect_gitignore: bool = True,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> dict[str, Any]:
+        """
+        Warm persisted Rust symbol and text indices for a project path.
+        """
+        input_path = str(Path(path).resolve())
+
+        if ensure_server:
+            self._client.ensure_server(timeout_ms=timeout_ms)
+        elif not self.connected:
+            self.connect(timeout_ms=timeout_ms)
+
+        raw = self._client.warm_project(
+            path=input_path,
+            respect_gitignore=respect_gitignore,
+        )
+        return dict(raw)
+
 
     def pattern_search(
         self,

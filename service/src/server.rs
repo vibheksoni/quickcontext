@@ -21,7 +21,7 @@ use crate::pattern_rewrite;
 use crate::protocol::{Request, Response};
 use crate::protocol_search::{self, ProtocolSearchOptions};
 use crate::skeleton::{self, SkeletonOptions};
-use crate::symbol_index::{find_callers, symbol_lookup, trace_call_graph};
+use crate::symbol_index::{find_callers, symbol_lookup, trace_call_graph, warm_project as warm_symbol_project};
 use crate::types::TraceDirection;
 use crate::text_search;
 
@@ -398,6 +398,14 @@ async fn dispatch(req: Request, specs: &[LanguageSpec], cancel: &CancellationTok
             limit.unwrap_or(DEFAULT_TEXT_SEARCH_LIMIT),
             intent_mode.unwrap_or(DEFAULT_INTENT_MODE),
             intent_level.unwrap_or(DEFAULT_INTENT_LEVEL),
+            specs,
+        ),
+        Request::WarmProject {
+            path,
+            respect_gitignore,
+        } => handle_warm_project(
+            &path,
+            respect_gitignore.unwrap_or(true),
             specs,
         ),
         Request::ProtocolSearch {
@@ -1304,6 +1312,29 @@ fn handle_text_search(
         },
         Err(e) => Response::error(e),
     }
+}
+
+fn handle_warm_project(
+    path_str: &str,
+    respect_gitignore: bool,
+    specs: &[LanguageSpec],
+) -> Response {
+    let path = Path::new(path_str);
+    let symbol_count = match warm_symbol_project(path, specs, respect_gitignore) {
+        Ok(count) => count,
+        Err(e) => return Response::error(e),
+    };
+    let text_doc_count = match crate::text_index::warm_index(path, specs, respect_gitignore) {
+        Ok(count) => count,
+        Err(e) => return Response::error(e),
+    };
+
+    Response::ok_data(serde_json::json!({
+        "path": path_str,
+        "symbol_count": symbol_count,
+        "text_doc_count": text_doc_count,
+        "respect_gitignore": respect_gitignore,
+    }))
 }
 
 

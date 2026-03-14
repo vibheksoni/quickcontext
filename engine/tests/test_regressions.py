@@ -2054,6 +2054,24 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(stats.total_files, 1)
         self.assertEqual(stats.total_symbols, 1)
 
+    def test_warm_project_returns_transport_payload(self) -> None:
+        service = RustParserService()
+        try:
+            service._client = mock.Mock()
+            service._client.ensure_server = mock.Mock()
+            service._client.warm_project.return_value = {
+                "path": str(Path(".").resolve()),
+                "symbol_count": 10,
+                "text_doc_count": 5,
+                "respect_gitignore": True,
+            }
+            payload = service.warm_project(".")
+        finally:
+            service.close()
+
+        self.assertEqual(payload["symbol_count"], 10)
+        self.assertEqual(payload["text_doc_count"], 5)
+
 
 class LazyImportBoundaryTests(unittest.TestCase):
     def _reload_module(self, module_name: str):

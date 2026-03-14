@@ -229,6 +229,26 @@ pub fn symbol_lookup(
     })
 }
 
+pub fn warm_project(
+    path: &Path,
+    specs: &[LanguageSpec],
+    respect_gitignore: bool,
+) -> Result<usize, String> {
+    let project_root = normalize_path(path)?;
+
+    let project_lock = {
+        let mut manager = manager().lock().map_err(|_| "symbol index lock poisoned".to_string())?;
+        manager.get_or_build(&project_root, specs, respect_gitignore)?
+    };
+
+    refresh_symbol_index_if_needed(&project_lock, &project_root, specs, respect_gitignore)?;
+
+    let index = project_lock
+        .read()
+        .map_err(|_| "symbol index read lock poisoned".to_string())?;
+    Ok(index.symbols.len())
+}
+
 
 pub fn find_callers(
     symbol: &str,
