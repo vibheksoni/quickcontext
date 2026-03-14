@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use sha2::{Digest, Sha256};
@@ -256,6 +257,23 @@ pub fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn compiled_query(spec: &LanguageSpec) -> Result<&'static Query, String> {
+    static QUERY_CACHE: OnceLock<HashMap<&'static str, Query>> = OnceLock::new();
+    let cache = QUERY_CACHE.get_or_init(|| {
+        let mut cache = HashMap::new();
+        for spec in lang::registry() {
+            if let Ok(query) = Query::new(&spec.language, spec.query) {
+                cache.insert(spec.name, query);
+            }
+        }
+        cache
+    });
+
+    cache
+        .get(spec.name)
+        .ok_or_else(|| format!("query compile error: missing cached query for {}", spec.name))
+}
+
 pub fn collect_supported_files(
     root: &Path,
     specs: &[LanguageSpec],
@@ -418,10 +436,10 @@ fn extract_file_with_mode(
         }
     };
 
-    let query = match Query::new(&spec.language, spec.query) {
-        Ok(q) => q,
+    let query = match compiled_query(spec) {
+        Ok(query) => query,
         Err(e) => {
-            result.errors.push(format!("query compile error: {e}"));
+            result.errors.push(e);
             return result;
         }
     };
@@ -429,7 +447,7 @@ fn extract_file_with_mode(
     let capture_names = query.capture_names();
     let root = tree.root_node();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root, source.as_bytes());
+    let mut matches = cursor.matches(query, root, source.as_bytes());
 
     while let Some(m) = matches.next() {
         let pattern_idx = m.pattern_index;

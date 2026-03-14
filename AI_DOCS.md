@@ -61,6 +61,7 @@ Important config ideas:
 - cloud example config uses `litellm`
 - embedding dimensions must match the Qdrant collection vector dimensions
 - the Rust symbol index snapshot lives in `.quickcontext/symbol_index.redb` and uses a compact binary payload format for faster cold loads
+- Rust extraction also reuses compiled tree-sitter queries across parses to reduce repeated extractor overhead
 
 ## Important Python Modules
 
