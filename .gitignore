@@ -300,6 +300,7 @@ scripts/*
 !scripts/context_retrieval_cases.json
 !scripts/graph_retrieval_cases.json
 !scripts/text_retrieval_benchmark.py
+!scripts/warm_project_benchmark.py
 quickcontext.local.json
 deepwiki_util/
 openrouter/

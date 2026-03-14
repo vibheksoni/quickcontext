@@ -1264,6 +1264,34 @@ def trace_call_graph(ctx: click.Context, symbol: str, target_path: str | None, n
     console.print()
 
 
+@cli.command("warm")
+@click.argument("path", type=click.Path(exists=True, path_type=Path), default=".")
+@click.option("--no-gitignore", is_flag=True, help="Disable .gitignore/.ignore filtering.")
+@click.pass_context
+def warm(ctx: click.Context, path: Path, no_gitignore: bool) -> None:
+    """
+    Warm persisted Rust symbol and text indices for a project path.
+    """
+    config = ctx.obj["config"]
+    qc = QuickContext(config)
+
+    try:
+        payload = qc.warm_project(
+            path=path,
+            respect_gitignore=not no_gitignore,
+        )
+    except Exception as exc:
+        console.print(f"[red]Warm project failed:[/red] {exc}")
+        sys.exit(1)
+    finally:
+        qc.close()
+
+    console.print(f"[cyan]Path:[/cyan] {payload['path']}")
+    console.print(f"[cyan]Respect gitignore:[/cyan] {payload['respect_gitignore']}")
+    console.print(f"[cyan]Symbol count:[/cyan] {payload['symbol_count']}")
+    console.print(f"[cyan]Text doc count:[/cyan] {payload['text_doc_count']}")
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.option("--depth", default=None, type=int, help="Max directory recursion depth.")

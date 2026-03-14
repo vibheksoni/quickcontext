@@ -219,6 +219,7 @@ python -m engine text-search "auth token"
 python -m engine protocol-search "request response"
 python -m engine pattern-search "(function_definition name: (identifier) @name)" --lang python
 python -m engine search "chunk filter" --project quickcontext
+python -m engine warm .
 python -m engine refresh engine/src/config.py
 python -m engine watch .
 python -m engine list-projects
@@ -239,6 +240,7 @@ venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcon
 venv/Scripts/python.exe scripts/symbol_context_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/symbol_context_cases.json --strategy context-auto
 venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/graph_retrieval_cases.json --strategy context-auto
 venv/Scripts/python.exe scripts/text_retrieval_benchmark.py --config quickcontext.json --cases-file scripts/context_retrieval_cases.json --show-top 3
+venv/Scripts/python.exe scripts/warm_project_benchmark.py --config quickcontext.json --project quickcontext --path . --query "How does CodeSearcher.search_hybrid merge code and description vectors?"
 ```
 
 For local performance work, keep benchmark notes in `BENCHMARK_LOCAL.md`. That file is intentionally gitignored.
