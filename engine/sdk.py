@@ -1216,6 +1216,7 @@ class QuickContext:
         rerank_top10_retrieval_weight: float = 0.60,
         rerank_tail_retrieval_weight: float = 0.40,
         rerank_candidate_multiplier: int = 4,
+        include_source: bool = True,
     ) -> list:
         """
         Run semantic search over indexed code vectors.
@@ -1250,6 +1251,7 @@ class QuickContext:
                 use_keywords=use_keywords,
                 keyword_weight=keyword_weight,
                 rerank=rerank,
+                include_source=include_source,
             )
 
         if mode == "desc":
@@ -1261,6 +1263,7 @@ class QuickContext:
                 use_keywords=use_keywords,
                 keyword_weight=keyword_weight,
                 rerank=rerank,
+                include_source=include_source,
             )
 
         return searcher.search_hybrid(
@@ -1278,6 +1281,7 @@ class QuickContext:
             rerank_top10_retrieval_weight=rerank_top10_retrieval_weight,
             rerank_tail_retrieval_weight=rerank_tail_retrieval_weight,
             rerank_candidate_multiplier=rerank_candidate_multiplier,
+            include_source=include_source,
         )
 
     def semantic_search_bundle(
@@ -1365,6 +1369,7 @@ class QuickContext:
         rerank: bool = False,
         related_seed_files: int = 1,
         related_file_limit: int = 8,
+        include_source: bool = True,
     ) -> dict:
         """
         Automatically choose between plain semantic search and the graph-aware bundle primitive.
@@ -1402,6 +1407,7 @@ class QuickContext:
                 use_keywords=use_keywords,
                 keyword_weight=keyword_weight,
                 rerank=rerank,
+                include_source=include_source,
             ),
             "related_files": [],
             "related_callers": [],
@@ -1524,6 +1530,7 @@ class QuickContext:
             rerank=rerank,
             related_seed_files=related_seed_files,
             related_file_limit=related_file_limit,
+            include_source=False,
         )
         payload["symbol_query"] = None
         if payload.get("mode") == "search":
@@ -1558,6 +1565,7 @@ class QuickContext:
                     related_files=payload["related_files"],
                     limit=limit,
                 )
+            payload["results"] = self._hydrate_search_result_sources(payload["results"])
         return payload
 
     def structured_search(
@@ -2032,6 +2040,22 @@ class QuickContext:
                 )
             )
         return results
+
+    def _hydrate_search_result_sources(self, results: list) -> list:
+        """
+        Hydrate source text only for the final semantic results kept by the router.
+        """
+        hydrated: list = []
+        for item in results:
+            if not getattr(item, "file_path", None):
+                hydrated.append(item)
+                continue
+            if getattr(item, "source", ""):
+                hydrated.append(item)
+                continue
+            source, _signature, _docstring = self._read_symbol_context(item)
+            hydrated.append(replace(item, source=source))
+        return hydrated
 
     def _text_matches_to_related_files(
         self,
