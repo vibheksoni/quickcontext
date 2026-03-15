@@ -16,7 +16,9 @@ from engine.src.config import CollectionVectorConfig, EngineConfig, QdrantConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_description
 from engine.src.filecache import FileSignatureCache
+from engine.src.index_resume import ResumeFile, ResumeState, build_settings_fingerprint, clear_state, load_state, save_state
 from engine.src.cli import _optimize_search_config
+from engine.src.indexer import IndexedFileState
 from engine.src.parsing import CompactExtractionResult, ExtractStats, ImportEdge, RustParserService, SymbolLookupItem, SymbolLookupResult
 from engine.src.qdrant import QdrantConnection
 from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS, SearchResult
@@ -2622,6 +2624,53 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(loaded, helpers)
         fallback.assert_called_once()
+
+    def test_resume_pending_files_detects_completed_vs_partial_shadow_files(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            expected = [
+                ResumeFile("a.py", "hash-a", 3),
+                ResumeFile("b.py", "hash-b", 2),
+                ResumeFile("c.py", "hash-c", 1),
+            ]
+            indexed = {
+                "a.py": IndexedFileState(file_hash="hash-a", point_count=3),
+                "b.py": IndexedFileState(file_hash="hash-b", point_count=1),
+            }
+            completed, pending = qc._resume_pending_files(expected, indexed)
+        finally:
+            qc.close()
+
+        self.assertEqual(completed, ["a.py"])
+        self.assertEqual(pending, ["b.py", "c.py"])
+
+    def test_index_resume_state_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = ResumeState(
+                manifest_version=1,
+                project_name="demo",
+                directory=tmp,
+                shadow_collection="demo_v2",
+                source_collection="demo_v1",
+                settings_fingerprint=build_settings_fingerprint({"mode": "test"}),
+                copied_points=True,
+                deleted_changed_paths=False,
+                files=[ResumeFile("a.py", "hash-a", 2)],
+                delete_only_files=["b.py"],
+            )
+            save_state(tmp, state)
+            loaded = load_state(tmp, "demo")
+            self.assertEqual(loaded, state)
+            clear_state(tmp, "demo")
+            self.assertIsNone(load_state(tmp, "demo"))
 
 
 class LazyImportBoundaryTests(unittest.TestCase):

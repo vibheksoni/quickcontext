@@ -37,6 +37,7 @@ Flow:
 - entering `with QuickContext(...)` does not force a Qdrant connection up front
 - parser-only and text-first workflows can start without paying vector-store startup cost
 - Qdrant still connects lazily on first vector or collection operation
+- full shadow indexing now persists a local resume manifest under `.quickcontext/` so an interrupted full index can reuse the in-progress shadow collection instead of discarding already-upserted files
 
 ## IPC Transport
 

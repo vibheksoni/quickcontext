@@ -437,7 +437,7 @@ def embed_test(ctx: click.Context, text: str, which: str) -> None:
 @click.option("--max-total-chunks", default=None, type=int, help="Maximum total chunks kept for the indexing run.")
 @click.option("--compress-for-embedding", default=None, type=click.Choice(["light", "medium", "aggressive"]), help="Compress source before embeddings to reduce comments and boilerplate.")
 @click.option("--incremental-resume", is_flag=True, help="Continue indexing changed files directly on active collection (no shadow swap).")
-@click.option("--resume-batch-files", default=200, type=int, help="When --incremental-resume is set, files processed per batch.")
+@click.option("--resume-batch-files", default=200, type=int, help="Files processed per recovery batch for incremental or resumable full indexing.")
 @click.option("--no-skip-minified", is_flag=True, help="Disable minified/noise chunk skipping.")
 @click.option("--embedding-concurrency", default=None, type=int, help="Override embedding request concurrency for this run.")
 @click.option("--embedding-max-retries", default=None, type=int, help="Override embedding retry count for this run.")

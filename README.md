@@ -26,6 +26,7 @@ Use `retrieve_context_auto(...)` as the default for AI workflows, `semantic_sear
 If you run the service as a long-lived process, call `warm_project('.')` once after startup to preload local indices before the first heavy query. If you do not want to pay that startup cost up front, call `start_background_warm('.')` and let the SDK defer the same warmup until the session goes idle.
 Entering `with QuickContext(...)` keeps subsystems lazy: parser-only flows do not preconnect Qdrant, and vector features still connect on first use.
 When the repo you want to inspect is outside the process cwd, pass that repo root through `path=` on the AI-facing retrieval helpers so Rust symbol/text routing, helper expansion, caller expansion, and benchmark harnesses stay scoped to the right codebase.
+Full alias/shadow indexing now writes a local resume manifest under `.quickcontext/`, so if indexing is interrupted it can reuse the in-progress shadow collection instead of discarding files that were already upserted.
 
 ## Status
 

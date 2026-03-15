@@ -60,6 +60,12 @@ class IndexStats:
     embedding_batch_grow_events: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class IndexedFileState:
+    file_hash: Optional[str]
+    point_count: int
+
+
 class QdrantIndexer:
     """
     Batched upserter for Qdrant with dual-vector support.
@@ -356,6 +362,68 @@ class QdrantIndexer:
                     hashes[point_file_path] = point.payload.get("file_hash")
 
         return hashes
+
+    def get_file_index_state(self, file_paths: list[str]) -> dict[str, IndexedFileState]:
+        """
+        Get lightweight indexing state for a set of files from the target collection.
+
+        file_paths: list[str] — File paths to inspect.
+        Returns: dict[str, IndexedFileState] — Indexed file hash and point count per file.
+        """
+        state: dict[str, dict[str, Optional[str] | int]] = {
+            path: {"file_hash": None, "point_count": 0}
+            for path in file_paths
+        }
+        if not file_paths:
+            return {}
+
+        batch_size = 128
+        scroll_limit = 512
+        for offset in range(0, len(file_paths), batch_size):
+            batch = file_paths[offset:offset + batch_size]
+            next_offset = None
+
+            while True:
+                try:
+                    records, next_offset = self._client.scroll(
+                        collection_name=self._collection_name,
+                        scroll_filter=models.Filter(
+                            must=[
+                                models.FieldCondition(
+                                    key="file_path",
+                                    match=models.MatchAny(any=batch),
+                                )
+                            ]
+                        ),
+                        limit=scroll_limit,
+                        offset=next_offset,
+                        with_payload=["file_path", "file_hash"],
+                        with_vectors=False,
+                    )
+                except Exception:
+                    break
+
+                if not records:
+                    break
+
+                for point in records:
+                    point_file_path = point.payload.get("file_path")
+                    if point_file_path not in state:
+                        continue
+                    state[point_file_path]["point_count"] = int(state[point_file_path]["point_count"]) + 1
+                    if state[point_file_path]["file_hash"] is None:
+                        state[point_file_path]["file_hash"] = point.payload.get("file_hash")
+
+                if next_offset is None:
+                    break
+
+        return {
+            path: IndexedFileState(
+                file_hash=item["file_hash"],
+                point_count=int(item["point_count"]),
+            )
+            for path, item in state.items()
+        }
 
     def get_chunks_by_file(self, file_path: str) -> list[CodeChunk]:
         """

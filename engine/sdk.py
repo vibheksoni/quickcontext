@@ -23,7 +23,8 @@ if TYPE_CHECKING:
     from engine.src.collection import CollectionManager
     from engine.src.describer import ChunkDescription, DescriptionGenerator
     from engine.src.embedder import DualEmbedder, EmbeddedChunk
-    from engine.src.indexer import IndexStats, QdrantIndexer
+    from engine.src.indexer import IndexStats, IndexedFileState, QdrantIndexer
+    from engine.src.index_resume import ResumeFile, ResumeState
     from engine.src.providers import EmbeddingProvider
     from engine.src.qdrant import QdrantConnection
     from engine.src.searcher import CodeSearcher, SearchResult
@@ -3370,6 +3371,137 @@ class QuickContext:
             )
         return related
 
+    def _chunks_by_file(self, chunks: list[CodeChunk]) -> dict[str, list[CodeChunk]]:
+        grouped: dict[str, list[CodeChunk]] = {}
+        for chunk in chunks:
+            grouped.setdefault(chunk.file_path, []).append(chunk)
+        return grouped
+
+    def _resume_pending_files(
+        self,
+        expected_files: list["ResumeFile"],
+        indexed_state: dict[str, "IndexedFileState"],
+    ) -> tuple[list[str], list[str]]:
+        """
+        Split resumable shadow files into completed and pending sets.
+        """
+        completed: list[str] = []
+        pending: list[str] = []
+
+        for file_state in expected_files:
+            indexed = indexed_state.get(file_state.file_path)
+            if indexed and indexed.file_hash == file_state.file_hash and indexed.point_count == file_state.chunk_count:
+                completed.append(file_state.file_path)
+            else:
+                pending.append(file_state.file_path)
+
+        return completed, pending
+
+    def _merge_index_stats(self, left: "IndexStats", right: "IndexStats") -> "IndexStats":
+        """
+        Merge two indexing stats objects.
+        """
+        return replace(
+            left,
+            total_chunks=left.total_chunks + right.total_chunks,
+            upserted_points=left.upserted_points + right.upserted_points,
+            failed_points=left.failed_points + right.failed_points,
+            total_tokens=left.total_tokens + right.total_tokens,
+            duration_seconds=left.duration_seconds + right.duration_seconds,
+            llm_cost_usd=left.llm_cost_usd + right.llm_cost_usd,
+            embedding_cost_usd=left.embedding_cost_usd + right.embedding_cost_usd,
+            skipped_small_chunks=left.skipped_small_chunks + right.skipped_small_chunks,
+            skipped_minified_chunks=left.skipped_minified_chunks + right.skipped_minified_chunks,
+            skipped_capped_chunks=left.skipped_capped_chunks + right.skipped_capped_chunks,
+            files_capped=left.files_capped + right.files_capped,
+            embedding_requests=left.embedding_requests + right.embedding_requests,
+            embedding_retries=left.embedding_retries + right.embedding_retries,
+            embedding_failed_requests=left.embedding_failed_requests + right.embedding_failed_requests,
+            embedding_input_count=left.embedding_input_count + right.embedding_input_count,
+            embedding_stage_duration_seconds=(
+                left.embedding_stage_duration_seconds + right.embedding_stage_duration_seconds
+            ),
+            embedding_batch_shrink_events=left.embedding_batch_shrink_events + right.embedding_batch_shrink_events,
+            embedding_batch_grow_events=left.embedding_batch_grow_events + right.embedding_batch_grow_events,
+            embedding_final_batch_size=max(left.embedding_final_batch_size, right.embedding_final_batch_size),
+        )
+
+    def _zero_index_stats(
+        self,
+        started_at: float,
+        generate_descriptions: bool,
+        skipped_small_chunks: int = 0,
+        skipped_minified_chunks: int = 0,
+        skipped_capped_chunks: int = 0,
+        files_capped: int = 0,
+    ) -> "IndexStats":
+        from engine.src.indexer import IndexStats
+
+        return IndexStats(
+            total_chunks=0,
+            upserted_points=0,
+            failed_points=0,
+            total_tokens=0,
+            duration_seconds=time.time() - started_at,
+            llm_cost_usd=0.0,
+            embedding_cost_usd=0.0,
+            skipped_small_chunks=skipped_small_chunks,
+            skipped_minified_chunks=skipped_minified_chunks,
+            skipped_capped_chunks=skipped_capped_chunks,
+            files_capped=files_capped,
+            descriptions_enabled=generate_descriptions,
+        )
+
+    def _build_resume_files(
+        self,
+        changed_results: list[ExtractionResult],
+        chunks: list[CodeChunk],
+    ) -> tuple[list["ResumeFile"], list[str]]:
+        from engine.src.index_resume import ResumeFile
+
+        chunk_counts: dict[str, int] = {}
+        for chunk in chunks:
+            chunk_counts[chunk.file_path] = chunk_counts.get(chunk.file_path, 0) + 1
+
+        resumable: list[ResumeFile] = []
+        delete_only: list[str] = []
+        for result in changed_results:
+            chunk_count = chunk_counts.get(result.file_path, 0)
+            if chunk_count > 0:
+                resumable.append(
+                    ResumeFile(
+                        file_path=result.file_path,
+                        file_hash=result.file_hash,
+                        chunk_count=chunk_count,
+                    )
+                )
+            else:
+                delete_only.append(result.file_path)
+
+        resumable.sort(key=lambda item: item.file_path)
+        delete_only.sort()
+        return resumable, delete_only
+
+    def _finalize_shadow_collection(
+        self,
+        collection: "CollectionManager",
+        shadow_name: str,
+        show_progress: bool,
+    ) -> None:
+        old_collection = collection.swap_alias(shadow_name)
+        if show_progress:
+            print(f"Swapped alias to {shadow_name}")
+
+        if old_collection is not None:
+            try:
+                collection.client.delete_collection(old_collection)
+                if show_progress:
+                    print(f"Deleted old collection: {old_collection}")
+            except Exception:
+                pass
+
+        collection.cleanup_old_versions()
+
     def index_directory(
         self,
         directory: str | Path,
@@ -3637,78 +3769,168 @@ class QuickContext:
                 f"capped={filter_stats.skipped_per_file_cap}"
             )
 
-        if not chunks:
+        if not chunks and incremental_resume:
             file_cache.save()
-            if incremental_resume:
-                if show_progress:
-                    print("No chunks to index after filtering")
-                return IndexStats(
-                    total_chunks=0,
-                    upserted_points=0,
-                    failed_points=0,
-                    total_tokens=0,
-                    duration_seconds=time.time() - started_at,
-                    llm_cost_usd=0.0,
-                    embedding_cost_usd=0.0,
-                    skipped_small_chunks=filter_stats.skipped_small,
-                    skipped_minified_chunks=filter_stats.skipped_minified,
-                    skipped_capped_chunks=filter_stats.skipped_per_file_cap,
-                    files_capped=filter_stats.files_capped,
-                    descriptions_enabled=generate_descriptions,
-                )
-
-            shadow_name = collection.create_shadow()
-            from engine.src.indexer import QdrantIndexer
-            shadow_indexer = QdrantIndexer(
-                client=collection.client,
-                collection_name=shadow_name,
-                batch_size=self._config.qdrant.upsert_batch_size,
-                upsert_concurrency=self._config.qdrant.upsert_concurrency,
-            )
-            old_collection = collection.resolve_alias()
-            if old_collection is not None and not force_refresh:
-                copied_points = collection.copy_points(
-                    source_collection=old_collection,
-                    target_collection=shadow_name,
-                    batch_size=self._config.qdrant.upsert_batch_size,
-                )
-                if show_progress:
-                    print(f"Copied {copied_points} existing points into {shadow_name}")
-
-                changed_paths = sorted({result.file_path for result in changed_results})
-                if changed_paths:
-                    shadow_indexer.delete_by_files(changed_paths)
-                    if show_progress:
-                        print(f"Removed stale points for {len(changed_paths)} changed files from {shadow_name}")
-
-            old_collection = collection.swap_alias(shadow_name)
-            if old_collection is not None:
-                try:
-                    collection.client.delete_collection(old_collection)
-                except Exception:
-                    pass
-            collection.cleanup_old_versions()
-
             if show_progress:
-                print("Applied filtered deletions with no replacement chunks")
-
-            return IndexStats(
-                total_chunks=0,
-                upserted_points=0,
-                failed_points=0,
-                total_tokens=0,
-                duration_seconds=time.time() - started_at,
-                llm_cost_usd=0.0,
-                embedding_cost_usd=0.0,
+                print("No chunks to index after filtering")
+            return self._zero_index_stats(
+                started_at=started_at,
+                generate_descriptions=generate_descriptions,
                 skipped_small_chunks=filter_stats.skipped_small,
                 skipped_minified_chunks=filter_stats.skipped_minified,
                 skipped_capped_chunks=filter_stats.skipped_per_file_cap,
                 files_capped=filter_stats.files_capped,
-                descriptions_enabled=generate_descriptions,
             )
 
         from engine.src.dedup import deduplicate_chunks, expand_descriptions, expand_embeddings
-        dedup_result = deduplicate_chunks(chunks)
+        from engine.src.index_resume import (
+            ResumeState,
+            build_settings_fingerprint,
+            clear_state,
+            load_state,
+            save_state,
+        )
+        from engine.src.indexer import IndexStats, QdrantIndexer
+
+        resume_files, delete_only_files = self._build_resume_files(changed_results, chunks)
+        changed_paths = sorted({result.file_path for result in changed_results})
+        resume_settings = build_settings_fingerprint(
+            {
+                "directory": str(directory),
+                "project_name": detected_project,
+                "force_refresh": force_refresh,
+                "fast": fast,
+                "generate_descriptions": generate_descriptions,
+                "min_chunk_bytes": min_chunk_bytes,
+                "max_chunks_per_file": max_chunks_per_file,
+                "max_total_chunks": max_total_chunks,
+                "compress_for_embedding": compress_for_embedding,
+                "skip_minified": skip_minified,
+                "resume_batch_files": max(1, int(resume_batch_files)),
+                "files": [
+                    {
+                        "file_path": item.file_path,
+                        "file_hash": item.file_hash,
+                        "chunk_count": item.chunk_count,
+                    }
+                    for item in resume_files
+                ],
+                "delete_only_files": delete_only_files,
+            }
+        )
+
+        active_collection = collection.resolve_alias()
+        resume_state = load_state(directory, detected_project)
+        shadow_name: str | None = None
+
+        def shadow_exists(name: str) -> bool:
+            try:
+                collection.client.get_collection(name)
+                return True
+            except Exception:
+                return False
+
+        if resume_state is not None:
+            expected_manifest = {
+                (item.file_path, item.file_hash, item.chunk_count)
+                for item in resume_files
+            }
+            stored_manifest = {
+                (item.file_path, item.file_hash, item.chunk_count)
+                for item in resume_state.files
+            }
+            if active_collection == resume_state.shadow_collection:
+                clear_state(directory, detected_project)
+                resume_state = None
+            elif (
+                resume_state.settings_fingerprint == resume_settings
+                and stored_manifest == expected_manifest
+                and resume_state.delete_only_files == delete_only_files
+                and resume_state.source_collection == active_collection
+                and shadow_exists(resume_state.shadow_collection)
+            ):
+                shadow_name = resume_state.shadow_collection
+                if show_progress:
+                    print(f"Resuming shadow collection: {shadow_name}")
+            else:
+                if shadow_exists(resume_state.shadow_collection) and active_collection != resume_state.shadow_collection:
+                    try:
+                        collection.client.delete_collection(resume_state.shadow_collection)
+                    except Exception:
+                        pass
+                clear_state(directory, detected_project)
+                resume_state = None
+
+        if resume_state is None:
+            shadow_name = collection.create_shadow()
+            resume_state = ResumeState(
+                manifest_version=1,
+                project_name=detected_project,
+                directory=str(directory),
+                shadow_collection=shadow_name,
+                source_collection=active_collection,
+                settings_fingerprint=resume_settings,
+                copied_points=False,
+                deleted_changed_paths=False,
+                files=resume_files,
+                delete_only_files=delete_only_files,
+            )
+            save_state(directory, resume_state)
+            if show_progress:
+                print(f"Created shadow collection: {shadow_name}")
+
+        shadow_indexer = QdrantIndexer(
+            client=collection.client,
+            collection_name=shadow_name,
+            batch_size=self._config.qdrant.upsert_batch_size,
+            upsert_concurrency=self._config.qdrant.upsert_concurrency,
+        )
+
+        if resume_state.source_collection is not None and not force_refresh and not resume_state.copied_points:
+            copied_points = collection.copy_points(
+                source_collection=resume_state.source_collection,
+                target_collection=shadow_name,
+                batch_size=self._config.qdrant.upsert_batch_size,
+            )
+            resume_state = replace(resume_state, copied_points=True)
+            save_state(directory, resume_state)
+            if show_progress:
+                print(f"Copied {copied_points} existing points into {shadow_name}")
+
+        if changed_paths and not resume_state.deleted_changed_paths:
+            shadow_indexer.delete_by_files(changed_paths)
+            resume_state = replace(resume_state, deleted_changed_paths=True)
+            save_state(directory, resume_state)
+            if show_progress:
+                print(f"Removed stale points for {len(changed_paths)} changed files from {shadow_name}")
+
+        indexed_state = shadow_indexer.get_file_index_state([item.file_path for item in resume_files])
+        completed_paths, pending_paths = self._resume_pending_files(resume_files, indexed_state)
+        if show_progress and completed_paths:
+            print(f"Recovered {len(completed_paths)} already indexed files from {shadow_name}")
+
+        if not pending_paths:
+            self._finalize_shadow_collection(collection, shadow_name, show_progress)
+            clear_state(directory, detected_project)
+            file_cache.save()
+            if show_progress:
+                if resume_files:
+                    print("Recovered shadow collection and applied alias swap")
+                else:
+                    print("Applied filtered deletions with no replacement chunks")
+            return self._zero_index_stats(
+                started_at=started_at,
+                generate_descriptions=generate_descriptions,
+                skipped_small_chunks=filter_stats.skipped_small,
+                skipped_minified_chunks=filter_stats.skipped_minified,
+                skipped_capped_chunks=filter_stats.skipped_per_file_cap,
+                files_capped=filter_stats.files_capped,
+            )
+
+        pending_path_set = set(pending_paths)
+        pending_chunks = [chunk for chunk in chunks if chunk.file_path in pending_path_set]
+
+        dedup_result = deduplicate_chunks(pending_chunks)
 
         if compress_for_embedding:
             for idx, chunk in enumerate(dedup_result.unique_chunks):
@@ -3722,34 +3944,6 @@ class QuickContext:
                 f"{dedup_result.unique_count} unique, "
                 f"{dedup_result.duplicate_count} duplicates skipped"
             )
-
-        shadow_name = collection.create_shadow()
-        if show_progress:
-            print(f"Created shadow collection: {shadow_name}")
-
-        from engine.src.indexer import QdrantIndexer
-        shadow_indexer = QdrantIndexer(
-            client=collection.client,
-            collection_name=shadow_name,
-            batch_size=self._config.qdrant.upsert_batch_size,
-            upsert_concurrency=self._config.qdrant.upsert_concurrency,
-        )
-
-        old_collection = collection.resolve_alias()
-        if old_collection is not None and not force_refresh:
-            copied_points = collection.copy_points(
-                source_collection=old_collection,
-                target_collection=shadow_name,
-                batch_size=self._config.qdrant.upsert_batch_size,
-            )
-            if show_progress:
-                print(f"Copied {copied_points} existing points into {shadow_name}")
-
-            changed_paths = sorted({result.file_path for result in changed_results})
-            if changed_paths:
-                shadow_indexer.delete_by_files(changed_paths)
-                if show_progress:
-                    print(f"Removed stale points for {len(changed_paths)} changed files from {shadow_name}")
 
         if generate_descriptions:
             if show_progress:
@@ -3783,32 +3977,41 @@ class QuickContext:
             adaptive_batching_override=embedding_adaptive_batching,
         )
         embed_stats = self.embedder.last_run_stats
-        embedded_chunks = expand_embeddings(unique_embedded, chunks, descriptions, dedup_result)
+        embedded_chunks = expand_embeddings(unique_embedded, pending_chunks, descriptions, dedup_result)
+        embedded_by_file: dict[str, list] = {}
+        for chunk in embedded_chunks:
+            embedded_by_file.setdefault(chunk.chunk.file_path, []).append(chunk)
 
-        if show_progress:
-            print(f"Upserting {len(embedded_chunks)} chunks to {shadow_name}...")
+        total_upsert_stats = IndexStats(
+            total_chunks=0,
+            upserted_points=0,
+            failed_points=0,
+            total_tokens=0,
+            duration_seconds=0.0,
+            llm_cost_usd=0.0,
+            embedding_cost_usd=0.0,
+            descriptions_enabled=generate_descriptions,
+        )
 
-        upsert_stats = shadow_indexer.upsert_chunks(embedded_chunks)
+        batch_size = max(1, int(resume_batch_files))
+        for offset in range(0, len(pending_paths), batch_size):
+            batch_paths = pending_paths[offset:offset + batch_size]
+            batch_embedded = []
+            for file_path in batch_paths:
+                batch_embedded.extend(embedded_by_file.get(file_path, []))
+            if not batch_embedded:
+                continue
 
-        old_collection = collection.swap_alias(shadow_name)
-        if show_progress:
-            print(f"Swapped alias to {shadow_name}")
+            if show_progress:
+                print(f"Upserting {len(batch_embedded)} chunks to {shadow_name} for {len(batch_paths)} files...")
+            batch_stats = shadow_indexer.upsert_chunks(batch_embedded)
+            total_upsert_stats = self._merge_index_stats(total_upsert_stats, batch_stats)
 
-        if old_collection is not None:
-            try:
-                collection.client.delete_collection(old_collection)
-                if show_progress:
-                    print(f"Deleted old collection: {old_collection}")
-            except Exception:
-                pass
+        self._finalize_shadow_collection(collection, shadow_name, show_progress)
+        clear_state(directory, detected_project)
 
-        collection.cleanup_old_versions()
-
-        stats = IndexStats(
-            total_chunks=upsert_stats.total_chunks,
-            upserted_points=upsert_stats.upserted_points,
-            failed_points=upsert_stats.failed_points,
-            total_tokens=upsert_stats.total_tokens,
+        stats = replace(
+            total_upsert_stats,
             duration_seconds=time.time() - started_at,
             llm_cost_usd=llm_cost,
             embedding_cost_usd=embedding_cost,
