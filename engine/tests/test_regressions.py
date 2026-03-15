@@ -1761,6 +1761,163 @@ class RegressionTests(unittest.TestCase):
             [Path("engine/sdk.py").resolve(), Path("engine/src/collection.py").resolve()],
         )
 
+    def test_text_primary_payload_adds_import_and_module_related_files(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                storage_dir = root / "features" / "notes" / "main" / "storage"
+                storage_dir.mkdir(parents=True)
+                anchor_file = storage_dir / "index.js"
+                frontmatter_file = storage_dir / "frontmatter.js"
+                version_file = storage_dir / "version.service.js"
+                trash_file = storage_dir / "trash.service.js"
+                import_file = root / "features" / "notes" / "main" / "storage" / "crdt-notes.service.js"
+                logger_file = root / "shared" / "logger.js"
+                logger_file.parent.mkdir(parents=True)
+
+                for path in (anchor_file, frontmatter_file, version_file, trash_file, import_file, logger_file):
+                    path.write_text("// test\n", encoding="utf-8")
+
+                text_result = type(
+                    "TextResult",
+                    (),
+                    {
+                        "matches": [
+                            type(
+                                "TextMatch",
+                                (),
+                                {
+                                    "file_path": str(anchor_file.resolve()),
+                                    "language": "javascript",
+                                    "snippet_line_start": 1,
+                                    "snippet_line_end": 3,
+                                    "snippet": "export * from './frontmatter.js'",
+                                    "matched_terms": ["notes", "frontmatter", "version", "trash", "session"],
+                                    "score": 22.0,
+                                },
+                            )(),
+                            type(
+                                "TextMatch",
+                                (),
+                                {
+                                    "file_path": str(logger_file.resolve()),
+                                    "language": "javascript",
+                                    "snippet_line_start": 1,
+                                    "snippet_line_end": 3,
+                                    "snippet": "export const logger = ...",
+                                    "matched_terms": ["notes"],
+                                    "score": 3.0,
+                                },
+                            )(),
+                        ]
+                    },
+                )()
+                import_edge = ImportEdge(
+                    source_file=str(anchor_file.resolve()),
+                    target_file=str(import_file.resolve()),
+                    import_statement="import './crdt-notes.service.js'",
+                    module_path="./crdt-notes.service.js",
+                    language="javascript",
+                    line=1,
+                )
+                with mock.patch.object(
+                    qc,
+                    "import_neighbors",
+                    return_value=type("Neighbors", (), {"imports": [import_edge], "importers": []})(),
+                ):
+                    payload = qc._text_primary_payload(
+                        query="How are notes stored with frontmatter, version history, trash, and CRDT session support?",
+                        project_name="notes-test",
+                        text_result=text_result,
+                        limit=1,
+                        related_file_limit=4,
+                        path=root,
+                    )
+        finally:
+            qc.close()
+
+        related_paths = [Path(item["file_path"]).resolve() for item in payload["related_files"]]
+        self.assertIn(frontmatter_file.resolve(), related_paths)
+        self.assertIn(version_file.resolve(), related_paths)
+        self.assertIn(import_file.resolve(), related_paths)
+        self.assertNotIn(logger_file.resolve(), related_paths)
+
+    def test_text_import_related_files_prioritize_module_neighbors_over_shared_utilities(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                hub_dir = root / "features" / "mcp" / "main" / "hub"
+                bridge_dir = root / "features" / "mcp" / "main" / "bridge"
+                shared_dir = root / "shared"
+                hub_dir.mkdir(parents=True)
+                bridge_dir.mkdir(parents=True)
+                shared_dir.mkdir(parents=True)
+
+                anchor_file = hub_dir / "mcp-hub.js"
+                server_manager_file = hub_dir / "server-manager.js"
+                bridge_file = bridge_dir / "mcp-bridge.js"
+                logger_file = shared_dir / "logger.js"
+
+                for path in (anchor_file, server_manager_file, bridge_file, logger_file):
+                    path.write_text("// test\n", encoding="utf-8")
+
+                result = SearchResult(
+                    1.0,
+                    str(anchor_file.resolve()),
+                    "mcp-hub.js",
+                    "file_match",
+                    1,
+                    10,
+                    "",
+                    "",
+                    language="javascript",
+                )
+                neighbors = type(
+                    "Neighbors",
+                    (),
+                    {
+                        "imports": [
+                            ImportEdge(str(anchor_file.resolve()), str(logger_file.resolve()), "import logger", "./logger", "javascript", 1),
+                            ImportEdge(str(anchor_file.resolve()), str(server_manager_file.resolve()), "import serverManager", "./server-manager", "javascript", 2),
+                            ImportEdge(str(anchor_file.resolve()), str(bridge_file.resolve()), "import bridge", "../bridge/mcp-bridge", "javascript", 3),
+                        ],
+                        "importers": [],
+                    },
+                )()
+                with mock.patch.object(qc, "import_neighbors", return_value=neighbors):
+                    related = qc._text_import_related_files_for_results(
+                        query="How does the MCP hub start per-workspace servers and route tool calls and events back into the app?",
+                        results=[result],
+                        related_seed_files=1,
+                        related_file_limit=3,
+                        path=root,
+                    )
+        finally:
+            qc.close()
+
+        self.assertEqual(
+            [Path(item["file_path"]).resolve() for item in related[:2]],
+            [server_manager_file.resolve(), bridge_file.resolve()],
+        )
+
     def test_retrieve_context_auto_uses_symbol_bundle_for_broad_symbol_queries(self) -> None:
         qc = QuickContext(
             EngineConfig(

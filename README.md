@@ -12,7 +12,7 @@ It currently has two main parts:
 The SDK now includes AI-facing retrieval helpers:
 
 - `QuickContext.retrieve_context_auto(...)`
-  Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, expands behavior-oriented symbol questions with same-file helper symbols from indexed Rust metadata plus targeted source hydration, falls back to semantic or bundle retrieval for broader natural-language questions, accepts explicit `path=` scoping when the target repo is outside the current working directory, and degrades to Rust text retrieval when an external repo has not been vector-indexed yet.
+  Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, expands behavior-oriented symbol questions with same-file helper symbols from indexed Rust metadata plus targeted source hydration, falls back to semantic or bundle retrieval for broader natural-language questions, enriches strong text-primary queries with import-aware and module-local related files, accepts explicit `path=` scoping when the target repo is outside the current working directory, and degrades to Rust text retrieval when an external repo has not been vector-indexed yet.
 - `QuickContext.warm_project(...)`
   Optional startup warmup for the long-lived Rust service. It preloads the persisted Rust symbol and text indices for a project so the first real query is cheaper.
 - `QuickContext.start_background_warm(...)`

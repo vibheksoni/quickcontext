@@ -1617,6 +1617,7 @@ class QuickContext:
                         text_result=text_result,
                         limit=limit,
                         related_file_limit=related_file_limit,
+                        path=retrieval_root,
                     )
             else:
                 text_result = None
@@ -1759,6 +1760,7 @@ class QuickContext:
             text_result=text_result,
             limit=limit,
             related_file_limit=related_file_limit,
+            path=path,
         )
 
     def _looks_like_missing_vector_index_error(self, exc: Exception) -> bool:
@@ -1897,6 +1899,7 @@ class QuickContext:
         text_result: TextSearchResult,
         limit: int,
         related_file_limit: int,
+        path: str | Path,
     ) -> dict:
         """
         Build an AI-facing payload from Rust text search results.
@@ -1906,20 +1909,381 @@ class QuickContext:
             matches=text_result.matches,
             limit=limit,
         )
+        primary_results = self._text_matches_to_search_results(primary_matches)
+        import_related = self._text_import_related_files_for_results(
+            query=query,
+            results=primary_results,
+            related_seed_files=min(2, len(primary_results)),
+            related_file_limit=max(related_file_limit * 2, 8),
+            path=path,
+        )
+        module_related = self._module_local_related_files_for_results(
+            query=query,
+            results=primary_results,
+            related_file_limit=max(related_file_limit * 2, 8),
+        )
+        lexical_related = self._text_matches_to_related_files(
+            query=query,
+            matches=related_matches,
+            related_file_limit=max(related_file_limit * 2, 8),
+            excluded_paths={str(item.file_path) for item in primary_matches},
+        )
         return {
             "query": query,
             "project_name": project_name,
             "mode": "text",
             "symbol_query": None,
-            "results": self._text_matches_to_search_results(primary_matches),
-            "related_files": self._text_matches_to_related_files(
-                query=query,
-                matches=related_matches,
-                related_file_limit=related_file_limit,
-                excluded_paths={str(item.file_path) for item in primary_matches},
+            "results": primary_results,
+            "related_files": self._merge_ranked_related_file_lists(
+                module_related,
+                import_related,
+                lexical_related,
+                limit=related_file_limit,
             ),
             "related_callers": [],
         }
+
+    def _text_import_related_files_for_results(
+        self,
+        query: str,
+        results: list,
+        related_seed_files: int,
+        related_file_limit: int,
+        path: str | Path,
+    ) -> list[dict]:
+        """
+        Collect import-neighbor companions around text-primary anchors and rank them for context usefulness.
+        """
+        if (
+            not results
+            or related_file_limit <= 0
+            or related_seed_files <= 0
+            or not self._should_expand_text_primary_related(query)
+        ):
+            return []
+
+        seeds: list[str] = []
+        seen_seed_files: set[str] = set()
+        for result in results:
+            file_path = str(result.file_path)
+            if file_path in seen_seed_files:
+                continue
+            seen_seed_files.add(file_path)
+            seeds.append(file_path)
+            if len(seeds) >= related_seed_files:
+                break
+
+        related_by_path: dict[str, dict] = {}
+        excluded_paths = set(seeds)
+        project_root = self._resolve_retrieval_root(path)
+
+        for seed_file in seeds:
+            try:
+                neighbors = self.import_neighbors(file=seed_file, path=project_root)
+            except Exception:
+                continue
+            self._merge_related_edges(
+                seed_file=seed_file,
+                relation="imports",
+                edges=neighbors.imports,
+                related_by_path=related_by_path,
+                excluded_paths=excluded_paths,
+            )
+            self._merge_related_edges(
+                seed_file=seed_file,
+                relation="imported_by",
+                edges=neighbors.importers,
+                related_by_path=related_by_path,
+                excluded_paths=excluded_paths,
+            )
+
+        related = list(related_by_path.values())
+        related.sort(
+            key=lambda item: (
+                -self._text_related_file_priority(query, item),
+                item["distance"],
+                item["file_path"],
+            )
+        )
+        return related[:related_file_limit]
+
+    def _module_local_related_files_for_results(
+        self,
+        query: str,
+        results: list,
+        related_file_limit: int,
+    ) -> list[dict]:
+        """
+        Collect nearby module-local files around text-primary anchors using path structure and query overlap.
+        """
+        if not results or related_file_limit <= 0 or not self._should_expand_text_primary_related(query):
+            return []
+
+        query_keywords = set(extract_keywords(query, max_keywords=20))
+        related_by_path: dict[str, dict] = {}
+        excluded_paths = {
+            str(getattr(item, "file_path"))
+            for item in results
+            if getattr(item, "file_path", None)
+        }
+
+        for result in results[: min(2, len(results))]:
+            raw_seed_file = str(getattr(result, "file_path", "")).replace("\\\\?\\", "")
+            if not raw_seed_file:
+                continue
+            seed_path = Path(raw_seed_file)
+            if not seed_path.exists():
+                continue
+            for candidate_path, distance in self._iter_module_local_candidate_paths(seed_path):
+                normalized_candidate = str(candidate_path).replace("\\\\?\\", "")
+                if normalized_candidate in excluded_paths or self._should_skip_lexical_related_path(query, normalized_candidate):
+                    continue
+                priority = self._module_local_candidate_priority(
+                    query_keywords=query_keywords,
+                    seed_path=seed_path,
+                    candidate_path=candidate_path,
+                    distance=distance,
+                )
+                if priority <= 0:
+                    continue
+
+                item = related_by_path.setdefault(
+                    normalized_candidate,
+                    {
+                        "file_path": normalized_candidate,
+                        "distance": distance,
+                        "relations": [],
+                        "_priority": priority,
+                    },
+                )
+                item["distance"] = min(item["distance"], distance)
+                item["_priority"] = max(item["_priority"], priority)
+                item["relations"].append(
+                    {
+                        "relation": "module_local_neighbor",
+                        "seed_file": str(seed_path),
+                        "module_path": str(candidate_path.parent),
+                        "language": getattr(result, "language", None),
+                        "line": 0,
+                    }
+                )
+
+        related = sorted(
+            related_by_path.values(),
+            key=lambda item: (-item["_priority"], item["distance"], item["file_path"]),
+        )
+        for item in related:
+            item.pop("_priority", None)
+        return related[:related_file_limit]
+
+    def _iter_module_local_candidate_paths(self, seed_path: Path) -> list[tuple[Path, int]]:
+        """
+        Yield nearby candidate files from the seed directory, its immediate children, and its parent directory.
+        """
+        candidates: list[tuple[Path, int]] = []
+        seen: set[Path] = set()
+        resolved_seed = seed_path.resolve()
+
+        def add_directory(directory: Path, distance: int, include_children: bool = False) -> None:
+            if not directory.exists() or not directory.is_dir():
+                return
+            try:
+                entries = list(directory.iterdir())
+            except OSError:
+                return
+            for entry in entries:
+                if entry.is_file():
+                    resolved = entry.resolve()
+                    if resolved == resolved_seed or resolved in seen:
+                        continue
+                    if not self._is_supported_module_local_candidate(entry, seed_path):
+                        continue
+                    seen.add(resolved)
+                    candidates.append((resolved, distance))
+                elif include_children and entry.is_dir():
+                    try:
+                        child_entries = list(entry.iterdir())
+                    except OSError:
+                        continue
+                    for child in child_entries:
+                        if not child.is_file():
+                            continue
+                        resolved = child.resolve()
+                        if resolved == resolved_seed or resolved in seen:
+                            continue
+                        if not self._is_supported_module_local_candidate(child, seed_path):
+                            continue
+                        seen.add(resolved)
+                        candidates.append((resolved, distance + 1))
+
+        add_directory(seed_path.parent, 1, include_children=True)
+        parent_directory = seed_path.parent.parent
+        if parent_directory != seed_path.parent:
+            add_directory(parent_directory, 2, include_children=False)
+        return candidates
+
+    def _is_supported_module_local_candidate(self, candidate_path: Path, seed_path: Path) -> bool:
+        """
+        Keep module-local companion expansion focused on likely code files.
+        """
+        code_suffixes = {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cjs",
+            ".cs",
+            ".go",
+            ".h",
+            ".hpp",
+            ".java",
+            ".js",
+            ".jsx",
+            ".kt",
+            ".mjs",
+            ".php",
+            ".py",
+            ".rb",
+            ".rs",
+            ".swift",
+            ".ts",
+            ".tsx",
+        }
+        candidate_suffix = candidate_path.suffix.lower()
+        seed_suffix = seed_path.suffix.lower()
+        if candidate_suffix and candidate_suffix == seed_suffix:
+            return True
+        return candidate_suffix in code_suffixes
+
+    def _module_local_candidate_priority(
+        self,
+        query_keywords: set[str],
+        seed_path: Path,
+        candidate_path: Path,
+        distance: int,
+    ) -> int:
+        candidate_tokens = self._split_symbol_text_tokens(candidate_path.as_posix())
+        seed_tokens = self._split_symbol_text_tokens(seed_path.as_posix())
+        overlap = len(query_keywords.intersection(candidate_tokens))
+        seed_overlap = len(seed_tokens.intersection(candidate_tokens))
+
+        score = overlap * 4
+        score += min(seed_overlap, 3)
+
+        if candidate_path.parent == seed_path.parent:
+            score += 3
+        elif candidate_path.parent.parent == seed_path.parent:
+            score += 2
+        elif candidate_path.parent == seed_path.parent.parent:
+            score += 1
+
+        generic_tokens = {"index", "main", "logger", "types", "type", "utils", "util", "constants", "shared"}
+        if candidate_tokens.intersection(generic_tokens) and not query_keywords.intersection(candidate_tokens):
+            score -= 2
+
+        if distance > 1:
+            score -= distance - 1
+
+        return score
+
+    def _text_related_file_priority(self, query: str, related_file: dict) -> int:
+        """
+        Score related files for text-primary context so module-local implementation files win over low-signal utilities.
+        """
+        file_path = str(related_file["file_path"]).replace("\\", "/")
+        query_keywords = set(extract_keywords(query, max_keywords=20))
+        candidate_tokens = self._split_symbol_text_tokens(file_path.replace("/", " "))
+
+        score = len(query_keywords.intersection(candidate_tokens)) * 3
+        relations = related_file.get("relations", [])
+        score += min(len(relations), 2)
+
+        seed_file = ""
+        if relations:
+            seed_file = str(relations[0].get("seed_file", "")).replace("\\", "/")
+        if seed_file:
+            seed_path = Path(seed_file)
+            candidate_path = Path(file_path)
+            if candidate_path.parent == seed_path.parent:
+                score += 4
+            elif candidate_path.parent.parent == seed_path.parent:
+                score += 3
+            elif candidate_path.parent == seed_path.parent.parent:
+                score += 1
+
+        low_signal_tokens = {"logger", "types", "type", "utils", "util", "constants", "events", "schemas", "shared"}
+        if candidate_tokens.intersection(low_signal_tokens) and not query_keywords.intersection(candidate_tokens):
+            score -= 2
+
+        return score
+
+    def _merge_ranked_related_file_lists(
+        self,
+        *related_lists: list[dict],
+        limit: int,
+    ) -> list[dict]:
+        """
+        Merge ranked related-file lists while preserving the earlier list priority and deduping paths.
+        """
+        if limit <= 0:
+            return []
+
+        merged_by_path: dict[str, dict] = {}
+        ordered: list[dict] = []
+        for items in related_lists:
+            for item in items:
+                file_path = str(item["file_path"])
+                existing = merged_by_path.get(file_path)
+                if existing is None:
+                    merged_item = {
+                        "file_path": file_path,
+                        "distance": int(item.get("distance", 1)),
+                        "relations": list(item.get("relations", [])),
+                    }
+                    merged_by_path[file_path] = merged_item
+                    ordered.append(merged_item)
+                else:
+                    existing["distance"] = min(existing["distance"], int(item.get("distance", 1)))
+                    existing["relations"].extend(item.get("relations", []))
+                if len(ordered) >= limit:
+                    break
+            if len(ordered) >= limit:
+                break
+        return ordered[:limit]
+
+    def _should_expand_text_primary_related(self, query: str) -> bool:
+        """
+        Detect broad natural-language questions where text-primary results need richer multi-file companions.
+        """
+        keywords = set(extract_keywords(query, max_keywords=20))
+        if len(keywords) < 5:
+            return False
+
+        flow_terms = {
+            "across",
+            "archive",
+            "archived",
+            "back",
+            "coordinate",
+            "flow",
+            "history",
+            "initialize",
+            "manage",
+            "merge",
+            "migration",
+            "pipeline",
+            "route",
+            "routing",
+            "session",
+            "start",
+            "stored",
+            "support",
+            "through",
+            "trash",
+            "version",
+            "watching",
+            "workspace",
+        }
+        return bool(keywords.intersection(flow_terms))
 
     def _split_text_matches_for_query(
         self,
