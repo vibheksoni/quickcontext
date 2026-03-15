@@ -2046,7 +2046,11 @@ class RegressionTests(unittest.TestCase):
                 qc,
                 "_hydrate_search_result_sources",
                 return_value=hydrated,
-            ) as hydrate:
+            ) as hydrate, mock.patch.object(
+                qc,
+                "_related_callers_for_results",
+                return_value=[],
+            ) as related_callers:
                 payload = qc.semantic_search_bundle(
                     "Which files import this module and what dependencies does it have?",
                     project_name="quickcontext",
@@ -2059,6 +2063,7 @@ class RegressionTests(unittest.TestCase):
 
         self.assertFalse(semantic_search.call_args.kwargs["include_source"])
         hydrate.assert_called_once()
+        related_callers.assert_called_once_with(results)
         self.assertEqual(payload["results"], hydrated)
 
     def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
