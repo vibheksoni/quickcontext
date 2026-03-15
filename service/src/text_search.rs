@@ -15,6 +15,12 @@ const SNIPPET_CONTEXT_LINES: usize = 3;
 const TOOLING_FILE_PENALTY: f64 = 0.15;
 const DOC_FILE_QUERY_PENALTY: f64 = 0.45;
 const TEST_FILE_QUERY_PENALTY: f64 = 0.45;
+const GENERATED_BUNDLE_FILE_PENALTY: f64 = 0.18;
+const GENERIC_WRAPPER_FILE_PENALTY: f64 = 0.78;
+const GENERIC_ENTRYPOINT_FILE_PENALTY: f64 = 0.72;
+const PATH_KEYWORD_BASE_BOOST: f64 = 0.16;
+const PATH_KEYWORD_BASENAME_BOOST: f64 = 0.10;
+const PATH_KEYWORD_MAX_BOOST: f64 = 1.42;
 
 
 /// Full-text search over files using persistent BM25 candidates and structural reranking.
@@ -178,6 +184,7 @@ fn score_and_rank(
         let role_boost =
             structural_boost::compute_role_boost(structural_boost::classify_role_from_content(&content));
         let tooling_penalty = compute_tooling_path_penalty(&candidate.file_path, &query_terms);
+        let path_boost = compute_path_keyword_boost(&candidate.file_path, &query_terms);
 
         let intent_boost = if intent_mode {
             compute_intent_score(
@@ -190,8 +197,13 @@ fn score_and_rank(
             1.0
         };
 
-        let boosted_score =
-            candidate.score * category_boost * coverage_boost * role_boost * intent_boost * tooling_penalty;
+        let boosted_score = candidate.score
+            * category_boost
+            * coverage_boost
+            * role_boost
+            * intent_boost
+            * tooling_penalty
+            * path_boost;
         let (snippet, line_start, line_end) = extract_snippet(&content, &candidate.matched_terms);
 
         matches.push(TextSearchMatch {
@@ -226,6 +238,7 @@ fn score_and_rank_fast(
             structural_boost::compute_category_boost(structural_boost::classify_file(&candidate.file_path));
         let coverage_boost = compute_matched_term_coverage_boost(&candidate.matched_terms, query_terms);
         let tooling_penalty = compute_tooling_path_penalty(&candidate.file_path, query_terms);
+        let path_boost = compute_path_keyword_boost(&candidate.file_path, query_terms);
         let intent_boost = if intent_mode {
             compute_intent_score(
                 &candidate.matched_terms,
@@ -237,7 +250,10 @@ fn score_and_rank_fast(
             1.0
         };
 
-        scored.push((idx, candidate.score * category_boost * coverage_boost * intent_boost * tooling_penalty));
+        scored.push((
+            idx,
+            candidate.score * category_boost * coverage_boost * intent_boost * tooling_penalty * path_boost,
+        ));
     }
 
     scored.sort_by(|a, b| {
@@ -464,6 +480,7 @@ fn extract_snippet(content: &str, matched_terms: &[String]) -> (String, usize, u
 
 fn compute_tooling_path_penalty(path: &str, query_terms: &[String]) -> f64 {
     let normalized_path = path.to_ascii_lowercase().replace('\\', "/");
+    let mut penalty = 1.0;
     let tooling_terms = [
         "benchmark",
         "latency",
@@ -478,17 +495,13 @@ fn compute_tooling_path_penalty(path: &str, query_terms: &[String]) -> f64 {
     let query_is_tooling = query_terms
         .iter()
         .any(|term| tooling_terms.iter().any(|tool| term == tool));
-    if query_is_tooling {
-        return 1.0;
-    }
-
     let is_tooling_path = normalized_path.contains("/scripts/")
         || normalized_path.starts_with("scripts/")
         || normalized_path.contains("benchmark")
         || normalized_path.ends_with("_cases.json")
         || normalized_path.ends_with(".bench.rs");
-    if is_tooling_path {
-        return TOOLING_FILE_PENALTY;
+    if is_tooling_path && !query_is_tooling {
+        penalty *= TOOLING_FILE_PENALTY;
     }
 
     let doc_terms = ["doc", "docs", "documentation", "readme", "guide", "guides", "manual"];
@@ -503,7 +516,7 @@ fn compute_tooling_path_penalty(path: &str, query_terms: &[String]) -> f64 {
         || normalized_path.ends_with("readme.md")
         || normalized_path.ends_with("ai_docs.md");
     if is_doc_path && !query_is_doc_focused {
-        return DOC_FILE_QUERY_PENALTY;
+        penalty *= DOC_FILE_QUERY_PENALTY;
     }
 
     let test_terms = ["test", "tests", "spec", "specs", "regression", "unittest", "pytest"];
@@ -519,10 +532,201 @@ fn compute_tooling_path_penalty(path: &str, query_terms: &[String]) -> f64 {
         || normalized_path.ends_with("_spec.py")
         || normalized_path.contains("test_regressions.py");
     if is_test_path && !query_is_test_focused {
-        return TEST_FILE_QUERY_PENALTY;
+        penalty *= TEST_FILE_QUERY_PENALTY;
     }
 
-    1.0
+    if is_generated_bundle_path(&normalized_path) && !query_is_renderer_focused(query_terms) {
+        penalty *= GENERATED_BUNDLE_FILE_PENALTY;
+    }
+
+    penalty * compute_wrapper_path_penalty(&normalized_path, query_terms)
+}
+
+fn compute_path_keyword_boost(path: &str, query_terms: &[String]) -> f64 {
+    if query_terms.is_empty() {
+        return 1.0;
+    }
+
+    let normalized_path = path.to_ascii_lowercase().replace('\\', "/");
+    let query_set: HashSet<String> = query_terms
+        .iter()
+        .map(|term| term.to_ascii_lowercase())
+        .filter(|term| term.len() >= 3)
+        .collect();
+    if query_set.is_empty() {
+        return 1.0;
+    }
+
+    let path_tokens = tokenize_path_tokens(&normalized_path);
+    if path_tokens.is_empty() {
+        return 1.0;
+    }
+
+    let path_overlap = query_set.intersection(&path_tokens).count();
+    if path_overlap == 0 {
+        return 1.0;
+    }
+
+    let filename = Path::new(&normalized_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let basename_tokens = tokenize_path_tokens(filename);
+    let basename_overlap = query_set.intersection(&basename_tokens).count();
+
+    let mut boost = 1.0 + (path_overlap as f64 * PATH_KEYWORD_BASE_BOOST);
+    boost += basename_overlap as f64 * PATH_KEYWORD_BASENAME_BOOST;
+    boost.min(PATH_KEYWORD_MAX_BOOST)
+}
+
+fn tokenize_path_tokens(value: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let normalized = value
+        .replace('\\', "/")
+        .replace(['.', '-', '_', ':', '(', ')', '[', ']', ','], " ");
+
+    for token in normalized.split(|c: char| c == '/' || c.is_whitespace()) {
+        let lowered = token.trim().to_ascii_lowercase();
+        if lowered.len() < 3 || is_low_signal_path_token(&lowered) {
+            continue;
+        }
+        tokens.insert(lowered);
+    }
+
+    tokens
+}
+
+fn is_low_signal_path_token(token: &str) -> bool {
+    matches!(
+        token,
+        "app"
+            | "apps"
+            | "dist"
+            | "feature"
+            | "features"
+            | "lib"
+            | "main"
+            | "node"
+            | "nodes"
+            | "preload"
+            | "renderer"
+            | "shared"
+            | "src"
+            | "utils"
+            | "immutable"
+            | "chunk"
+            | "chunks"
+            | "worker"
+            | "workers"
+            | "index"
+            | "file"
+            | "files"
+            | "service"
+            | "manager"
+            | "repository"
+            | "module"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "mjs"
+            | "cjs"
+            | "cts"
+            | "map"
+    )
+}
+
+fn is_generated_bundle_path(path: &str) -> bool {
+    path.contains("/app/immutable/")
+        || path.contains("/immutable/chunks/")
+        || path.contains("/immutable/nodes/")
+        || path.contains("/immutable/workers/")
+}
+
+fn query_is_renderer_focused(query_terms: &[String]) -> bool {
+    let renderer_terms = [
+        "asset",
+        "assets",
+        "chunk",
+        "chunks",
+        "component",
+        "components",
+        "css",
+        "dom",
+        "frontend",
+        "front-end",
+        "html",
+        "renderer",
+        "route",
+        "routes",
+        "svelte",
+        "style",
+        "styles",
+        "ui",
+        "worker",
+        "workers",
+    ];
+    query_terms
+        .iter()
+        .any(|term| renderer_terms.iter().any(|candidate| term == candidate))
+}
+
+fn compute_wrapper_path_penalty(path: &str, query_terms: &[String]) -> f64 {
+    if query_terms.len() < 3 {
+        return 1.0;
+    }
+
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let basename = filename
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mentions = |terms: &[&str]| -> bool {
+        query_terms
+            .iter()
+            .any(|term| terms.iter().any(|candidate| term == candidate))
+    };
+
+    let mut penalty = 1.0;
+
+    let is_shallow_entry = filename == "index.js"
+        && (path == "main/index.js"
+            || path == "preload/index.js"
+            || path == "shared/index.js"
+            || path.ends_with("/main/index.js")
+            || path.ends_with("/preload/index.js")
+            || path.ends_with("/shared/index.js"));
+    if is_shallow_entry && !mentions(&["index", "entry", "entrypoint", "bootstrap", "startup", "init", "initialize"]) {
+        penalty *= GENERIC_ENTRYPOINT_FILE_PENALTY;
+    }
+
+    if filename.ends_with(".ipc.js") && !mentions(&["ipc", "channel", "channels", "invoke", "message", "messages"]) {
+        penalty *= GENERIC_WRAPPER_FILE_PENALTY;
+    }
+    if basename.ends_with("tools") && !mentions(&["tool", "tools"]) {
+        penalty *= GENERIC_WRAPPER_FILE_PENALTY;
+    }
+    if basename.ends_with("bridge") && !mentions(&["bridge", "bridges"]) {
+        penalty *= GENERIC_WRAPPER_FILE_PENALTY;
+    }
+    if basename.ends_with("adapter") && !mentions(&["adapter", "adapters", "protocol", "protocols"]) {
+        penalty *= GENERIC_WRAPPER_FILE_PENALTY;
+    }
+    if basename.ends_with("provider") && !mentions(&["provider", "providers", "model", "models"]) {
+        penalty *= GENERIC_WRAPPER_FILE_PENALTY;
+    }
+    if matches!(basename.as_str(), "types" | "constants" | "schemas")
+        && !mentions(&["type", "types", "constant", "constants", "schema", "schemas"])
+    {
+        penalty *= GENERIC_WRAPPER_FILE_PENALTY;
+    }
+
+    penalty
 }
 
 
@@ -598,6 +802,43 @@ mod tests {
         let query_terms = vec!["test".to_string(), "regression".to_string()];
         let penalty = compute_tooling_path_penalty("engine/tests/test_regressions.py", &query_terms);
         assert_eq!(penalty, 1.0);
+    }
+
+    #[test]
+    fn test_compute_tooling_path_penalty_penalizes_generated_renderer_chunks_for_non_ui_queries() {
+        let query_terms = vec!["event".to_string(), "storage".to_string(), "notification".to_string()];
+        let penalty = compute_tooling_path_penalty(
+            "renderer/app/immutable/chunks/BLk-YuGw.js",
+            &query_terms,
+        );
+        assert!(penalty < 1.0);
+    }
+
+    #[test]
+    fn test_compute_tooling_path_penalty_keeps_generated_renderer_chunks_for_renderer_queries() {
+        let query_terms = vec!["renderer".to_string(), "component".to_string(), "chunk".to_string()];
+        let penalty = compute_tooling_path_penalty(
+            "renderer/app/immutable/chunks/BLk-YuGw.js",
+            &query_terms,
+        );
+        assert_eq!(penalty, 1.0);
+    }
+
+    #[test]
+    fn test_compute_tooling_path_penalty_penalizes_generic_wrapper_files_for_non_wrapper_queries() {
+        let query_terms = vec!["mcp".to_string(), "hub".to_string(), "restart".to_string(), "server".to_string()];
+        let penalty = compute_tooling_path_penalty("main/index.js", &query_terms);
+        assert!(penalty < 1.0);
+    }
+
+    #[test]
+    fn test_compute_path_keyword_boost_rewards_descriptive_file_paths() {
+        let query_terms = vec!["mcp".to_string(), "hub".to_string(), "server".to_string()];
+        let boost = compute_path_keyword_boost(
+            "features/mcp/main/hub/mcp-hub.js",
+            &query_terms,
+        );
+        assert!(boost > 1.0);
     }
 
     #[test]

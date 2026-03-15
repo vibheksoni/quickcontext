@@ -229,6 +229,12 @@ class QuickContext:
             idle_delay_seconds=self._background_warm_auto_delay_seconds,
         )
 
+    def _resolve_retrieval_root(self, path: str | Path | None = None) -> Path:
+        """
+        Resolve the repo root used by parser-first and text-first retrieval flows.
+        """
+        return Path(path).resolve() if path is not None else Path.cwd().resolve()
+
     def _get_collection(self, project_name: str) -> "CollectionManager":
         """
         Get or create CollectionManager for a project.
@@ -1304,6 +1310,7 @@ class QuickContext:
         rerank_tail_retrieval_weight: float = 0.40,
         rerank_candidate_multiplier: int = 4,
         include_source: bool = True,
+        path: str | Path | None = None,
     ) -> list:
         """
         Run semantic search over indexed code vectors.
@@ -1326,9 +1333,10 @@ class QuickContext:
         rerank_candidate_multiplier: int — Candidate multiplier before reranking.
         Returns: list — SearchResult list.
         """
-        self._ensure_background_warm_started()
+        retrieval_root = self._resolve_retrieval_root(path)
+        self._ensure_background_warm_started(retrieval_root)
         with self._activity_scope():
-            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            project = project_name if project_name else detect_project_name(retrieval_root, manual_override=None)
             searcher = self._get_searcher(project, rerank=rerank)
 
             if mode == "code":
@@ -1388,6 +1396,7 @@ class QuickContext:
         related_file_limit: int = 8,
         include_graph_related: bool = True,
         include_source: bool = True,
+        path: str | Path | None = None,
     ) -> dict:
         """
         Run semantic retrieval and expand related files from the import graph around top hits.
@@ -1395,9 +1404,10 @@ class QuickContext:
         This is intended for deeper AI workflows that need both the best semantic anchors
         and a small set of adjacent files to inspect next.
         """
-        self._ensure_background_warm_started()
+        retrieval_root = self._resolve_retrieval_root(path)
+        self._ensure_background_warm_started(retrieval_root)
         with self._activity_scope():
-            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            project = project_name if project_name else detect_project_name(retrieval_root, manual_override=None)
             tooling_query = self._looks_like_tooling_query(query)
             semantic_limit = max(limit, 1) * 4
             if tooling_query:
@@ -1413,6 +1423,7 @@ class QuickContext:
                 keyword_weight=keyword_weight,
                 rerank=rerank,
                 include_source=False,
+                path=retrieval_root,
             )
             anchors, semantic_neighbors = self._split_semantic_bundle_results(
                 results=results,
@@ -1438,8 +1449,9 @@ class QuickContext:
                     results=anchors,
                     related_seed_files=related_seed_files,
                     related_file_limit=max(0, related_file_limit - len(prioritized_related)),
+                    path=retrieval_root,
                 )
-            related_callers = self._related_callers_for_results(results)
+            related_callers = self._related_callers_for_results(results, path=retrieval_root)
             final_anchors = self._hydrate_search_result_sources(anchors) if include_source else anchors
 
             return {
@@ -1464,13 +1476,15 @@ class QuickContext:
         related_seed_files: int = 1,
         related_file_limit: int = 8,
         include_source: bool = True,
+        path: str | Path | None = None,
     ) -> dict:
         """
         Automatically choose between plain semantic search and the graph-aware bundle primitive.
         """
-        self._ensure_background_warm_started()
+        retrieval_root = self._resolve_retrieval_root(path)
+        self._ensure_background_warm_started(retrieval_root)
         with self._activity_scope():
-            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            project = project_name if project_name else detect_project_name(retrieval_root, manual_override=None)
             if self._should_use_bundle_for_query(query):
                 bundle = self.semantic_search_bundle(
                     query=query,
@@ -1485,6 +1499,7 @@ class QuickContext:
                     related_seed_files=related_seed_files,
                     related_file_limit=related_file_limit,
                     include_graph_related=self._should_use_graph_related_for_query(query),
+                    path=retrieval_root,
                 )
                 bundle["mode"] = "bundle"
                 return bundle
@@ -1504,6 +1519,7 @@ class QuickContext:
                     keyword_weight=keyword_weight,
                     rerank=rerank,
                     include_source=include_source,
+                    path=retrieval_root,
                 ),
                 "related_files": [],
                 "related_callers": [],
@@ -1522,6 +1538,7 @@ class QuickContext:
         rerank: bool = False,
         related_seed_files: int = 1,
         related_file_limit: int = 8,
+        path: str | Path | None = None,
     ) -> dict:
         """
         Automatically choose the best retrieval primitive for AI workflows.
@@ -1530,9 +1547,10 @@ class QuickContext:
         return the real definition source without paying an embedding round trip. Broader
         natural-language questions fall back to semantic_search_auto(...).
         """
-        self._ensure_background_warm_started()
+        retrieval_root = self._resolve_retrieval_root(path)
+        self._ensure_background_warm_started(retrieval_root)
         with self._activity_scope():
-            project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
+            project = project_name if project_name else detect_project_name(retrieval_root, manual_override=None)
             symbol_query = self._extract_symbol_query_candidate(query)
             if symbol_query:
                 expand_symbol_context = self._should_expand_symbol_context_results(query)
@@ -1541,6 +1559,7 @@ class QuickContext:
                     limit=1 if expand_symbol_context else limit,
                     language=language,
                     path_prefix=path_prefix,
+                    path=retrieval_root,
                 )
                 if results:
                     if expand_symbol_context:
@@ -1548,6 +1567,7 @@ class QuickContext:
                             query=query,
                             results=results,
                             limit=limit,
+                            path=retrieval_root,
                         )
                     if self._should_use_bundle_for_query(query):
                         return {
@@ -1560,8 +1580,9 @@ class QuickContext:
                                 results=results,
                                 related_seed_files=related_seed_files,
                                 related_file_limit=related_file_limit,
+                                path=retrieval_root,
                             ) if self._should_use_graph_related_for_query(query) else [],
-                            "related_callers": self._related_callers_for_results(results),
+                            "related_callers": self._related_callers_for_results(results, path=retrieval_root),
                         }
 
                     return {
@@ -1581,7 +1602,7 @@ class QuickContext:
                 try:
                     text_result = self.text_search(
                         query=query,
-                        path=Path.cwd(),
+                        path=retrieval_root,
                         limit=max(limit + related_file_limit, 8),
                         intent_mode=True,
                         intent_level=2,
@@ -1611,6 +1632,7 @@ class QuickContext:
                     related_seed_files=related_seed_files,
                     related_file_limit=related_file_limit,
                     include_graph_related=should_use_graph_related,
+                    path=retrieval_root,
                 )
                 bundle["mode"] = "bundle"
                 bundle["symbol_query"] = None
@@ -1629,6 +1651,7 @@ class QuickContext:
                 related_seed_files=related_seed_files,
                 related_file_limit=related_file_limit,
                 include_source=False,
+                path=retrieval_root,
             )
             payload["symbol_query"] = None
             if payload.get("mode") == "search":
@@ -1636,6 +1659,7 @@ class QuickContext:
                     query=query,
                     results=payload["results"],
                     related_file_limit=related_file_limit,
+                    path=retrieval_root,
                 )
                 if self._should_add_graph_lexical_companions(query):
                     graph_related = self._graph_lexical_related_files_for_query(
@@ -1643,6 +1667,7 @@ class QuickContext:
                         results=payload["results"],
                         existing_related=lexical_related,
                         related_file_limit=related_file_limit,
+                        path=retrieval_root,
                     )
                     reserved_graph = graph_related[:1]
                     seen_graph_paths = {entry["file_path"] for entry in reserved_graph}
@@ -1898,6 +1923,7 @@ class QuickContext:
         query: str,
         results: list,
         related_file_limit: int,
+        path: str | Path,
     ) -> list[dict]:
         """
         Add fast lexical file companions for non-symbol search-mode queries.
@@ -1913,7 +1939,7 @@ class QuickContext:
         try:
             text_result = self.text_search(
                 query=query,
-                path=Path.cwd(),
+                path=path,
                 limit=max(related_file_limit * 4, 12),
                 intent_mode=True,
                 intent_level=2,
@@ -1954,6 +1980,7 @@ class QuickContext:
         results: list,
         existing_related: list[dict],
         related_file_limit: int,
+        path: str | Path,
     ) -> list[dict]:
         """
         Add graph-oriented lexical companions for dependency and caller style queries.
@@ -1975,7 +2002,7 @@ class QuickContext:
         try:
             text_result = self.text_search(
                 query=graph_query,
-                path=Path.cwd(),
+                path=path,
                 limit=max(related_file_limit * 4, 12),
                 intent_mode=True,
                 intent_level=2,
@@ -2293,6 +2320,7 @@ class QuickContext:
         query: str,
         results: list,
         limit: int,
+        path: str | Path,
     ) -> list:
         """
         Expand exact symbol anchors with nearby helper symbols from the same implementation file.
@@ -2305,6 +2333,7 @@ class QuickContext:
             query=query,
             anchor=anchor,
             helper_limit=max(limit - 1, 0),
+            path=path,
         )
         return self._merge_symbol_context_results(
             anchor=anchor,
@@ -2413,13 +2442,14 @@ class QuickContext:
         limit: int,
         language: Optional[str] = None,
         path_prefix: Optional[str] = None,
+        path: str | Path | None = None,
     ) -> list:
         """
         Run symbol lookup and hydrate top symbol hits into SearchResult rows with source.
         """
         lookup = self.symbol_lookup(
             query=query,
-            path=Path.cwd(),
+            path=path,
             limit=max(limit * 2, 8),
         )
         prioritized = self._prioritize_symbol_lookup_results(lookup.results, query)
@@ -2463,6 +2493,7 @@ class QuickContext:
         query: str,
         anchor: object,
         helper_limit: int,
+        path: str | Path,
     ) -> list:
         """
         Collect same-file helper symbols referenced by the anchor implementation.
@@ -2476,7 +2507,7 @@ class QuickContext:
             return []
 
         try:
-            extracted_symbols = self._load_file_symbol_candidates(anchor_file)
+            extracted_symbols = self._load_file_symbol_candidates(anchor_file, path=path)
         except Exception:
             return []
 
@@ -2533,7 +2564,7 @@ class QuickContext:
         ]
         return self._hydrate_search_result_sources(helper_results)
 
-    def _load_file_symbol_candidates(self, file_path: str) -> list:
+    def _load_file_symbol_candidates(self, file_path: str, path: str | Path) -> list:
         """
         Load same-file symbol metadata from the Rust symbol index, falling back to extraction.
         """
@@ -2541,7 +2572,7 @@ class QuickContext:
         try:
             lookup = self.parser_service.file_symbols(
                 file=normalized_path,
-                path=Path.cwd(),
+                path=path,
                 limit=2048,
             )
             if lookup.results:
@@ -2959,6 +2990,7 @@ class QuickContext:
         results: list,
         related_seed_files: int,
         related_file_limit: int,
+        path: str | Path,
     ) -> list[dict]:
         """
         Collect a small, deduplicated set of related files around the top semantic hits.
@@ -2979,7 +3011,7 @@ class QuickContext:
 
         related_by_path: dict[str, dict] = {}
         excluded_paths = set(seeds)
-        project_root = Path.cwd().resolve()
+        project_root = self._resolve_retrieval_root(path)
 
         for seed_file in seeds:
             neighbors = self.import_neighbors(file=seed_file, path=project_root)
@@ -3226,7 +3258,7 @@ class QuickContext:
         }
         return bool(keywords.intersection(graph_terms))
 
-    def _related_callers_for_results(self, results: list) -> list[dict]:
+    def _related_callers_for_results(self, results: list, path: str | Path) -> list[dict]:
         """
         Collect caller rows around the top callable semantic anchor.
         """
@@ -3237,7 +3269,7 @@ class QuickContext:
         if str(getattr(top, "symbol_kind", "")).lower() not in {"function", "method"}:
             return []
 
-        caller_rows = self.find_callers(symbol=top.symbol_name, path=Path.cwd(), limit=8)
+        caller_rows = self.find_callers(symbol=top.symbol_name, path=path, limit=8)
         related: list[dict] = []
         seen: set[tuple[str, str, int]] = set()
         for caller in caller_rows.callers:

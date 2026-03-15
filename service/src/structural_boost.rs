@@ -147,7 +147,13 @@ fn is_vendor_path(path_lower: &str) -> bool {
 /// path_lower: &str — Lowercased, forward-slash normalized path.
 /// filename: &str — Lowercased filename.
 fn is_generated_file(path_lower: &str, filename: &str) -> bool {
-    if path_lower.contains("generated/") || path_lower.contains("/gen/") {
+    if path_lower.contains("generated/")
+        || path_lower.contains("/gen/")
+        || path_lower.contains("/app/immutable/")
+        || path_lower.contains("/immutable/chunks/")
+        || path_lower.contains("/immutable/nodes/")
+        || path_lower.contains("/immutable/workers/")
+    {
         return true;
     }
     let suffixes = [

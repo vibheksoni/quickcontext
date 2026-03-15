@@ -298,6 +298,7 @@ scripts/*
 !scripts/symbol_context_cases.json
 !scripts/context_retrieval_benchmark.py
 !scripts/context_retrieval_cases.json
+!scripts/augmentintent_dist_cases.json
 !scripts/graph_retrieval_cases.json
 !scripts/text_retrieval_benchmark.py
 !scripts/warm_project_benchmark.py

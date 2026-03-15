@@ -20,6 +20,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark mixed AI retrieval quality and latency.")
     parser.add_argument("--config", default=None, help="Path to quickcontext config JSON.")
     parser.add_argument("--project", default="quickcontext", help="Indexed project name.")
+    parser.add_argument("--path", default=".", help="Project root path for parser/text retrieval routes.")
     parser.add_argument("--cases-file", required=True, help="JSON file containing benchmark cases.")
     parser.add_argument(
         "--strategy",
@@ -78,6 +79,7 @@ def _run_strategy(
     strategy: str,
     query: str,
     project_name: str,
+    path: Path,
     limit: int,
     related_seed_files: int,
     related_file_limit: int,
@@ -86,6 +88,7 @@ def _run_strategy(
         return qc.semantic_search_auto(
             query=query,
             project_name=project_name,
+            path=path,
             limit=limit,
             related_seed_files=related_seed_files,
             related_file_limit=related_file_limit,
@@ -94,20 +97,27 @@ def _run_strategy(
     return qc.retrieve_context_auto(
         query=query,
         project_name=project_name,
+        path=path,
         limit=limit,
         related_seed_files=related_seed_files,
         related_file_limit=related_file_limit,
     )
 
 
-def _warmup(qc: QuickContext, project_name: str) -> None:
-    qc.symbol_lookup("CollectionManager", path=Path.cwd(), limit=1)
-    qc.semantic_search("query embedding cache", project_name=project_name, limit=1)
+def _warmup(qc: QuickContext, project_name: str, path: Path, query: str) -> None:
+    try:
+        qc.warm_project(path=path)
+    except Exception:
+        pass
+    try:
+        qc.retrieve_context_auto(query=query, project_name=project_name, path=path, limit=1)
+    except Exception:
+        pass
 
 
 def main() -> None:
     args = _parse_args()
-    repo_root = Path.cwd().resolve()
+    target_root = Path(args.path).resolve()
     cases = json.loads(Path(args.cases_file).read_text(encoding="utf-8"))
     config = _optimize_search_config(_load_config(args.config))
 
@@ -119,7 +129,8 @@ def main() -> None:
     case_rows: list[dict] = []
 
     with QuickContext(config) as qc:
-        _warmup(qc, args.project)
+        warmup_query = str(cases[0]["query"]) if cases else "warm project"
+        _warmup(qc, args.project, target_root, warmup_query)
         for case in cases:
             query = str(case["query"])
             expected_paths = [str(path) for path in case["expected_paths"]]
@@ -129,6 +140,7 @@ def main() -> None:
                 strategy=args.strategy,
                 query=query,
                 project_name=args.project,
+                path=target_root,
                 limit=args.limit,
                 related_seed_files=args.related_seed_files,
                 related_file_limit=args.related_file_limit,
@@ -136,9 +148,9 @@ def main() -> None:
             latency_ms = (time.perf_counter() - started) * 1000
             latencies.append(latency_ms)
 
-            result_paths = [_relative_path(item.file_path, repo_root) for item in payload["results"]]
+            result_paths = [_relative_path(item.file_path, target_root) for item in payload["results"]]
             bundle_paths = result_paths + [
-                _relative_path(item["file_path"], repo_root)
+                _relative_path(item["file_path"], target_root)
                 for item in payload["related_files"]
             ]
             hit_rank = _match_rank(result_paths, expected_paths)

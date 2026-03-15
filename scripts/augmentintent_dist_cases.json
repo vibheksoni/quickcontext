@@ -1,0 +1,89 @@
+[
+  {
+    "query": "How does the MCP hub start per-workspace servers and route tool calls and events back into the app?",
+    "expected_paths": [
+      "features/mcp/main/hub/mcp-hub.js",
+      "features/mcp/main/hub/server-manager.js",
+      "features/mcp/main/bridge/mcp-bridge.js"
+    ]
+  },
+  {
+    "query": "How does the bundled ACP server manage JSON-RPC sessions and expose filesystem and terminal capabilities to agents?",
+    "expected_paths": [
+      "features/acp-official/main/server/acp-server.js",
+      "features/acp-official/main/server/session-manager.js",
+      "features/acp-official/main/server/handlers/file-system.js",
+      "features/acp-official/main/server/handlers/terminal.js"
+    ]
+  },
+  {
+    "query": "How are notes stored with frontmatter, version history, trash, and CRDT session support?",
+    "expected_paths": [
+      "features/notes/main/storage/index.js",
+      "features/notes/main/storage/frontmatter.js",
+      "features/notes/main/storage/version.service.js",
+      "features/notes/main/storage/trash.service.js",
+      "features/notes/main/storage/crdt-notes.service.js"
+    ]
+  },
+  {
+    "query": "How does browser action execution validate declarative steps before calling the browser capture service?",
+    "expected_paths": [
+      "features/browser/main/browser-action-executor.js",
+      "features/browser/main/browser-capture-service.js",
+      "features/browser/main/embedded-browser-cdp-service.js"
+    ]
+  },
+  {
+    "query": "How does the workspace change-detection pipeline coordinate file watching, snapshots, and change processing?",
+    "expected_paths": [
+      "features/workspace/main/change-detector-refactored.js",
+      "features/workspace/main/change-detection/file-watcher.js",
+      "features/workspace/main/change-detection/snapshot-manager.js",
+      "features/workspace/main/change-detection/change-processor.js"
+    ]
+  },
+  {
+    "query": "How does the app initialize the consolidated agent backend and clean up agents when a workspace is deleted or archived?",
+    "expected_paths": [
+      "features/agent/main/init-unified-backend.js",
+      "features/agent/main/consolidated-backend.service.js",
+      "features/agent/main/agent-backend-handler.service.js"
+    ]
+  },
+  {
+    "query": "How does the git router pick local versus remote git implementations and validate workspace-scoped file paths?",
+    "expected_paths": [
+      "features/git/main/git-router.js",
+      "features/git/main/git.service.js",
+      "features/git/main/remote-git-manager.js"
+    ]
+  },
+  {
+    "query": "How does the accept-changes flow use background git actions and the git service across workspaces?",
+    "expected_paths": [
+      "features/accept-changes/main/accept-changes.service.js",
+      "features/accept-changes/background-git-actions.service.js",
+      "features/git/main/background-git-ops.service.js",
+      "features/git/main/git.service.js"
+    ]
+  },
+  {
+    "query": "How does the CRDT notes layer merge concurrent edits while still writing durable versions?",
+    "expected_paths": [
+      "features/notes/main/storage/crdt-notes.service.js",
+      "features/notes/main/storage/crdt-document-manager.js",
+      "features/notes/main/storage/version-manager.js",
+      "features/notes/main/storage/version.service.js"
+    ]
+  },
+  {
+    "query": "How do note operations flow from IPC into folder-based storage, including migration from older formats?",
+    "expected_paths": [
+      "features/notes/main/storage/folder-notes.repository.js",
+      "features/notes/main/storage/note-migration.js",
+      "features/notes/main/notes.ipc.js",
+      "features/notes/main/notes.service.js"
+    ]
+  }
+]

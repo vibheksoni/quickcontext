@@ -1075,6 +1075,7 @@ class RegressionTests(unittest.TestCase):
                     results=[result_item],
                     related_seed_files=1,
                     related_file_limit=4,
+                    path=Path.cwd(),
                 )
         finally:
             qc.close()
@@ -1118,11 +1119,12 @@ class RegressionTests(unittest.TestCase):
                     ]
                 },
             )()
-            with mock.patch.object(qc, "find_callers", return_value=caller_result):
-                related = qc._related_callers_for_results([result_item])
+            with mock.patch.object(qc, "find_callers", return_value=caller_result) as find_callers:
+                related = qc._related_callers_for_results([result_item], path=Path.cwd())
         finally:
             qc.close()
 
+        self.assertEqual(find_callers.call_args.kwargs["path"], Path.cwd())
         self.assertEqual(len(related), 1)
         self.assertEqual(related[0]["symbol"], "build_chunks")
         self.assertEqual(related[0]["caller_name"], "index_directory")
@@ -1327,11 +1329,13 @@ class RegressionTests(unittest.TestCase):
                 "semantic_search_auto",
                 side_effect=AssertionError("semantic_search_auto should not run for symbol query"),
             ):
-                payload = qc.retrieve_context_auto("Where is CodeSearcher.search_hybrid defined?")
+                target_path = Path("C:/tmp/external-symbol-target")
+                payload = qc.retrieve_context_auto("Where is CodeSearcher.search_hybrid defined?", path=target_path)
         finally:
             qc.close()
 
         symbol_search.assert_called_once()
+        self.assertEqual(symbol_search.call_args.kwargs["path"], target_path.resolve())
         self.assertEqual(payload["mode"], "symbol")
         self.assertEqual(payload["results"][0].symbol_name, "search_hybrid")
 
@@ -1396,6 +1400,7 @@ class RegressionTests(unittest.TestCase):
                     "snippet_line_start": 12,
                 },
             )()
+            target_path = Path("C:/tmp/external-lexical-target")
             with mock.patch.object(
                 qc,
                 "semantic_search_auto",
@@ -1415,13 +1420,15 @@ class RegressionTests(unittest.TestCase):
                 qc,
                 "text_search",
                 return_value=type("TextResult", (), {"matches": [text_match]})(),
-            ):
+            ) as text_search:
                 payload = qc.retrieve_context_auto(
-                    "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?"
+                    "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?",
+                    path=target_path,
                 )
         finally:
             qc.close()
 
+        self.assertTrue(all(call.kwargs["path"] == target_path.resolve() for call in text_search.call_args_list))
         self.assertEqual(payload["mode"], "search")
         self.assertEqual(len(payload["related_files"]), 1)
         self.assertEqual(payload["related_files"][0]["file_path"], str(Path("engine/src/pipe.py").resolve()))
@@ -1831,6 +1838,7 @@ class RegressionTests(unittest.TestCase):
                     "How does CodeSearcher.search_hybrid merge code and description vectors?",
                     [anchor, fallback],
                     limit=4,
+                    path=Path.cwd(),
                 )
         finally:
             qc.close()
@@ -1883,6 +1891,7 @@ class RegressionTests(unittest.TestCase):
                     "Where is CodeSearcher.search_hybrid defined?",
                     [anchor, fallback],
                     limit=3,
+                    path=Path.cwd(),
                 )
         finally:
             qc.close()
@@ -1980,6 +1989,7 @@ class RegressionTests(unittest.TestCase):
                     "How does CodeSearcher.search_structured fuse typed sub-queries?",
                     [anchor],
                     limit=4,
+                    path=Path.cwd(),
                 )
         finally:
             qc.close()
@@ -2063,7 +2073,7 @@ class RegressionTests(unittest.TestCase):
 
         self.assertFalse(semantic_search.call_args.kwargs["include_source"])
         hydrate.assert_called_once()
-        related_callers.assert_called_once_with(results)
+        related_callers.assert_called_once_with(results, path=Path.cwd().resolve())
         self.assertEqual(payload["results"], hydrated)
 
     def test_search_hydrates_final_results_after_lightweight_query(self) -> None:
@@ -2383,6 +2393,7 @@ class RegressionTests(unittest.TestCase):
                 query="How does CodeSearcher.search_hybrid merge code and description vectors?",
                 anchor=anchor,
                 helper_limit=2,
+                path=Path.cwd(),
             )
 
         self.assertEqual(len(results), 2)
@@ -2449,6 +2460,7 @@ class RegressionTests(unittest.TestCase):
                 query="How does CodeSearcher.search_hybrid merge code and description vectors?",
                 anchor=anchor,
                 helper_limit=2,
+                path=Path.cwd(),
             )
 
         self.assertEqual(len(results), 2)
@@ -2512,6 +2524,7 @@ class RegressionTests(unittest.TestCase):
                 query="How does CodeSearcher.search_hybrid merge code and description vectors?",
                 anchor=anchor,
                 helper_limit=2,
+                path=Path.cwd(),
             )
 
         self.assertEqual({item.symbol_name for item in results}, {"_batch_search", "_rrf_fuse"})
@@ -2545,7 +2558,7 @@ class RegressionTests(unittest.TestCase):
         )]
 
         with mock.patch.object(qc, "_load_file_symbols", return_value=helpers) as fallback:
-            loaded = qc._load_file_symbol_candidates(str(Path("engine/src/searcher.py").resolve()))
+            loaded = qc._load_file_symbol_candidates(str(Path("engine/src/searcher.py").resolve()), path=Path.cwd())
 
         self.assertEqual(loaded, helpers)
         fallback.assert_called_once()

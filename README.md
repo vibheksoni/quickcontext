@@ -12,19 +12,20 @@ It currently has two main parts:
 The SDK now includes AI-facing retrieval helpers:
 
 - `QuickContext.retrieve_context_auto(...)`
-  Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, expands behavior-oriented symbol questions with same-file helper symbols from indexed Rust metadata plus targeted source hydration, and falls back to semantic or bundle retrieval for broader natural-language questions.
+  Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, expands behavior-oriented symbol questions with same-file helper symbols from indexed Rust metadata plus targeted source hydration, falls back to semantic or bundle retrieval for broader natural-language questions, and accepts explicit `path=` scoping when the target repo is outside the current working directory.
 - `QuickContext.warm_project(...)`
   Optional startup warmup for the long-lived Rust service. It preloads the persisted Rust symbol and text indices for a project so the first real query is cheaper.
 - `QuickContext.start_background_warm(...)`
   Optional idle warmup for long-lived SDK sessions. It schedules the same project warmup to happen once the session goes idle instead of blocking startup.
 - `QuickContext.semantic_search_auto(...)`
-  Lets the SDK choose between fast direct semantic retrieval and the deeper graph-aware bundle path.
+  Lets the SDK choose between fast direct semantic retrieval and the deeper graph-aware bundle path. It also accepts explicit `path=` scoping for external repos.
 - `QuickContext.semantic_search_bundle(...)`
-  Returns semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper codebase exploration.
+  Returns semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper codebase exploration. It also accepts explicit `path=` scoping for external repos.
 
 Use `retrieve_context_auto(...)` as the default for AI workflows, `semantic_search(...)` for direct semantic retrieval, `semantic_search_auto(...)` when you specifically want semantic-only auto-routing, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
 If you run the service as a long-lived process, call `warm_project('.')` once after startup to preload local indices before the first heavy query. If you do not want to pay that startup cost up front, call `start_background_warm('.')` and let the SDK defer the same warmup until the session goes idle.
 Entering `with QuickContext(...)` keeps subsystems lazy: parser-only flows do not preconnect Qdrant, and vector features still connect on first use.
+When the repo you want to inspect is outside the process cwd, pass that repo root through `path=` on the AI-facing retrieval helpers so Rust symbol/text routing, helper expansion, caller expansion, and benchmark harnesses stay scoped to the right codebase.
 
 ## Status
 
@@ -57,6 +58,7 @@ with QuickContext(config) as qc:
     payload = qc.retrieve_context_auto(
         "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?",
         project_name="quickcontext",
+        path=".",
         limit=3,
     )
 
@@ -240,6 +242,7 @@ python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py 
 venv/Scripts/python.exe -m unittest engine.tests.test_regressions
 venv/Scripts/python.exe scripts/retrieval_benchmark.py --config quickcontext.json --project quickcontext
 venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/context_retrieval_cases.json --strategy context-auto
+venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project external-bench --path <target-root> --cases-file scripts/augmentintent_dist_cases.json --strategy context-auto
 venv/Scripts/python.exe scripts/symbol_context_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/symbol_context_cases.json --strategy context-auto
 venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/graph_retrieval_cases.json --strategy context-auto
 venv/Scripts/python.exe scripts/text_retrieval_benchmark.py --config quickcontext.json --cases-file scripts/context_retrieval_cases.json --show-top 3
