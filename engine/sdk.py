@@ -10,6 +10,12 @@ from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.compressor import CompressionStats, compress_grep_line, compress_source
 from engine.src.config import EngineConfig
+from engine.src.artifact_index import (
+    ARTIFACT_FALLBACK_ERROR,
+    ArtifactIndexProfile,
+    analyze_artifact_candidate,
+    should_downgrade_artifact_profile,
+)
 from engine.src.dedup import (
     DeduplicationResult,
     content_hash,
@@ -80,6 +86,16 @@ from engine.src.search_modes import BIAS_NAMES, SearchBias, apply_bias, get_bias
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _UNDERSCORE_SPLIT_PATTERN = re.compile(r"_+")
 _CAMEL_BOUNDARY_PATTERN = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def _human_readable_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    units = ("B", "KB", "MB", "GB")
+    unit_idx = 0
+    while value >= 1024.0 and unit_idx < len(units) - 1:
+        value /= 1024.0
+        unit_idx += 1
+    return f"{value:.2f} {units[unit_idx]}"
 
 
 class QuickContext:
@@ -3816,6 +3832,38 @@ class QuickContext:
             descriptions_enabled=generate_descriptions,
         )
 
+    def _collect_artifact_profiles(
+        self,
+        entries: list,
+        fast: bool,
+        skip_minified: bool,
+    ) -> dict[str, ArtifactIndexProfile]:
+        """
+        Detect large generated/minified bundle files that should use coarse artifact chunks in fast mode.
+        """
+        if not fast or not skip_minified:
+            return {}
+
+        profiles: dict[str, ArtifactIndexProfile] = {}
+        for entry in entries:
+            if int(getattr(entry, "file_size", 0) or 0) < 128 * 1024:
+                continue
+            language = str(getattr(entry, "language", "")).lower()
+            if language not in {"javascript", "typescript", "tsx", "jsx"}:
+                continue
+            try:
+                profile = analyze_artifact_candidate(
+                    file_path=entry.file_path,
+                    language=entry.language,
+                    file_size=entry.file_size,
+                    file_mtime=entry.file_mtime,
+                )
+            except Exception:
+                continue
+            if should_downgrade_artifact_profile(profile):
+                profiles[entry.file_path] = profile
+        return profiles
+
     def _build_resume_files(
         self,
         changed_results: list[ExtractionResult],
@@ -3963,14 +4011,64 @@ class QuickContext:
 
         indexed_hashes = indexer.get_file_hashes([entry.file_path for entry in candidate_entries])
         changed_results: list[ExtractionResult] = []
+        artifact_profiles = self._collect_artifact_profiles(
+            candidate_entries,
+            fast=fast,
+            skip_minified=skip_minified,
+        )
+        artifact_downgraded_files = 0
+        artifact_downgraded_bytes = 0
+        extraction_entries = []
 
-        if show_progress and candidate_entries:
-            print(f"Extracting symbols from {len(candidate_entries)} candidate files...")
+        for entry in candidate_entries:
+            profile = artifact_profiles.get(entry.file_path)
+            if profile is None:
+                extraction_entries.append(entry)
+                continue
 
-        candidate_paths = {entry.file_path for entry in candidate_entries}
-        if candidate_entries and (
-            len(candidate_entries) == len(scan_entries)
-            or len(candidate_entries) > 100
+            file_cache.update_from_extraction(
+                entry.file_path,
+                profile.file_hash,
+                entry.file_size,
+                entry.file_mtime,
+            )
+
+            indexed_hash = indexed_hashes.get(entry.file_path)
+            if (
+                not force_refresh
+                and indexed_hash is not None
+                and indexed_hash == profile.file_hash
+            ):
+                unchanged_files += 1
+                continue
+
+            changed_results.append(
+                ExtractionResult(
+                    file_path=entry.file_path,
+                    language=entry.language,
+                    symbols=[],
+                    errors=[ARTIFACT_FALLBACK_ERROR],
+                    file_hash=profile.file_hash,
+                    file_size=entry.file_size,
+                    file_mtime=entry.file_mtime,
+                )
+            )
+            artifact_downgraded_files += 1
+            artifact_downgraded_bytes += int(entry.file_size or 0)
+
+        if show_progress and extraction_entries:
+            print(f"Extracting symbols from {len(extraction_entries)} candidate files...")
+        if show_progress and artifact_downgraded_files > 0:
+            print(
+                "Downgrading "
+                f"{artifact_downgraded_files} large minified artifact files "
+                f"({_human_readable_bytes(artifact_downgraded_bytes)}) to coarse file chunks"
+            )
+
+        candidate_paths = {entry.file_path for entry in extraction_entries}
+        if extraction_entries and (
+            len(extraction_entries) == len(scan_entries)
+            or len(extraction_entries) > 100
         ):
             extracted_candidates = [
                 result
@@ -3983,7 +4081,7 @@ class QuickContext:
                 extracted_candidates.extend(self.extract_symbols(file_path))
         else:
             extracted_candidates = []
-            for entry in candidate_entries:
+            for entry in extraction_entries:
                 extracted_candidates.extend(self.extract_symbols(entry.file_path))
 
         for result in extracted_candidates:
@@ -4556,6 +4654,41 @@ class QuickContext:
             if max_total_chunks is None:
                 max_total_chunks = 50000
 
+        artifact_profiles_by_path: dict[str, ArtifactIndexProfile] = {}
+        if fast and skip_minified:
+            for file_path in paths_to_extract:
+                path_obj = Path(file_path)
+                file_size = int(path_obj.stat().st_size) if path_obj.exists() else 0
+                if file_size < 128 * 1024:
+                    continue
+                suffix_language = {
+                    ".js": "javascript",
+                    ".jsx": "jsx",
+                    ".ts": "typescript",
+                    ".tsx": "tsx",
+                }.get(path_obj.suffix.lower())
+                if suffix_language is None:
+                    continue
+                try:
+                    profile = analyze_artifact_candidate(
+                        file_path=file_path,
+                        language=suffix_language,
+                        file_size=file_size,
+                        file_mtime=int(path_obj.stat().st_mtime),
+                    )
+                except Exception:
+                    continue
+                if should_downgrade_artifact_profile(profile):
+                    artifact_profiles_by_path[file_path] = profile
+
+        if show_progress and artifact_profiles_by_path:
+            total_bytes = sum(profile.file_size for profile in artifact_profiles_by_path.values())
+            print(
+                "Downgrading "
+                f"{len(artifact_profiles_by_path)} refreshed artifact files "
+                f"({_human_readable_bytes(total_bytes)}) to coarse file chunks"
+            )
+
         all_chunks_to_reindex: list[CodeChunk] = []
         all_identities_to_delete: list = []
         total_unchanged = 0
@@ -4568,7 +4701,21 @@ class QuickContext:
         for file_path in paths_to_extract:
             old_chunks = old_chunks_by_file.get(file_path, [])
 
-            results = self.extract_symbols(file_path)
+            artifact_profile = artifact_profiles_by_path.get(file_path)
+            if artifact_profile is not None:
+                results = [
+                    ExtractionResult(
+                        file_path=file_path,
+                        language=artifact_profile.language,
+                        symbols=[],
+                        errors=[ARTIFACT_FALLBACK_ERROR],
+                        file_hash=artifact_profile.file_hash,
+                        file_size=artifact_profile.file_size,
+                        file_mtime=artifact_profile.file_mtime,
+                    )
+                ]
+            else:
+                results = self.extract_symbols(file_path)
             new_chunks = self.chunker.build_chunks(results)
 
             for result in results:

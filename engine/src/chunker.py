@@ -3,8 +3,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import hashlib
+import math
 import re
 
+from engine.src.artifact_index import ARTIFACT_FALLBACK_ERROR
 from engine.src.parsing import ExtractedSymbol, ExtractionResult
 
 
@@ -79,14 +81,24 @@ class ChunkBuilder:
     - Large symbol truncation with configurable max size
     """
 
-    def __init__(self, max_chunk_bytes: int = 32000, fallback_chunk_size: int = 8000):
+    def __init__(
+        self,
+        max_chunk_bytes: int = 32000,
+        fallback_chunk_size: int = 8000,
+        artifact_chunk_size: int = 24000,
+        artifact_max_chunks: int = 8,
+    ):
         """
         Args:
             max_chunk_bytes: Maximum bytes per chunk (default 32K for Qwen3-8B context)
             fallback_chunk_size: Chunk size for files with no symbols
+            artifact_chunk_size: Approximate excerpt size for artifact fallback chunks
+            artifact_max_chunks: Maximum coarse chunks emitted for one bundle artifact
         """
         self._max_chunk_bytes = max_chunk_bytes
         self._fallback_chunk_size = fallback_chunk_size
+        self._artifact_chunk_size = max(1024, min(artifact_chunk_size, max_chunk_bytes))
+        self._artifact_max_chunks = max(1, int(artifact_max_chunks))
 
     def build_chunks(self, results: list[ExtractionResult]) -> list[CodeChunk]:
         """
@@ -102,6 +114,9 @@ class ChunkBuilder:
             language = result.language
 
             if not result.symbols:
+                if ARTIFACT_FALLBACK_ERROR in (result.errors or []):
+                    chunks.extend(self._artifact_file_chunks(file_path, language, result.file_hash))
+                    continue
                 chunks.extend(self._fallback_chunks(file_path, language))
                 continue
 
@@ -117,6 +132,135 @@ class ChunkBuilder:
                     chunks.append(chunk)
 
         return chunks
+
+    def _artifact_file_chunks(
+        self,
+        file_path: str,
+        language: str,
+        file_hash: Optional[str] = None,
+    ) -> list[CodeChunk]:
+        """
+        Create a small number of coarse sampled chunks for generated/minified bundle artifacts.
+        """
+        try:
+            content = self._read_file(file_path)
+        except Exception:
+            return []
+
+        resolved_file_hash = file_hash or self._hash_content(content)
+        content_bytes = content.encode("utf-8")
+        total_bytes = len(content_bytes)
+        if total_bytes == 0:
+            return []
+
+        desired_chunks = min(
+            self._artifact_max_chunks,
+            max(1, math.ceil(total_bytes / (2 * 1024 * 1024))),
+        )
+        window_size = min(self._artifact_chunk_size, self._max_chunk_bytes)
+        offsets = self._artifact_sample_offsets(total_bytes, window_size, desired_chunks)
+        chunks: list[CodeChunk] = []
+
+        for chunk_idx, offset in enumerate(offsets):
+            target_end = min(total_bytes, offset + window_size)
+            chunk_end = self._find_smart_chunk_end(content_bytes, offset, target_end)
+            if chunk_end <= offset:
+                chunk_end = target_end
+
+            snippet_bytes = content_bytes[offset:chunk_end]
+            snippet_text = snippet_bytes.decode("utf-8", errors="ignore")
+            normalized_source = self._normalize_artifact_excerpt(
+                file_path=file_path,
+                chunk_index=chunk_idx,
+                chunk_count=len(offsets),
+                byte_start=offset,
+                byte_end=chunk_end,
+                source=snippet_text,
+            )
+            if not normalized_source.strip():
+                continue
+
+            line_start = content[:offset].count("\n") + 1
+            line_end = content[:chunk_end].count("\n") + 1
+            chunk_id = self._generate_chunk_id(
+                file_path,
+                f"<artifact_chunk_{chunk_idx}>",
+                "file_artifact",
+                None,
+                None,
+                offset,
+                chunk_end,
+            )
+            chunks.append(
+                CodeChunk(
+                    chunk_id=chunk_id,
+                    source=self._truncate_source(normalized_source),
+                    language=language,
+                    file_path=file_path,
+                    symbol_name=f"<artifact_chunk_{chunk_idx}>",
+                    symbol_kind="file_artifact",
+                    line_start=line_start,
+                    line_end=line_end,
+                    byte_start=offset,
+                    byte_end=chunk_end,
+                    signature=None,
+                    docstring=None,
+                    parent=None,
+                    visibility=None,
+                    role="generated",
+                    file_hash=resolved_file_hash,
+                )
+            )
+
+        return chunks
+
+    def _artifact_sample_offsets(self, total_bytes: int, window_size: int, chunk_count: int) -> list[int]:
+        """
+        Pick evenly spaced excerpt offsets across a large artifact file.
+        """
+        if chunk_count <= 1 or total_bytes <= window_size:
+            return [0]
+
+        max_start = max(0, total_bytes - window_size)
+        offsets = {
+            int(round((max_start * idx) / max(1, chunk_count - 1)))
+            for idx in range(chunk_count)
+        }
+        return sorted(offsets)
+
+    def _normalize_artifact_excerpt(
+        self,
+        file_path: str,
+        chunk_index: int,
+        chunk_count: int,
+        byte_start: int,
+        byte_end: int,
+        source: str,
+    ) -> str:
+        """
+        Reformat a sampled artifact excerpt so it stays searchable without tripping minified-file heuristics.
+        """
+        normalized = source.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = re.sub(r"([;{}])", r"\1\n", normalized)
+        lines: list[str] = []
+        for raw_line in normalized.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            for offset in range(0, len(line), 240):
+                lines.append(line[offset:offset + 240])
+                if len(lines) >= 180:
+                    break
+            if len(lines) >= 180:
+                break
+
+        header = (
+            f"Generated bundle artifact excerpt from {Path(file_path).name}\n"
+            f"Chunk {chunk_index + 1} of {chunk_count}\n"
+            f"Approx byte range {byte_start}-{byte_end}\n"
+        )
+        body = "\n".join(lines)
+        return f"{header}\n{body}".strip()
 
     def _symbol_to_chunk(self, symbol: ExtractedSymbol, file_hash: str) -> Optional[CodeChunk]:
         """

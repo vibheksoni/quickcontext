@@ -3,6 +3,7 @@ import time
 from collections import Counter
 from pathlib import Path
 import sys
+import uuid
 
 from qdrant_client import models
 
@@ -11,12 +12,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from engine import QuickContext
+from engine.src.artifact_index import (
+    ARTIFACT_FALLBACK_ERROR,
+    analyze_artifact_candidate,
+    should_downgrade_artifact_profile,
+)
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder
 from engine.src.config import EngineConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_descriptions
-from engine.src.parsing import RustParserService
+from engine.src.indexer import QdrantIndexer
+from engine.src.parsing import ExtractionResult, RustParserService
 
 
 def _human_mb(num_bytes: int) -> float:
@@ -68,6 +75,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--upsert-sample-chunks", type=int, default=64, help="Number of embedded chunks to upsert into a temp collection. Use 0 to skip Qdrant upsert.")
     parser.add_argument("--min-chunk-bytes", type=int, default=200, help="Chunk min-byte filter used in fast indexing mode.")
     parser.add_argument("--max-chunks-per-file", type=int, default=180, help="Per-file chunk cap used in fast indexing mode.")
+    parser.add_argument("--artifact-aware-fast", action="store_true", help="Downgrade obvious bundle artifacts to coarse file chunks before extraction.")
     return parser.parse_args()
 
 
@@ -93,8 +101,32 @@ def main() -> None:
     for entry in sample_entries:
         file_path = Path(entry.file_path)
         raw_stats = _raw_file_line_stats(file_path)
+        downgraded = False
         started = time.perf_counter()
-        extracted = parser_service.extract(file_path)
+        if args.artifact_aware_fast and entry.file_size >= 128 * 1024 and entry.language.lower() in {"javascript", "typescript", "tsx", "jsx"}:
+            profile = analyze_artifact_candidate(
+                file_path=file_path,
+                language=entry.language,
+                file_size=entry.file_size,
+                file_mtime=entry.file_mtime,
+            )
+            if should_downgrade_artifact_profile(profile):
+                extracted = [
+                    ExtractionResult(
+                        file_path=str(file_path),
+                        language=entry.language,
+                        symbols=[],
+                        errors=[ARTIFACT_FALLBACK_ERROR],
+                        file_hash=profile.file_hash,
+                        file_size=entry.file_size,
+                        file_mtime=entry.file_mtime,
+                    )
+                ]
+                downgraded = True
+            else:
+                extracted = parser_service.extract(file_path)
+        else:
+            extracted = parser_service.extract(file_path)
         extract_ms = (time.perf_counter() - started) * 1000
         extract_total_ms += extract_ms
         extraction_results.extend(extracted)
@@ -106,6 +138,7 @@ def main() -> None:
                 "file_size": entry.file_size,
                 "extract_ms": extract_ms,
                 "symbol_count": symbol_count,
+                "downgraded": downgraded,
                 **raw_stats,
             }
         )
@@ -166,7 +199,7 @@ def main() -> None:
             if args.upsert_sample_chunks > 0 and embedded_chunks:
                 upsert_sample = embedded_chunks[: min(len(embedded_chunks), int(args.upsert_sample_chunks))]
                 client = qc.connection.client
-                collection_name = "qc-index-phase-benchmark"
+                collection_name = f"qc-index-phase-benchmark-{uuid.uuid4().hex[:8]}"
                 try:
                     client.delete_collection(collection_name)
                 except Exception:
@@ -185,7 +218,12 @@ def main() -> None:
                     },
                 )
 
-                indexer = qc._get_indexer("qc-index-phase-benchmark")
+                indexer = QdrantIndexer(
+                    client=client,
+                    collection_name=collection_name,
+                    batch_size=32,
+                    upsert_concurrency=1,
+                )
                 started = time.perf_counter()
                 points = [indexer._chunk_to_point(chunk) for chunk in upsert_sample]
                 point_build_ms = (time.perf_counter() - started) * 1000
@@ -251,6 +289,7 @@ def main() -> None:
             f"lines={item['line_count']:6d} | "
             f"max_line={item['max_line_length']:7d} | "
             f"avg_line={item['avg_line_length']:8.2f} | "
+            f"downgraded={str(item['downgraded']).lower():5s} | "
             f"raw_minified={str(item['raw_minified_like']).lower():5s} | "
             f"{item['file_name']}"
         )

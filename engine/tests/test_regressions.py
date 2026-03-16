@@ -10,6 +10,8 @@ import builtins
 
 from engine.__main__ import _find_command
 from engine.sdk import QuickContext
+from engine.src.artifact_index import ARTIFACT_FALLBACK_ERROR, ArtifactIndexProfile, should_downgrade_artifact_profile
+from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.collection import CollectionManager
 from engine.src.config import CollectionVectorConfig, EngineConfig, QdrantConfig
@@ -19,7 +21,7 @@ from engine.src.filecache import FileSignatureCache
 from engine.src.index_resume import ResumeFile, ResumeState, build_settings_fingerprint, clear_state, load_state, save_state
 from engine.src.cli import _optimize_search_config
 from engine.src.indexer import IndexedFileState
-from engine.src.parsing import CompactExtractionResult, ExtractStats, ImportEdge, RustParserService, SymbolLookupItem, SymbolLookupResult
+from engine.src.parsing import CompactExtractionResult, ExtractStats, ExtractionResult, ImportEdge, RustParserService, SymbolLookupItem, SymbolLookupResult
 from engine.src.qdrant import QdrantConnection
 from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS, SearchResult
 
@@ -282,6 +284,64 @@ class RegressionTests(unittest.TestCase):
 
         result = deduplicate_chunks([c1, c2, c3])
         self.assertEqual(result.unique_count, 2)
+
+    def test_should_downgrade_artifact_profile_only_for_large_minified_bundles(self) -> None:
+        downgraded = ArtifactIndexProfile(
+            file_path="bundle.12345678.js",
+            language="javascript",
+            file_size=700 * 1024,
+            file_mtime=0,
+            file_hash="hash",
+            line_count=4,
+            max_line_length=5000,
+            avg_line_length=420.0,
+            whitespace_ratio=0.01,
+            raw_minified_like=True,
+            bundle_like_name=True,
+        )
+        kept = ArtifactIndexProfile(
+            file_path="server.py",
+            language="python",
+            file_size=2 * 1024 * 1024,
+            file_mtime=0,
+            file_hash="hash",
+            line_count=2000,
+            max_line_length=180,
+            avg_line_length=48.0,
+            whitespace_ratio=0.18,
+            raw_minified_like=False,
+            bundle_like_name=False,
+        )
+        self.assertTrue(should_downgrade_artifact_profile(downgraded))
+        self.assertFalse(should_downgrade_artifact_profile(kept))
+
+    def test_chunk_builder_artifact_fallback_creates_coarse_searchable_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "bundle.12345678.js"
+            minified = "function x(){return 1;}" * 6000
+            file_path.write_text(minified, encoding="utf-8")
+
+            extraction = ExtractionResult(
+                file_path=str(file_path.resolve()),
+                language="javascript",
+                symbols=[],
+                errors=[ARTIFACT_FALLBACK_ERROR],
+                file_hash="artifact-hash",
+                file_size=file_path.stat().st_size,
+                file_mtime=int(file_path.stat().st_mtime),
+            )
+            builder = ChunkBuilder()
+            chunks = builder.build_chunks([extraction])
+            filtered, stats = filter_chunks(
+                chunks,
+                ChunkFilterConfig(min_chunk_bytes=200, max_chunks_per_file=180, skip_minified=True),
+            )
+
+        self.assertLessEqual(len(chunks), 8)
+        self.assertTrue(all(chunk.symbol_kind == "file_artifact" for chunk in chunks))
+        self.assertTrue(filtered)
+        self.assertEqual(stats.skipped_minified, 0)
 
     def test_file_signature_cache_uses_external_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

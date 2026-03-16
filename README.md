@@ -27,6 +27,7 @@ If you run the service as a long-lived process, call `warm_project('.')` once af
 Entering `with QuickContext(...)` keeps subsystems lazy: parser-only flows do not preconnect Qdrant, and vector features still connect on first use.
 When the repo you want to inspect is outside the process cwd, pass that repo root through `path=` on the AI-facing retrieval helpers so Rust symbol/text routing, helper expansion, caller expansion, and benchmark harnesses stay scoped to the right codebase.
 Full alias/shadow indexing now writes a local resume manifest under `.quickcontext/`, so if indexing is interrupted it can reuse the in-progress shadow collection instead of discarding files that were already upserted.
+When `fast=True`, the indexer now downgrades obvious large minified JavaScript bundle artifacts to a small number of coarse file chunks before deep extraction. That keeps generated trees indexable without paying full parser cost on huge hashed bundles.
 
 ## Status
 
