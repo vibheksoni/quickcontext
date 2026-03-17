@@ -8,6 +8,7 @@ The repository currently focuses on:
 
 - a Rust service for parsing and search operations
 - a Python engine for indexing, retrieval, embeddings, and orchestration
+- a thin FastMCP wrapper over the SDK for agent-facing tool exposure
 
 The project is still in progress. There is room to improve architecture, speed, ranking quality, and developer experience. MCP support is planned but not yet part of the tracked repo.
 
@@ -24,6 +25,7 @@ The project is still in progress. There is room to improve architecture, speed, 
 
 - `service/`: Rust binary and IPC server
 - `engine/`: Python SDK and CLI
+- `quickcontext_mcp/`: thin FastMCP server wrapping the SDK
 
 Flow:
 
@@ -98,6 +100,15 @@ Useful SDK retrieval primitives:
 - `QuickContext.semantic_search_auto(...)`: semantic-only auto-routing between fast direct retrieval and the deeper bundle path; also accepts explicit `path=` scoping for external repos
 - `QuickContext.structured_search(...)`: typed multi-query retrieval
 - `QuickContext.semantic_search_bundle(...)`: semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper follow-up exploration; also accepts explicit `path=` scoping for external repos
+
+The tracked MCP wrapper stays thin over those same SDK primitives:
+
+- `project_info`: path inspection, detected project name, index state, and folder scopes
+- `list_projects`: indexed project discovery
+- `index` / `index_status`: semantic indexing and duplicate-suppressed active-run inspection
+- `search`: main AI-facing retrieval surface with `auto`, `text`, `semantic`, and `bundle` modes
+- `grep`: exact literal retrieval through the Rust service
+- `symbol_lookup`: exact or near-exact identifier lookup through the Rust symbol index
 
 Recommendation:
 

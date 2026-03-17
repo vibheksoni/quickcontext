@@ -8,6 +8,7 @@ It currently has two main parts:
 
 - `service/`: a Rust binary for parsing, grep, skeleton generation, text search, protocol search, pattern search, symbol and caller lookup, import graph analysis, and local IPC
 - `engine/`: a Python SDK and CLI for indexing, Qdrant collection management, chunking, deduplication, embeddings, retrieval, watch mode, and edit operations
+- `quickcontext_mcp/`: a thin FastMCP server that wraps the Python SDK with agent-friendly indexing and retrieval tools
 
 The SDK now includes AI-facing retrieval helpers:
 
@@ -88,6 +89,7 @@ with QuickContext(config) as qc:
 ## Repository Layout
 
 - `engine/`: Python package and CLI entrypoint
+- `quickcontext_mcp/`: FastMCP server package
 - `service/`: Rust service and command-line binary
 - `docker-compose.yml`: local Qdrant container
 - `requirements.txt`: Python dependencies
@@ -218,6 +220,42 @@ Linux:
 ```bash
 ./service/target/release/quickcontext-service serve
 ```
+
+## MCP Server
+
+The tracked repository now includes a thin FastMCP wrapper around the Python SDK. The MCP surface is intentionally narrow:
+
+- `project_info`: inspect one path, detect the project name, check index state, and list useful folder scopes
+- `list_projects`: list currently indexed projects
+- `index`: index a path for semantic retrieval and suppress duplicate active runs for the same target
+- `index_status`: inspect the latest or active indexing run
+- `search`: main AI-facing retrieval tool with `auto`, `text`, `semantic`, and `bundle` modes
+- `grep`: exact literal grep through the Rust service
+- `symbol_lookup`: exact or near-exact identifier lookup through the Rust symbol index
+
+Run it locally over stdio:
+
+```text
+venv/Scripts/python.exe -m quickcontext_mcp
+```
+
+Run it as a long-lived HTTP server:
+
+```text
+set QC_MCP_TRANSPORT=http
+set QC_MCP_HOST=127.0.0.1
+set QC_MCP_PORT=8000
+venv/Scripts/python.exe -m quickcontext_mcp
+```
+
+Useful environment variables:
+
+- `QC_MCP_CONFIG`: explicit config file path. Defaults to `quickcontext.json`, then `.quickcontext.json`, then auto config resolution.
+- `QC_MCP_TRANSPORT`: `stdio` or `http`
+- `QC_MCP_HOST`: HTTP bind host
+- `QC_MCP_PORT`: HTTP bind port
+- `QC_MCP_HTTP_PATH`: HTTP MCP route path, default `/mcp/`
+- `QC_MCP_STATELESS_HTTP`: `true` or `false` for stateless HTTP mode
 
 ## Common Python CLI Commands
 
