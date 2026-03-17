@@ -37,6 +37,15 @@ class IndexStats:
         embedding_final_batch_size: Final adaptive embedding batch size used
         embedding_batch_shrink_events: Number of adaptive batch-size decreases
         embedding_batch_grow_events: Number of adaptive batch-size increases
+        scan_stage_duration_seconds: Time spent discovering supported files
+        artifact_profile_stage_duration_seconds: Time spent profiling large artifact candidates
+        extract_stage_duration_seconds: Time spent in Rust extraction
+        chunk_build_stage_duration_seconds: Time spent converting extraction results into chunks
+        filter_stage_duration_seconds: Time spent filtering and capping chunks
+        dedup_stage_duration_seconds: Time spent deduplicating chunks before embedding
+        description_stage_duration_seconds: Time spent generating descriptions
+        point_build_stage_duration_seconds: Time spent converting embedded chunks into Qdrant points
+        upsert_stage_duration_seconds: Time spent sending point batches to Qdrant
     """
     total_chunks: int
     upserted_points: int
@@ -58,6 +67,15 @@ class IndexStats:
     embedding_final_batch_size: int = 0
     embedding_batch_shrink_events: int = 0
     embedding_batch_grow_events: int = 0
+    scan_stage_duration_seconds: float = 0.0
+    artifact_profile_stage_duration_seconds: float = 0.0
+    extract_stage_duration_seconds: float = 0.0
+    chunk_build_stage_duration_seconds: float = 0.0
+    filter_stage_duration_seconds: float = 0.0
+    dedup_stage_duration_seconds: float = 0.0
+    description_stage_duration_seconds: float = 0.0
+    point_build_stage_duration_seconds: float = 0.0
+    upsert_stage_duration_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,15 +134,21 @@ class QdrantIndexer:
         upserted = 0
         failed = 0
         total_tokens = sum(chunk.description.token_count for chunk in embedded_chunks)
+        point_build_started = time.time()
 
         batches = [
             embedded_chunks[i:i + self._batch_size]
             for i in range(0, total_chunks, self._batch_size)
         ]
+        prepared_batches = [
+            [self._chunk_to_point(chunk) for chunk in batch]
+            for batch in batches
+        ]
+        point_build_duration = time.time() - point_build_started
+        upsert_started = time.time()
 
-        if self._upsert_concurrency <= 1 or len(batches) <= 1:
-            for batch in batches:
-                points = [self._chunk_to_point(chunk) for chunk in batch]
+        if self._upsert_concurrency <= 1 or len(prepared_batches) <= 1:
+            for points in prepared_batches:
                 try:
                     self._client.upsert(
                         collection_name=self._collection_name,
@@ -136,10 +160,10 @@ class QdrantIndexer:
                     failed += len(points)
                     print(f"Batch upsert failed: {e}")
         else:
-            with ThreadPoolExecutor(max_workers=min(self._upsert_concurrency, len(batches))) as executor:
+            with ThreadPoolExecutor(max_workers=min(self._upsert_concurrency, len(prepared_batches))) as executor:
                 futures = {
-                    executor.submit(self._upsert_points, [self._chunk_to_point(chunk) for chunk in batch]): len(batch)
-                    for batch in batches
+                    executor.submit(self._upsert_points, points): len(points)
+                    for points in prepared_batches
                 }
                 for future in as_completed(futures):
                     batch_size = futures[future]
@@ -151,6 +175,7 @@ class QdrantIndexer:
                         print(f"Batch upsert failed: {e}")
 
         duration = time.time() - start_time
+        upsert_duration = time.time() - upsert_started
 
         return IndexStats(
             total_chunks=total_chunks,
@@ -158,6 +183,8 @@ class QdrantIndexer:
             failed_points=failed,
             total_tokens=total_tokens,
             duration_seconds=duration,
+            point_build_stage_duration_seconds=point_build_duration,
+            upsert_stage_duration_seconds=upsert_duration,
         )
 
     def _upsert_points(self, points: list[models.PointStruct]) -> None:

@@ -71,6 +71,7 @@ Important config ideas:
 - the persisted Rust text index also stores file-category and path-field metadata so text search can blend content and path signals while downweighting low-priority file classes
 - Rust extraction also reuses compiled tree-sitter queries across parses to reduce repeated extractor overhead
 - fast indexing now downgrades obvious large minified JavaScript bundle artifacts to a small number of coarse file chunks before deep extraction so generated trees do not pay full parser cost for low-value bundles
+- `index_directory(...)` and `refresh_files(...)` now expose real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and Qdrant upsert
 
 ## Important Python Modules
 

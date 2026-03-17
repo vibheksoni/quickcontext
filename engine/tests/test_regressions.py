@@ -366,10 +366,10 @@ class RegressionTests(unittest.TestCase):
         description = build_fallback_description(chunk)
         embedder = DualEmbedder(
             code_provider="litellm",
-            code_model="x",
+            code_model="provider-a/model",
             code_dimension=3,
             desc_provider="litellm",
-            desc_model="x",
+            desc_model="provider-b/model",
             desc_dimension=3,
         )
 

@@ -3804,6 +3804,23 @@ class QuickContext:
             embedding_batch_shrink_events=left.embedding_batch_shrink_events + right.embedding_batch_shrink_events,
             embedding_batch_grow_events=left.embedding_batch_grow_events + right.embedding_batch_grow_events,
             embedding_final_batch_size=max(left.embedding_final_batch_size, right.embedding_final_batch_size),
+            scan_stage_duration_seconds=left.scan_stage_duration_seconds + right.scan_stage_duration_seconds,
+            artifact_profile_stage_duration_seconds=(
+                left.artifact_profile_stage_duration_seconds + right.artifact_profile_stage_duration_seconds
+            ),
+            extract_stage_duration_seconds=left.extract_stage_duration_seconds + right.extract_stage_duration_seconds,
+            chunk_build_stage_duration_seconds=(
+                left.chunk_build_stage_duration_seconds + right.chunk_build_stage_duration_seconds
+            ),
+            filter_stage_duration_seconds=left.filter_stage_duration_seconds + right.filter_stage_duration_seconds,
+            dedup_stage_duration_seconds=left.dedup_stage_duration_seconds + right.dedup_stage_duration_seconds,
+            description_stage_duration_seconds=(
+                left.description_stage_duration_seconds + right.description_stage_duration_seconds
+            ),
+            point_build_stage_duration_seconds=(
+                left.point_build_stage_duration_seconds + right.point_build_stage_duration_seconds
+            ),
+            upsert_stage_duration_seconds=left.upsert_stage_duration_seconds + right.upsert_stage_duration_seconds,
         )
 
     def _zero_index_stats(
@@ -3990,7 +4007,9 @@ class QuickContext:
             print(f"Indexing project: {detected_project}")
             print(f"Scanning supported files in {directory}...")
 
+        scan_started = time.time()
         scan_entries = self.parser_service.scan_files(directory)
+        scan_stage_duration_seconds = time.time() - scan_started
 
         indexer = self._get_indexer(detected_project)
         candidate_entries = []
@@ -4011,11 +4030,13 @@ class QuickContext:
 
         indexed_hashes = indexer.get_file_hashes([entry.file_path for entry in candidate_entries])
         changed_results: list[ExtractionResult] = []
+        artifact_profile_started = time.time()
         artifact_profiles = self._collect_artifact_profiles(
             candidate_entries,
             fast=fast,
             skip_minified=skip_minified,
         )
+        artifact_profile_stage_duration_seconds = time.time() - artifact_profile_started
         artifact_downgraded_files = 0
         artifact_downgraded_bytes = 0
         extraction_entries = []
@@ -4066,6 +4087,7 @@ class QuickContext:
             )
 
         candidate_paths = {entry.file_path for entry in extraction_entries}
+        extract_started = time.time()
         if extraction_entries and (
             len(extraction_entries) == len(scan_entries)
             or len(extraction_entries) > 100
@@ -4083,6 +4105,7 @@ class QuickContext:
             extracted_candidates = []
             for entry in extraction_entries:
                 extracted_candidates.extend(self.extract_symbols(entry.file_path))
+        extract_stage_duration_seconds = time.time() - extract_started
 
         for result in extracted_candidates:
             file_cache.update_from_extraction(
@@ -4196,7 +4219,9 @@ class QuickContext:
         if show_progress:
             print("Building chunks...")
 
+        chunk_build_started = time.time()
         chunks = self.chunker.build_chunks(changed_results)
+        chunk_build_stage_duration_seconds = time.time() - chunk_build_started
 
         if fast:
             generate_descriptions = False
@@ -4206,6 +4231,7 @@ class QuickContext:
             if max_total_chunks is None:
                 max_total_chunks = 50000
 
+        filter_started = time.time()
         chunks, filter_stats = filter_chunks(
             chunks,
             ChunkFilterConfig(
@@ -4226,6 +4252,7 @@ class QuickContext:
             )
             if show_progress:
                 print(f"Total chunk cap applied: kept {len(chunks)}/{len(ranked)}")
+        filter_stage_duration_seconds = time.time() - filter_started
 
         if show_progress:
             print(
@@ -4397,7 +4424,9 @@ class QuickContext:
         pending_path_set = set(pending_paths)
         pending_chunks = [chunk for chunk in chunks if chunk.file_path in pending_path_set]
 
+        dedup_started = time.time()
         dedup_result = deduplicate_chunks(pending_chunks)
+        dedup_stage_duration_seconds = time.time() - dedup_started
 
         if compress_for_embedding:
             for idx, chunk in enumerate(dedup_result.unique_chunks):
@@ -4416,9 +4445,11 @@ class QuickContext:
             if show_progress:
                 print(f"Generating descriptions for {dedup_result.unique_count} unique chunks...")
 
+            description_started = time.time()
             unique_descriptions = self.describer.generate_batch(dedup_result.unique_chunks)
             descriptions = expand_descriptions(unique_descriptions, dedup_result)
             llm_cost = sum(d.cost_usd for d in unique_descriptions)
+            description_stage_duration_seconds = time.time() - description_started
 
             if show_progress:
                 total_tokens = sum(d.token_count for d in unique_descriptions)
@@ -4426,9 +4457,11 @@ class QuickContext:
         else:
             from engine.src.describer import build_fallback_descriptions
 
+            description_started = time.time()
             unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
             descriptions = expand_descriptions(unique_descriptions, dedup_result)
             llm_cost = 0.0
+            description_stage_duration_seconds = time.time() - description_started
             if show_progress:
                 print("Skipping description generation (fast/no-descriptions mode)")
 
@@ -4495,6 +4528,15 @@ class QuickContext:
             embedding_final_batch_size=embed_stats.final_batch_size,
             embedding_batch_shrink_events=embed_stats.batch_shrink_events,
             embedding_batch_grow_events=embed_stats.batch_grow_events,
+            scan_stage_duration_seconds=scan_stage_duration_seconds,
+            artifact_profile_stage_duration_seconds=artifact_profile_stage_duration_seconds,
+            extract_stage_duration_seconds=extract_stage_duration_seconds,
+            chunk_build_stage_duration_seconds=chunk_build_stage_duration_seconds,
+            filter_stage_duration_seconds=filter_stage_duration_seconds,
+            dedup_stage_duration_seconds=dedup_stage_duration_seconds,
+            description_stage_duration_seconds=description_stage_duration_seconds,
+            point_build_stage_duration_seconds=total_upsert_stats.point_build_stage_duration_seconds,
+            upsert_stage_duration_seconds=total_upsert_stats.upsert_stage_duration_seconds,
         )
 
         file_cache.save()
@@ -4513,6 +4555,19 @@ class QuickContext:
                 f"final_batch={stats.embedding_final_batch_size}, "
                 f"shrink={stats.embedding_batch_shrink_events}, "
                 f"grow={stats.embedding_batch_grow_events}"
+            )
+            print(
+                "Index phase timings: "
+                f"scan={stats.scan_stage_duration_seconds:.2f}s, "
+                f"artifact_profile={stats.artifact_profile_stage_duration_seconds:.2f}s, "
+                f"extract={stats.extract_stage_duration_seconds:.2f}s, "
+                f"chunk={stats.chunk_build_stage_duration_seconds:.2f}s, "
+                f"filter={stats.filter_stage_duration_seconds:.2f}s, "
+                f"dedup={stats.dedup_stage_duration_seconds:.2f}s, "
+                f"describe={stats.description_stage_duration_seconds:.2f}s, "
+                f"embed={stats.embedding_stage_duration_seconds:.2f}s, "
+                f"point_build={stats.point_build_stage_duration_seconds:.2f}s, "
+                f"upsert={stats.upsert_stage_duration_seconds:.2f}s"
             )
             if stats.failed_points > 0:
                 print(f"Failed: {stats.failed_points} chunks")
@@ -4654,7 +4709,13 @@ class QuickContext:
             if max_total_chunks is None:
                 max_total_chunks = 50000
 
+        extract_stage_duration_seconds = 0.0
+        chunk_build_stage_duration_seconds = 0.0
+        filter_stage_duration_seconds = 0.0
+        dedup_stage_duration_seconds = 0.0
+        description_stage_duration_seconds = 0.0
         artifact_profiles_by_path: dict[str, ArtifactIndexProfile] = {}
+        artifact_profile_started = time.time()
         if fast and skip_minified:
             for file_path in paths_to_extract:
                 path_obj = Path(file_path)
@@ -4680,6 +4741,7 @@ class QuickContext:
                     continue
                 if should_downgrade_artifact_profile(profile):
                     artifact_profiles_by_path[file_path] = profile
+        artifact_profile_stage_duration_seconds = time.time() - artifact_profile_started
 
         if show_progress and artifact_profiles_by_path:
             total_bytes = sum(profile.file_size for profile in artifact_profiles_by_path.values())
@@ -4702,6 +4764,7 @@ class QuickContext:
             old_chunks = old_chunks_by_file.get(file_path, [])
 
             artifact_profile = artifact_profiles_by_path.get(file_path)
+            extract_started = time.time()
             if artifact_profile is not None:
                 results = [
                     ExtractionResult(
@@ -4716,13 +4779,17 @@ class QuickContext:
                 ]
             else:
                 results = self.extract_symbols(file_path)
+            extract_stage_duration_seconds += time.time() - extract_started
+            chunk_started = time.time()
             new_chunks = self.chunker.build_chunks(results)
+            chunk_build_stage_duration_seconds += time.time() - chunk_started
 
             for result in results:
                 file_cache.update_from_extraction(
                     result.file_path, result.file_hash, result.file_size, result.file_mtime,
                 )
 
+            filter_started = time.time()
             filtered_chunks, filter_stats = filter_chunks(
                 new_chunks,
                 ChunkFilterConfig(
@@ -4731,6 +4798,7 @@ class QuickContext:
                     skip_minified=bool(skip_minified),
                 ),
             )
+            filter_stage_duration_seconds += time.time() - filter_started
             diff = ChunkDiffer.diff(old_chunks, filtered_chunks)
 
             all_chunks_to_reindex.extend(diff.needs_reindex)
@@ -4794,7 +4862,9 @@ class QuickContext:
             )
 
         from engine.src.dedup import deduplicate_chunks, expand_descriptions, expand_embeddings
+        dedup_started = time.time()
         dedup_result = deduplicate_chunks(all_chunks_to_reindex)
+        dedup_stage_duration_seconds = time.time() - dedup_started
 
         if compress_for_embedding:
             for idx, chunk in enumerate(dedup_result.unique_chunks):
@@ -4813,9 +4883,11 @@ class QuickContext:
             if show_progress:
                 print(f"Generating descriptions for {dedup_result.unique_count} unique chunks...")
 
+            description_started = time.time()
             unique_descriptions = self.describer.generate_batch(dedup_result.unique_chunks)
             descriptions = expand_descriptions(unique_descriptions, dedup_result)
             llm_cost = sum(d.cost_usd for d in unique_descriptions)
+            description_stage_duration_seconds = time.time() - description_started
 
             if show_progress:
                 total_tokens = sum(d.token_count for d in unique_descriptions)
@@ -4823,9 +4895,11 @@ class QuickContext:
         else:
             from engine.src.describer import build_fallback_descriptions
 
+            description_started = time.time()
             unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
             descriptions = expand_descriptions(unique_descriptions, dedup_result)
             llm_cost = 0.0
+            description_stage_duration_seconds = time.time() - description_started
             if show_progress:
                 print("Skipping description generation (fast/no-descriptions mode)")
 
@@ -4848,13 +4922,13 @@ class QuickContext:
         if show_progress:
             print(f"Upserting {len(embedded_chunks)} chunks to Qdrant...")
 
-        stats = indexer.upsert_chunks(embedded_chunks)
+        indexer_stats = indexer.upsert_chunks(embedded_chunks)
 
         stats = IndexStats(
-            total_chunks=stats.total_chunks,
-            upserted_points=stats.upserted_points,
-            failed_points=stats.failed_points,
-            total_tokens=stats.total_tokens,
+            total_chunks=indexer_stats.total_chunks,
+            upserted_points=indexer_stats.upserted_points,
+            failed_points=indexer_stats.failed_points,
+            total_tokens=indexer_stats.total_tokens,
             duration_seconds=time.time() - started_at,
             llm_cost_usd=llm_cost,
             embedding_cost_usd=embedding_cost,
@@ -4871,6 +4945,14 @@ class QuickContext:
             embedding_final_batch_size=embed_stats.final_batch_size,
             embedding_batch_shrink_events=embed_stats.batch_shrink_events,
             embedding_batch_grow_events=embed_stats.batch_grow_events,
+            artifact_profile_stage_duration_seconds=artifact_profile_stage_duration_seconds,
+            extract_stage_duration_seconds=extract_stage_duration_seconds,
+            chunk_build_stage_duration_seconds=chunk_build_stage_duration_seconds,
+            filter_stage_duration_seconds=filter_stage_duration_seconds,
+            dedup_stage_duration_seconds=dedup_stage_duration_seconds,
+            description_stage_duration_seconds=description_stage_duration_seconds,
+            point_build_stage_duration_seconds=indexer_stats.point_build_stage_duration_seconds,
+            upsert_stage_duration_seconds=indexer_stats.upsert_stage_duration_seconds,
         )
 
         file_cache.save()
@@ -4889,6 +4971,18 @@ class QuickContext:
                 f"final_batch={stats.embedding_final_batch_size}, "
                 f"shrink={stats.embedding_batch_shrink_events}, "
                 f"grow={stats.embedding_batch_grow_events}"
+            )
+            print(
+                "Refresh phase timings: "
+                f"artifact_profile={stats.artifact_profile_stage_duration_seconds:.2f}s, "
+                f"extract={stats.extract_stage_duration_seconds:.2f}s, "
+                f"chunk={stats.chunk_build_stage_duration_seconds:.2f}s, "
+                f"filter={stats.filter_stage_duration_seconds:.2f}s, "
+                f"dedup={stats.dedup_stage_duration_seconds:.2f}s, "
+                f"describe={stats.description_stage_duration_seconds:.2f}s, "
+                f"embed={stats.embedding_stage_duration_seconds:.2f}s, "
+                f"point_build={stats.point_build_stage_duration_seconds:.2f}s, "
+                f"upsert={stats.upsert_stage_duration_seconds:.2f}s"
             )
             if stats.failed_points > 0:
                 print(f"Failed: {stats.failed_points} chunks")
