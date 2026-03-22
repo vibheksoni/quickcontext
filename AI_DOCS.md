@@ -116,6 +116,8 @@ The tracked MCP wrapper stays thin over those same SDK primitives:
 - `grep`: exact literal retrieval through the Rust service
 - `symbol_lookup`: exact or near-exact identifier lookup through the Rust symbol index
 
+For path-scoped MCP tools, always pass an explicit target path. Do not rely on the MCP server process working directory.
+
 Recommendation:
 
 - Use `retrieve_context_auto(...)` as the safest default for AI workflows.

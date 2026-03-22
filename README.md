@@ -245,6 +245,8 @@ The tracked repository now includes a thin FastMCP wrapper around the Python SDK
 - `grep`: exact literal grep through the Rust service
 - `symbol_lookup`: exact or near-exact identifier lookup through the Rust symbol index
 
+For path-scoped MCP tools, always pass an explicit target path. Do not rely on the MCP server process working directory.
+
 Run it locally over stdio:
 
 ```text

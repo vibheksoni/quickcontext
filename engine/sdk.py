@@ -3963,6 +3963,69 @@ class QuickContext:
                 "Start Qdrant or update the active config before indexing."
             ) from exc
 
+    def _apply_fast_embedding_defaults(
+        self,
+        *,
+        fast: bool,
+        embedding_concurrency: Optional[int],
+        embedding_batch_size: Optional[int],
+        embedding_max_retries: Optional[int],
+        embedding_adaptive_batching: Optional[bool],
+    ) -> tuple[Optional[int], Optional[int], Optional[int], Optional[bool]]:
+        """
+        Apply SDK-level fast-mode defaults for remote embedding throughput.
+
+        The CLI already exposed more aggressive one-shot settings, but SDK callers and
+        wrappers were previously stuck with conservative defaults unless they knew the
+        tuning knobs. Fast mode should carry its speed intent through the whole SDK.
+        """
+        if not fast:
+            return (
+                embedding_concurrency,
+                embedding_batch_size,
+                embedding_max_retries,
+                embedding_adaptive_batching,
+            )
+
+        providers = {
+            cfg.provider
+            for cfg in (self._config.code_embedding, self._config.desc_embedding)
+            if cfg is not None
+        }
+        if "litellm" not in providers:
+            return (
+                embedding_concurrency,
+                embedding_batch_size,
+                embedding_max_retries,
+                embedding_adaptive_batching,
+            )
+
+        if embedding_concurrency is None:
+            embedding_concurrency = max(
+                16,
+                max(
+                    (cfg.concurrency for cfg in (self._config.code_embedding, self._config.desc_embedding) if cfg is not None),
+                    default=4,
+                ),
+            )
+        if embedding_batch_size is None:
+            embedding_batch_size = max(
+                64,
+                max(
+                    (cfg.batch_size for cfg in (self._config.code_embedding, self._config.desc_embedding) if cfg is not None),
+                    default=32,
+                ),
+            )
+        if embedding_adaptive_batching is None:
+            embedding_adaptive_batching = True
+
+        return (
+            embedding_concurrency,
+            embedding_batch_size,
+            embedding_max_retries,
+            embedding_adaptive_batching,
+        )
+
     def index_directory(
         self,
         directory: str | Path,
@@ -4285,6 +4348,18 @@ class QuickContext:
             skip_minified = True
             if max_total_chunks is None:
                 max_total_chunks = 50000
+        (
+            embedding_concurrency,
+            embedding_batch_size,
+            embedding_max_retries,
+            embedding_adaptive_batching,
+        ) = self._apply_fast_embedding_defaults(
+            fast=fast,
+            embedding_concurrency=embedding_concurrency,
+            embedding_batch_size=embedding_batch_size,
+            embedding_max_retries=embedding_max_retries,
+            embedding_adaptive_batching=embedding_adaptive_batching,
+        )
 
         filter_started = time.time()
         chunks, filter_stats = filter_chunks(
@@ -4856,6 +4931,18 @@ class QuickContext:
             skip_minified = True
             if max_total_chunks is None:
                 max_total_chunks = 50000
+        (
+            embedding_concurrency,
+            embedding_batch_size,
+            embedding_max_retries,
+            embedding_adaptive_batching,
+        ) = self._apply_fast_embedding_defaults(
+            fast=fast,
+            embedding_concurrency=embedding_concurrency,
+            embedding_batch_size=embedding_batch_size,
+            embedding_max_retries=embedding_max_retries,
+            embedding_adaptive_batching=embedding_adaptive_batching,
+        )
 
         extract_stage_duration_seconds = 0.0
         chunk_build_stage_duration_seconds = 0.0

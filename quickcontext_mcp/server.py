@@ -246,6 +246,7 @@ class CapabilitiesResource(BaseModel):
             "Text, grep, and symbol lookup routes work through the Rust service and do not require vector search.",
             "Repeated index calls for the same path/project attach to the existing active run instead of starting another index operation.",
             "Index status is backed by SDK-owned operation snapshots, including stage, files remaining, chunk counts, embedding progress, and upsert progress.",
+            "Path-scoped MCP tools require an explicit path so requests are never silently tied to the MCP server process working directory.",
         ]
     )
 
@@ -777,7 +778,7 @@ app = mcp
     },
 )
 async def project_info(
-    path: Annotated[str, Field(description="Absolute or relative file or directory path to inspect.")] = ".",
+    path: Annotated[str, Field(description="Absolute or relative file or directory path to inspect. This is required and should not rely on MCP server cwd.")],
     project_name: Annotated[str | None, Field(description="Optional project collection override.")] = None,
     ctx: Context = CurrentContext(),
 ) -> ProjectInfoResponse:
@@ -825,7 +826,7 @@ async def list_projects(ctx: Context = CurrentContext()) -> ListProjectsResponse
     },
 )
 async def index(
-    path: Annotated[str, Field(description="Absolute or relative directory path to index.")] = ".",
+    path: Annotated[str, Field(description="Absolute or relative directory path to index. This is required and should not rely on MCP server cwd.")],
     reindex: Annotated[bool, Field(description="When true, force-refresh already indexed files instead of trusting unchanged-file cache.")] = True,
     fast: Annotated[bool, Field(description="When true, skip description generation and use the fast indexing profile.")] = True,
     project_name: Annotated[str | None, Field(description="Optional project collection override.")] = None,
@@ -907,7 +908,7 @@ async def index_status(
 )
 async def search(
     query: Annotated[str, Field(description="Natural-language or code-oriented query to search for.")],
-    path: Annotated[str, Field(description="Absolute or relative repository root, directory, or file scope to search.")] = ".",
+    path: Annotated[str, Field(description="Absolute or relative repository root, directory, or file scope to search. This is required and should not rely on MCP server cwd.")],
     mode: Annotated[SearchMode, Field(description="Retrieval strategy: auto, text, semantic, or bundle.")] = "auto",
     project_name: Annotated[str | None, Field(description="Optional project collection override.")] = None,
     path_prefix: Annotated[str | None, Field(description="Optional folder prefix inside the project for narrower search scope.")] = None,
@@ -944,7 +945,7 @@ async def search(
 )
 async def grep(
     query: Annotated[str, Field(description="Exact literal text to grep for.")],
-    path: Annotated[str, Field(description="Absolute or relative repository root, directory, or file scope to grep.")] = ".",
+    path: Annotated[str, Field(description="Absolute or relative repository root, directory, or file scope to grep. This is required and should not rely on MCP server cwd.")],
     limit: Annotated[int, Field(description="Maximum number of matches to return.", ge=1, le=200)] = 40,
     before_context: Annotated[int, Field(description="Number of leading context lines to include before each match.", ge=0, le=10)] = 1,
     after_context: Annotated[int, Field(description="Number of trailing context lines to include after each match.", ge=0, le=10)] = 1,
@@ -979,7 +980,7 @@ async def grep(
 )
 async def symbol_lookup(
     query: Annotated[str, Field(description="Symbol or identifier to look up.")],
-    path: Annotated[str, Field(description="Absolute or relative repository root, directory, or file scope to inspect.")] = ".",
+    path: Annotated[str, Field(description="Absolute or relative repository root, directory, or file scope to inspect. This is required and should not rely on MCP server cwd.")],
     project_name: Annotated[str | None, Field(description="Optional project collection override.")] = None,
     limit: Annotated[int, Field(description="Maximum number of symbols to return.", ge=1, le=50)] = 12,
     ctx: Context = CurrentContext(),
@@ -1038,7 +1039,7 @@ def jobs_resource() -> IndexJobsResource:
 )
 def quickcontext_search_playbook(
     goal: Annotated[str, Field(description="The coding or code-understanding goal the assistant is trying to solve.")],
-    path: Annotated[str, Field(description="Absolute or relative project path the assistant is working in.")] = ".",
+    path: Annotated[str, Field(description="Absolute or relative project path the assistant is working in. This is required and should not rely on MCP server cwd.")],
     project_name: Annotated[str | None, Field(description="Optional project collection override.")] = None,
 ) -> str:
     resolved_path = str(_project_anchor(_normalize_scope_path(path)))

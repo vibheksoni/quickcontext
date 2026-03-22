@@ -64,7 +64,10 @@ class MCPServerTests(unittest.TestCase):
         async def _test() -> None:
             with patch("quickcontext_mcp.server._search_impl", return_value=fake_response):
                 async with Client(mcp) as client:
-                    result = await client.call_tool("search", {"query": "how does indexing work"})
+                    result = await client.call_tool(
+                        "search",
+                        {"query": "how does indexing work", "path": "C:/repo"},
+                    )
             payload = result.data
             self.assertEqual(payload.project_name, "repo")
             self.assertEqual(payload.mode_used, "symbol")
