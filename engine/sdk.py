@@ -24,7 +24,7 @@ from engine.src.dedup import (
     expand_embeddings,
 )
 from engine.src.filecache import FileSignatureCache
-from engine.src.lsp_setup import build_lsp_setup_plan
+from engine.src.lsp_setup import build_lsp_check_plan, build_lsp_setup_plan
 from engine.src.operation_status import GLOBAL_OPERATION_REGISTRY, OperationProgressReporter, snapshot_to_dict
 
 if TYPE_CHECKING:
@@ -85,7 +85,9 @@ from engine.src.packer import (
 from engine.src.project import detect_project_name
 from engine.src.sdk_models import (
     IndexOperationSnapshot,
+    LspCheckPlanInfo,
     LspInstallStepInfo,
+    LspServerCheckInfo,
     LspServerSetupInfo,
     LspSetupPlanInfo,
     ProjectCollectionInfo,
@@ -5482,6 +5484,39 @@ class QuickContext:
                         for step in server.install_steps
                     ],
                     notes=list(server.notes),
+                )
+                for server in plan.servers
+            ],
+        )
+
+    def lsp_check(self, path: str | Path) -> LspCheckPlanInfo:
+        """
+        Build a project-specific LSP readiness report.
+        """
+        plan = build_lsp_check_plan(path)
+        return LspCheckPlanInfo(
+            target_path=plan.target_path,
+            platform=plan.platform,
+            servers=[
+                LspServerCheckInfo(
+                    name=server.name,
+                    language_id=server.language_id,
+                    binary=server.binary,
+                    status=server.status,
+                    installed=server.installed,
+                    auto_install_supported=server.auto_install_supported,
+                    detection_reasons=list(server.detection_reasons),
+                    install_steps=[
+                        LspInstallStepInfo(
+                            manager=step.manager,
+                            command=step.command,
+                            note=step.note,
+                        )
+                        for step in server.install_steps
+                    ],
+                    notes=list(server.notes),
+                    probe_command=server.probe_command,
+                    probe_message=server.probe_message,
                 )
                 for server in plan.servers
             ],

@@ -307,6 +307,12 @@ Run supported auto-installs:
 python -m engine lsp-setup "C:/path/to/project" --install
 ```
 
+Check readiness after install:
+
+```text
+python -m engine lsp-check "C:/path/to/project"
+```
+
 Windows PowerShell wrapper:
 
 ```powershell
@@ -319,6 +325,7 @@ Notes:
 - The setup command is project-scoped. Pass the actual target repo path.
 - Some servers have automatic install commands; others are reported as manual-only with notes.
 - The command checks whether the expected LSP binary is already on `PATH`.
+- `lsp-check` reports `ready`, `missing`, `installed`, or `error` based on binary presence plus a lightweight probe where available.
 
 ## Validation
 

@@ -2335,6 +2335,95 @@ def lsp_setup(
         sys.exit(1)
 
 
+@cli.command("lsp-check")
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option("--json-output", is_flag=True, help="Print the readiness report as JSON.")
+@click.pass_context
+def lsp_check(
+    ctx: click.Context,
+    path: Path,
+    json_output: bool,
+) -> None:
+    """
+    Check whether the project's likely language servers are installed and probe-ready.
+    """
+    config = ctx.obj["config"]
+
+    try:
+        with QuickContext(config) as qc:
+            plan = qc.lsp_check(path)
+
+        if json_output:
+            console.print_json(json.dumps({
+                "target_path": plan.target_path,
+                "platform": plan.platform,
+                "servers": [
+                    {
+                        "name": server.name,
+                        "language_id": server.language_id,
+                        "binary": server.binary,
+                        "status": server.status,
+                        "installed": server.installed,
+                        "auto_install_supported": server.auto_install_supported,
+                        "detection_reasons": server.detection_reasons,
+                        "install_steps": [
+                            {
+                                "manager": step.manager,
+                                "command": step.command,
+                                "note": step.note,
+                            }
+                            for step in server.install_steps
+                        ],
+                        "notes": server.notes,
+                        "probe_command": server.probe_command,
+                        "probe_message": server.probe_message,
+                    }
+                    for server in plan.servers
+                ],
+            }, indent=2))
+            return
+
+        if not plan.servers:
+            console.print("[yellow]No known LSP servers detected for this target.[/yellow]")
+            return
+
+        table = Table(title=f"LSP Readiness Check ({plan.platform})")
+        table.add_column("Language", style="cyan")
+        table.add_column("Server", style="white")
+        table.add_column("Status", style="green")
+        table.add_column("Binary", style="dim")
+        table.add_column("Probe", style="white")
+        table.add_column("Message", style="dim")
+
+        for server in plan.servers:
+            table.add_row(
+                server.language_id,
+                server.name,
+                server.status,
+                server.binary,
+                server.probe_command or "-",
+                server.probe_message or "",
+            )
+
+        console.print(table)
+        console.print()
+        for server in plan.servers:
+            if server.status == "ready":
+                continue
+            console.print(f"[bold]{server.name}[/bold]")
+            for note in server.notes:
+                console.print(f"  {note}")
+            if server.status == "missing":
+                for step in server.install_steps:
+                    note_suffix = f"  # {step.note}" if step.note else ""
+                    console.print(f"  {step.command}{note_suffix}")
+            console.print()
+
+    except Exception as exc:
+        console.print(f"[red]LSP check failed:[/red] {exc}")
+        sys.exit(1)
+
+
 @cli.command("lsp-definition")
 @click.argument("file", type=click.Path(exists=True, path_type=Path))
 @click.argument("line", type=int)

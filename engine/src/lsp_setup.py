@@ -66,6 +66,28 @@ class LspInstallResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LspServerCheck:
+    name: str
+    language_id: str
+    binary: str
+    status: str
+    installed: bool
+    auto_install_supported: bool
+    detection_reasons: list[str]
+    install_steps: list[LspInstallStep] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    probe_command: str | None = None
+    probe_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LspCheckPlan:
+    target_path: str
+    platform: PlatformName
+    servers: list[LspServerCheck]
+
+
+@dataclass(frozen=True, slots=True)
 class _ServerSpec:
     name: str
     language_id: str
@@ -444,6 +466,41 @@ _SPECS: tuple[_ServerSpec, ...] = (
     ),
 )
 
+_PROBE_COMMANDS: dict[str, tuple[str, ...]] = {
+    "rust-analyzer": ("rust-analyzer", "--version"),
+    "typescript-language-server": ("typescript-language-server", "--version"),
+    "gopls": ("gopls", "version"),
+    "clangd": ("clangd", "--version"),
+    "lua-language-server": ("lua-language-server", "--version"),
+    "zls": ("zls", "--version"),
+    "ruby-lsp": ("ruby-lsp", "--version"),
+    "phpactor": ("phpactor", "--version"),
+    "kotlin-language-server": ("kotlin-language-server", "--version"),
+    "sourcekit-lsp": ("sourcekit-lsp", "--version"),
+    "haskell-language-server-wrapper": ("haskell-language-server-wrapper", "--version"),
+    "metals": ("metals", "--version"),
+    "dart": ("dart", "--version"),
+    "R": ("R", "--version"),
+    "bash-language-server": ("bash-language-server", "--version"),
+    "yaml-language-server": ("yaml-language-server", "--version"),
+    "vscode-json-language-server": ("vscode-json-language-server", "--version"),
+    "vscode-html-language-server": ("vscode-html-language-server", "--version"),
+    "vscode-css-language-server": ("vscode-css-language-server", "--version"),
+    "terraform-ls": ("terraform-ls", "--version"),
+    "taplo": ("taplo", "--version"),
+    "marksman": ("marksman", "--version"),
+    "vue-language-server": ("vue-language-server", "--version"),
+    "ocamllsp": ("ocamllsp", "--version"),
+    "erlang_ls": ("erlang_ls", "--version"),
+    "clojure-lsp": ("clojure-lsp", "--version"),
+    "solargraph": ("solargraph", "--version"),
+    "cmake-language-server": ("cmake-language-server", "--version"),
+    "perlnavigator": ("perlnavigator", "--version"),
+    "nimlangserver": ("nimlangserver", "--version"),
+    "vhdl_ls": ("vhdl_ls", "--version"),
+    "verible-verilog-ls": ("verible-verilog-ls", "--version"),
+}
+
 
 def current_platform() -> PlatformName:
     return "windows" if os.name == "nt" else "linux"
@@ -520,6 +577,95 @@ def build_lsp_setup_plan(path: str | Path) -> LspSetupPlan:
         target_path=str(root),
         platform=current_platform(),
         servers=servers,
+    )
+
+
+def _run_probe(plan: LspSetupPlan, command: tuple[str, ...]) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            list(command),
+            cwd=plan.target_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False, "Binary not found on PATH"
+    except subprocess.TimeoutExpired:
+        return False, "Probe timed out"
+    except Exception as exc:
+        return False, str(exc)
+
+    output = (completed.stdout or completed.stderr or "").strip()
+    if completed.returncode == 0:
+        return True, output.splitlines()[0] if output else "Probe succeeded"
+    return False, output.splitlines()[0] if output else f"Probe failed with exit code {completed.returncode}"
+
+
+def build_lsp_check_plan(path: str | Path) -> LspCheckPlan:
+    plan = build_lsp_setup_plan(path)
+    checks: list[LspServerCheck] = []
+
+    for server in plan.servers:
+        probe = _PROBE_COMMANDS.get(server.binary) or _PROBE_COMMANDS.get(server.name)
+        if not server.installed:
+            checks.append(
+                LspServerCheck(
+                    name=server.name,
+                    language_id=server.language_id,
+                    binary=server.binary,
+                    status="missing",
+                    installed=False,
+                    auto_install_supported=server.auto_install_supported,
+                    detection_reasons=list(server.detection_reasons),
+                    install_steps=list(server.install_steps),
+                    notes=list(server.notes),
+                    probe_command=" ".join(probe) if probe else None,
+                    probe_message="Binary is not on PATH",
+                )
+            )
+            continue
+
+        if probe is None:
+            checks.append(
+                LspServerCheck(
+                    name=server.name,
+                    language_id=server.language_id,
+                    binary=server.binary,
+                    status="installed",
+                    installed=True,
+                    auto_install_supported=server.auto_install_supported,
+                    detection_reasons=list(server.detection_reasons),
+                    install_steps=list(server.install_steps),
+                    notes=list(server.notes),
+                    probe_message="Binary is present, but no safe probe command is configured.",
+                )
+            )
+            continue
+
+        success, message = _run_probe(plan, probe)
+        checks.append(
+            LspServerCheck(
+                name=server.name,
+                language_id=server.language_id,
+                binary=server.binary,
+                status="ready" if success else "error",
+                installed=True,
+                auto_install_supported=server.auto_install_supported,
+                detection_reasons=list(server.detection_reasons),
+                install_steps=list(server.install_steps),
+                notes=list(server.notes),
+                probe_command=" ".join(probe),
+                probe_message=message,
+            )
+        )
+
+    return LspCheckPlan(
+        target_path=plan.target_path,
+        platform=plan.platform,
+        servers=checks,
     )
 
 

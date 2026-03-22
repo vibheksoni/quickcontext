@@ -5,7 +5,7 @@ from unittest import mock
 
 from engine.sdk import QuickContext
 from engine.src.config import EngineConfig
-from engine.src.lsp_setup import build_lsp_setup_plan
+from engine.src.lsp_setup import build_lsp_check_plan, build_lsp_setup_plan
 from engine.src.pipe import PipeClient
 
 
@@ -76,3 +76,42 @@ class LspSetupTests(unittest.TestCase):
             "character": 2,
         })
         self.assertEqual(result, {"items": []})
+
+    def test_lsp_check_marks_missing_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            (root / "main.ts").write_text("export const x = 1;\n", encoding="utf-8")
+            with mock.patch("engine.src.lsp_setup.shutil.which", return_value=None):
+                plan = build_lsp_check_plan(root)
+
+        by_name = {server.name: server for server in plan.servers}
+        self.assertEqual(by_name["typescript-language-server"].status, "missing")
+
+    def test_lsp_check_marks_ready_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text("[package]\nname='x'\nversion='0.1.0'\n", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+            completed = mock.Mock(returncode=0, stdout="rust-analyzer 1.0.0\n", stderr="")
+            with mock.patch("engine.src.lsp_setup.shutil.which", return_value="C:/bin/rust-analyzer"), mock.patch(
+                "engine.src.lsp_setup.subprocess.run",
+                return_value=completed,
+            ):
+                plan = build_lsp_check_plan(root)
+
+        by_name = {server.name: server for server in plan.servers}
+        self.assertEqual(by_name["rust-analyzer"].status, "ready")
+
+    def test_quickcontext_exposes_lsp_check_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text("{}", encoding="utf-8")
+            (root / "main.ts").write_text("export const x = 1;\n", encoding="utf-8")
+            with QuickContext(EngineConfig()) as qc:
+                with mock.patch("engine.src.lsp_setup.shutil.which", return_value=None):
+                    plan = qc.lsp_check(root)
+
+        self.assertEqual(plan.target_path, str(root.resolve()))
+        self.assertTrue(any(server.status == "missing" for server in plan.servers))

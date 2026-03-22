@@ -94,3 +94,25 @@ class LspSetupPlanInfo:
     target_path: str
     platform: str
     servers: list[LspServerSetupInfo] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class LspServerCheckInfo:
+    name: str
+    language_id: str
+    binary: str
+    status: str
+    installed: bool
+    auto_install_supported: bool
+    detection_reasons: list[str] = field(default_factory=list)
+    install_steps: list[LspInstallStepInfo] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    probe_command: str | None = None
+    probe_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LspCheckPlanInfo:
+    target_path: str
+    platform: str
+    servers: list[LspServerCheckInfo] = field(default_factory=list)
