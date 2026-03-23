@@ -555,6 +555,12 @@ class CodeSearcher:
                     fused_scores[key] += top_rank_bonus_1
                 elif rank < 3:
                     fused_scores[key] += top_rank_bonus_2_3
+                if (
+                    list_idx == 1
+                    and (result.symbol_kind or "").lower() == "file_artifact"
+                    and rank < 3
+                ):
+                    fused_scores[key] += min(max(result.score, 0.0) * 0.05, 0.025)
 
         ranked_keys = sorted(fused_scores.keys(), key=lambda key: fused_scores[key], reverse=True)
         return [

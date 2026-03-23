@@ -1025,6 +1025,29 @@ class RegressionTests(unittest.TestCase):
         self.assertLess(penalty, 1.0)
         self.assertEqual(neutral, 1.0)
 
+    def test_result_key_collapses_file_artifact_results_by_file(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        result_a = SearchResult(0.5, "dist/app.js", "summary_a", "file_artifact", 1, 10, "", "")
+        result_b = SearchResult(0.4, "dist/app.js", "summary_b", "file_artifact", 20, 30, "", "")
+        self.assertEqual(searcher._result_key(result_a), searcher._result_key(result_b))
+
+    def test_rrf_fuse_boosts_top_description_artifact_anchor(self) -> None:
+        searcher = CodeSearcher(
+            client=None,
+            collection_name="x",
+            code_provider=_FakeProvider("code", 2),
+            desc_provider=_FakeProvider("desc", 2),
+        )
+        code_top = SearchResult(0.7, "ui/page.js", "e", "function", 1, 10, "", "")
+        artifact = SearchResult(0.4, "dist/app.js", "summary", "file_artifact", 1, 10, "", "")
+        fused = searcher._rrf_fuse([[code_top], [artifact]], [0.5, 0.5])
+        self.assertEqual(fused[0].file_path, "dist/app.js")
+
     def test_ranking_helper_penalty_downranks_bonus_helpers_for_non_ranking_queries(self) -> None:
         searcher = CodeSearcher(
             client=None,
