@@ -282,6 +282,30 @@ class DescriptionGenerator:
         """
         return asyncio.run(self._generate_batch_async(chunks, batch_size, progress_callback=progress_callback))
 
+    def generate_lightweight_metadata_batch(
+        self,
+        chunks: list[CodeChunk],
+        request_batch_size: int = 4,
+        max_tokens: Optional[int] = None,
+        progress_callback=None,
+    ) -> list[ChunkDescription]:
+        """
+        Generate compact descriptions and keywords for multiple chunks per request.
+        """
+        if not chunks:
+            return []
+
+        out: list[ChunkDescription] = []
+        completed = 0
+        batch_size = max(1, int(request_batch_size))
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start:start + batch_size]
+            out.extend(self._generate_lightweight_metadata_once(batch, max_tokens=max_tokens))
+            completed += len(batch)
+            if progress_callback is not None:
+                progress_callback(completed, len(chunks))
+        return out
+
     async def _generate_batch_async(
         self,
         chunks: list[CodeChunk],
@@ -373,6 +397,73 @@ class DescriptionGenerator:
             except Exception:
                 return build_fallback_description(chunk)
 
+    def _generate_lightweight_metadata_once(
+        self,
+        chunks: list[CodeChunk],
+        max_tokens: Optional[int] = None,
+    ) -> list[ChunkDescription]:
+        """
+        Generate compact metadata for a batch of chunks in one LLM request.
+        """
+        if not chunks:
+            return []
+
+        prompt = self._build_lightweight_batch_prompt(chunks)
+        kwargs = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": self._lightweight_batch_system_prompt()},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": max_tokens or self._max_tokens,
+            "temperature": self._temperature,
+            "api_key": self._api_key,
+        }
+
+        if self._api_base:
+            kwargs["api_base"] = self._api_base
+
+        if self._openrouter_provider:
+            kwargs["extra_body"] = {
+                "provider": {
+                    "order": [self._openrouter_provider]
+                }
+            }
+
+        try:
+            response = _get_litellm().completion(**kwargs)
+            content = response.choices[0].message.content.strip()
+            parsed = self._parse_lightweight_batch_response(content)
+            try:
+                cost = _get_litellm().completion_cost(completion_response=response)
+            except Exception:
+                cost = float(getattr(getattr(response, "usage", None), "cost", 0.0) or 0.0)
+            token_count = int(getattr(response.usage, "total_tokens", 0) or 0)
+        except Exception:
+            return [build_fallback_description(chunk) for chunk in chunks]
+
+        per_item_cost = cost / max(1, len(chunks))
+        per_item_tokens = token_count // max(1, len(chunks))
+        descriptions: list[ChunkDescription] = []
+        for idx, chunk in enumerate(chunks):
+            item = parsed.get(str(idx))
+            if item is None:
+                if len(chunks) > 1:
+                    descriptions.extend(self._generate_lightweight_metadata_once([chunk], max_tokens=max_tokens))
+                else:
+                    descriptions.append(build_fallback_description(chunk))
+                continue
+            descriptions.append(
+                ChunkDescription(
+                    chunk_id=chunk.chunk_id,
+                    description=item["description"],
+                    keywords=item["keywords"],
+                    token_count=per_item_tokens,
+                    cost_usd=per_item_cost,
+                )
+            )
+        return descriptions
+
     def _system_prompt(self) -> str:
         """
         System prompt for description generation.
@@ -393,6 +484,29 @@ Rules:
 - Keywords: 3-7 relevant terms for semantic search (language, domain, patterns, concepts)
 - Keep it minimal to save tokens
 - Output ONLY valid JSON, no markdown fences"""
+
+    def _lightweight_batch_system_prompt(self) -> str:
+        """
+        System prompt for compact multi-chunk metadata generation.
+        """
+        return """You are a code indexing assistant. Generate compact descriptions and keywords for multiple generated-code packets in one response.
+
+Output format (XML):
+<items>
+  <item id="0">
+    <description>Short 1 sentence description.</description>
+    <keywords>kw1|kw2|kw3|kw4</keywords>
+  </item>
+</items>
+
+Rules:
+- Return one `<item>` for every input id exactly once.
+- Keep each description to 1 sentence.
+- Keywords must be short, concrete, and reusable across projects.
+- Infer behavior from the packet context, not just one identifier.
+- Prefer protocol, UI, routing, auth, billing, search, indexing, or state-management concepts when present.
+- Do not add explanations outside the XML.
+- Output ONLY the XML."""
 
     def _build_prompt(self, chunk: CodeChunk) -> str:
         """
@@ -433,6 +547,42 @@ Code:
 ```
 
 Generate description and keywords."""
+
+    def _build_lightweight_batch_prompt(self, chunks: list[CodeChunk]) -> str:
+        """
+        Build one prompt containing multiple generated-code packets for metadata generation.
+        """
+        items: list[str] = []
+        for idx, chunk in enumerate(chunks):
+            context_parts = [
+                f"Language: {chunk.language}",
+                f"File: {chunk.file_path}",
+                f"Symbol: {chunk.symbol_name} ({chunk.symbol_kind})",
+            ]
+            if chunk.parent:
+                context_parts.append(f"Parent: {chunk.parent}")
+            if chunk.signature:
+                context_parts.append(f"Signature: {chunk.signature}")
+
+            source_preview = chunk.source
+            marker = "\n\nRaw excerpt:\n"
+            if marker in source_preview:
+                source_preview = source_preview.split(marker, 1)[0]
+            if len(source_preview) > 900:
+                source_preview = source_preview[:900] + "\n... [truncated]"
+
+            items.append(
+                f"""<item id="{idx}">
+<context>
+{chr(10).join(context_parts)}
+</context>
+<packet>
+{source_preview}
+</packet>
+</item>"""
+            )
+
+        return "<items>\n" + "\n".join(items) + "\n</items>"
 
     def _parse_response(self, content: str) -> dict[str, any]:
         """
@@ -478,3 +628,34 @@ Generate description and keywords."""
                 "description": description or "No description available",
                 "keywords": keywords,
             }
+
+    def _parse_lightweight_batch_response(self, content: str) -> dict[str, dict[str, object]]:
+        """
+        Parse XML-like multi-item metadata output.
+        """
+        content = content.strip()
+        if content.startswith("```xml"):
+            content = content[6:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+
+        matches = re.findall(
+            r"<item id=['\"]([^'\"]+)['\"]>\s*<description>(.*?)</description>\s*<keywords>(.*?)</keywords>\s*</item>",
+            content,
+            flags=re.DOTALL,
+        )
+        out: dict[str, dict[str, object]] = {}
+        for item_id, description, keywords_text in matches:
+            keywords = [
+                keyword.strip()
+                for keyword in re.split(r"[|,]", keywords_text)
+                if keyword.strip()
+            ]
+            out[str(item_id)] = {
+                "description": " ".join(description.strip().split()) or "No description available",
+                "keywords": keywords[:8],
+            }
+        return out

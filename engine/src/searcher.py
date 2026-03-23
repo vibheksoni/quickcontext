@@ -520,6 +520,8 @@ class CodeSearcher:
         result: SearchResult — Result item to key.
         Returns: str — Stable key.
         """
+        if (result.symbol_kind or "").lower() == "file_artifact":
+            return f"artifact:{result.file_path}"
         return f"{result.file_path}:{result.symbol_kind}:{result.symbol_name}:{result.line_start}"
 
     def _rrf_fuse(

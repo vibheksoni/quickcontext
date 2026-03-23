@@ -109,6 +109,9 @@ class LLMConfig:
     api_key: Optional[str] = None
     api_base: Optional[str] = None
     openrouter_provider: Optional[str] = None
+    artifact_metadata_enabled: bool = False
+    artifact_metadata_batch_size: int = 4
+    artifact_metadata_max_tokens: int = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +252,9 @@ class EngineConfig:
         Reads: QC_QDRANT_HOST, QC_QDRANT_PORT, QC_QDRANT_COLLECTION,
                QC_CODE_PROVIDER, QC_CODE_MODEL, QC_CODE_DIMENSION, QC_CODE_API_KEY,
                QC_DESC_PROVIDER, QC_DESC_MODEL, QC_DESC_DIMENSION, QC_DESC_API_KEY,
-               QC_LLM_PROVIDER, QC_LLM_MODEL, QC_LLM_MAX_TOKENS, QC_LLM_API_KEY.
+               QC_LLM_PROVIDER, QC_LLM_MODEL, QC_LLM_MAX_TOKENS, QC_LLM_API_KEY,
+               QC_LLM_ARTIFACT_METADATA_ENABLED, QC_LLM_ARTIFACT_METADATA_BATCH_SIZE,
+               QC_LLM_ARTIFACT_METADATA_MAX_TOKENS.
         Returns: EngineConfig — Config built from env vars with defaults.
         """
         qdrant = QdrantConfig(
@@ -314,6 +319,9 @@ class EngineConfig:
             temperature=float(os.environ.get("QC_LLM_TEMPERATURE", "0.0")),
             api_key=os.environ.get("QC_LLM_API_KEY"),
             api_base=os.environ.get("QC_LLM_API_BASE"),
+            artifact_metadata_enabled=os.environ.get("QC_LLM_ARTIFACT_METADATA_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
+            artifact_metadata_batch_size=int(os.environ.get("QC_LLM_ARTIFACT_METADATA_BATCH_SIZE", "4")),
+            artifact_metadata_max_tokens=int(os.environ.get("QC_LLM_ARTIFACT_METADATA_MAX_TOKENS", "512")),
         )
 
         return EngineConfig(

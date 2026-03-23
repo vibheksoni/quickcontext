@@ -3648,6 +3648,32 @@ class QuickContext:
 
         return enriched_results, enriched_count
 
+    def _maybe_generate_lightweight_artifact_metadata(
+        self,
+        unique_chunks: list[CodeChunk],
+        descriptions: list,
+        progress_callback=None,
+    ) -> list:
+        """
+        Optionally replace fallback metadata for artifact chunks with compact batched LLM output.
+        """
+        llm_cfg = self._config.llm
+        if llm_cfg is None or not llm_cfg.artifact_metadata_enabled:
+            return descriptions
+
+        artifact_chunks = [chunk for chunk in unique_chunks if chunk.symbol_kind == "file_artifact"]
+        if not artifact_chunks:
+            return descriptions
+
+        generated = self.describer.generate_lightweight_metadata_batch(
+            artifact_chunks,
+            request_batch_size=max(1, int(llm_cfg.artifact_metadata_batch_size)),
+            max_tokens=max(64, int(llm_cfg.artifact_metadata_max_tokens)),
+            progress_callback=progress_callback,
+        )
+        generated_by_id = {item.chunk_id: item for item in generated}
+        return [generated_by_id.get(item.chunk_id, item) for item in descriptions]
+
     def _load_file_compact_symbols(self, file_path: str) -> list:
         """
         Load compact extracted symbols for one file with stat-based cache invalidation.
@@ -4988,8 +5014,19 @@ class QuickContext:
                 _progress_reporter.set_stage("describe", "Building fallback descriptions")
             description_started = time.time()
             unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
+            unique_descriptions = self._maybe_generate_lightweight_artifact_metadata(
+                dedup_result.unique_chunks,
+                unique_descriptions,
+                progress_callback=(
+                    (lambda completed, total: _progress_reporter.update(
+                        description_chunks_completed=completed,
+                        message=f"Generated lightweight metadata for {completed}/{total} artifact chunks",
+                    ))
+                    if _progress_reporter is not None else None
+                ),
+            )
             descriptions = expand_descriptions(unique_descriptions, dedup_result)
-            llm_cost = 0.0
+            llm_cost = sum(item.cost_usd for item in unique_descriptions)
             description_stage_duration_seconds = time.time() - description_started
             if _progress_reporter is not None:
                 _progress_reporter.update(
@@ -5533,8 +5570,19 @@ class QuickContext:
                 _progress_reporter.set_stage("describe", "Building fallback descriptions")
             description_started = time.time()
             unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
+            unique_descriptions = self._maybe_generate_lightweight_artifact_metadata(
+                dedup_result.unique_chunks,
+                unique_descriptions,
+                progress_callback=(
+                    (lambda completed, total: _progress_reporter.update(
+                        description_chunks_completed=completed,
+                        message=f"Generated lightweight metadata for {completed}/{total} artifact chunks",
+                    ))
+                    if _progress_reporter is not None else None
+                ),
+            )
             descriptions = expand_descriptions(unique_descriptions, dedup_result)
-            llm_cost = 0.0
+            llm_cost = sum(item.cost_usd for item in unique_descriptions)
             description_stage_duration_seconds = time.time() - description_started
             if _progress_reporter is not None:
                 _progress_reporter.update(
