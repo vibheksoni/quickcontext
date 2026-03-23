@@ -77,6 +77,20 @@ class LspSetupTests(unittest.TestCase):
         })
         self.assertEqual(result, {"items": []})
 
+    def test_pipe_client_exposes_lsp_session_methods(self) -> None:
+        client = PipeClient()
+        with mock.patch.object(client, "request", return_value={"status": "ok", "data": {"sessions": []}}) as request:
+            sessions = client.lsp_sessions()
+
+        request.assert_called_once_with({"method": "lsp_sessions"})
+        self.assertEqual(sessions, {"sessions": []})
+
+        with mock.patch.object(client, "request", return_value={"status": "ok", "data": {"stopped_sessions": 2}}) as request:
+            result = client.lsp_shutdown_all()
+
+        request.assert_called_once_with({"method": "lsp_shutdown_all"})
+        self.assertEqual(result, {"stopped_sessions": 2})
+
     def test_lsp_check_marks_missing_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -115,6 +129,18 @@ class LspSetupTests(unittest.TestCase):
 
         self.assertEqual(plan.target_path, str(root.resolve()))
         self.assertTrue(any(server.status == "missing" for server in plan.servers))
+
+    def test_quickcontext_exposes_lsp_sessions_and_shutdown(self) -> None:
+        with QuickContext(EngineConfig()) as qc:
+            qc._parser_service = mock.Mock()
+            qc._parser_service.lsp_sessions.return_value = {"sessions": [{"server_name": "rust-analyzer"}]}
+            qc._parser_service.lsp_shutdown_all.return_value = {"stopped_sessions": 1}
+
+            sessions = qc.lsp_sessions()
+            stopped = qc.lsp_shutdown_all()
+
+        self.assertEqual(sessions["sessions"][0]["server_name"], "rust-analyzer")
+        self.assertEqual(stopped["stopped_sessions"], 1)
 
     def test_lsp_check_preserves_install_steps_for_missing_servers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

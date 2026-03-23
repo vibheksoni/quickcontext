@@ -13,6 +13,9 @@ use super::types;
 
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 
 pub struct LspClient {
@@ -35,7 +38,9 @@ impl LspClient {
         spec: &'static LspServerSpec,
         project_root: &str,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(spec.binary);
+        let command_path = super::registry::resolve_binary(spec.binary)
+            .unwrap_or_else(|| spec.binary.to_string());
+        let mut cmd = Command::new(&command_path);
         for arg in spec.args {
             cmd.arg(arg);
         }
@@ -43,9 +48,11 @@ impl LspClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
 
         let mut child = cmd.spawn().map_err(|e| {
-            format!("failed to spawn {}: {e}", spec.binary)
+            format!("failed to spawn {} (resolved as {}): {e}", spec.binary, command_path)
         })?;
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
@@ -222,15 +229,22 @@ impl LspClient {
     ///
     /// Sends `shutdown` request, waits for acknowledgement, then sends `exit` notification.
     pub async fn shutdown(&mut self) -> Result<(), String> {
-        if !self.initialized {
-            return Ok(());
+        if self.initialized {
+            let _ = self.request("shutdown", None).await;
+            let _ = self.notify("exit", None).await;
+            self.initialized = false;
+
+            eprintln!("[lsp:{}] shutdown", self.spec.name);
         }
 
-        let _ = self.request("shutdown", None).await;
-        let _ = self.notify("exit", None).await;
-        self.initialized = false;
-
-        eprintln!("[lsp:{}] shutdown", self.spec.name);
+        match timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(format!("failed waiting for {}: {e}", self.spec.name)),
+            Err(_) => {
+                let _ = self.child.start_kill();
+                let _ = timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await;
+            }
+        }
         Ok(())
     }
 
@@ -290,6 +304,11 @@ impl LspClient {
     /// Whether the server has completed initialization.
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Get the child process id for the language server.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.id()
     }
 
     /// Go to definition of the symbol at the given position.

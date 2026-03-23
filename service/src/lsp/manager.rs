@@ -10,6 +10,17 @@ use super::registry;
 type ClientKey = (String, String);
 
 
+#[derive(Debug, Clone)]
+pub struct LspSessionInfo {
+    pub server_name: String,
+    pub language_id: String,
+    pub project_root: String,
+    pub pid: Option<u32>,
+    pub initialized: bool,
+    pub alive: bool,
+}
+
+
 pub struct LspManager {
     clients: HashMap<ClientKey, LspClient>,
 }
@@ -99,10 +110,18 @@ impl LspManager {
     }
 
     /// List all active language server sessions.
-    pub fn active_sessions(&self) -> Vec<(&str, &str)> {
-        self.clients
-            .values()
-            .map(|c| (c.spec().name, c.project_root()))
-            .collect()
+    pub fn active_sessions(&mut self) -> Vec<LspSessionInfo> {
+        let mut out = Vec::with_capacity(self.clients.len());
+        for ((project_root, language_id), client) in self.clients.iter_mut() {
+            out.push(LspSessionInfo {
+                server_name: client.spec().name.to_string(),
+                language_id: language_id.clone(),
+                project_root: project_root.clone(),
+                pid: client.process_id(),
+                initialized: client.is_initialized(),
+                alive: client.is_alive(),
+            });
+        }
+        out
     }
 }

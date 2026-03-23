@@ -2772,6 +2772,34 @@ class RustParserService:
 
         return self._client.lsp_workspace_symbols(query, input_file)
 
+    def lsp_sessions(
+        self,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """
+        List active LSP server sessions tracked by the Rust service.
+        """
+        if ensure_server:
+            self._client.ensure_server(timeout_ms=timeout_ms)
+        elif not self.connected:
+            self.connect(timeout_ms=timeout_ms)
+        return self._client.lsp_sessions()
+
+    def lsp_shutdown_all(
+        self,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """
+        Shut down all active LSP server sessions tracked by the Rust service.
+        """
+        if ensure_server:
+            self._client.ensure_server(timeout_ms=timeout_ms)
+        elif not self.connected:
+            self.connect(timeout_ms=timeout_ms)
+        return self._client.lsp_shutdown_all()
+
 
 def _default_service_path() -> Optional[str]:
     """

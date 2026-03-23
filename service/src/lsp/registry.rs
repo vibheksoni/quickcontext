@@ -428,16 +428,33 @@ pub fn detect_language_from_path(file_path: &str) -> Option<&'static str> {
 /// Check if a binary is available on PATH.
 ///
 /// binary: &str — Binary name to search for.
-pub fn find_binary(binary: &str) -> bool {
-    let locator = if cfg!(windows) { "where" } else { "which" };
+pub fn resolve_binary(binary: &str) -> Option<String> {
+    if binary == "rust-analyzer" {
+        if let Ok(output) = Command::new("rustup").args(["which", binary]).output() {
+            if output.status.success() {
+                let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !resolved.is_empty() {
+                    return Some(resolved);
+                }
+            }
+        }
+    }
 
-    Command::new(locator)
-        .arg(binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg(binary).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
+}
+
+pub fn find_binary(binary: &str) -> bool {
+    resolve_binary(binary).is_some()
 }
 
 

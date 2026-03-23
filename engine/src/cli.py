@@ -2741,6 +2741,48 @@ def lsp_workspace_symbols(ctx: click.Context, query: str, file: Path | None) -> 
     console.print_json(json.dumps(result, indent=2))
 
 
+@cli.command("lsp-sessions")
+@click.pass_context
+def lsp_sessions(ctx: click.Context) -> None:
+    """
+    List active language-server sessions tracked by the Rust service.
+    """
+    config = ctx.obj["config"]
+    qc = QuickContext(config)
+
+    try:
+        result = qc.lsp_sessions()
+    except Exception as exc:
+        console.print(f"[red]LSP sessions failed:[/red] {exc}")
+        sys.exit(1)
+    finally:
+        qc.close()
+
+    import json
+    console.print_json(json.dumps(result, indent=2))
+
+
+@cli.command("lsp-shutdown-all")
+@click.pass_context
+def lsp_shutdown_all(ctx: click.Context) -> None:
+    """
+    Shut down all active language-server sessions tracked by the Rust service.
+    """
+    config = ctx.obj["config"]
+    qc = QuickContext(config)
+
+    try:
+        result = qc.lsp_shutdown_all()
+    except Exception as exc:
+        console.print(f"[red]LSP shutdown-all failed:[/red] {exc}")
+        sys.exit(1)
+    finally:
+        qc.close()
+
+    import json
+    console.print_json(json.dumps(result, indent=2))
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Show what would be deleted without actually deleting.")
 @click.pass_context

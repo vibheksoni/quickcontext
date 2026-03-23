@@ -74,6 +74,7 @@ Important config ideas:
 - Rust extraction also reuses compiled tree-sitter queries across parses to reduce repeated extractor overhead
 - fast indexing now downgrades obvious large minified JavaScript bundle artifacts to a small number of coarse file chunks before deep extraction so generated trees do not pay full parser cost for low-value bundles
 - generated artifact chunks now prepend a deterministic semantic projection of extracted services, methods, types, fields, and relevant strings so semantic retrieval has better signal on dist-heavy JavaScript bundles even when fast mode skips full symbol extraction
+- when Rust extraction returns no symbols for a file and a ready language server exists for that language, the SDK now opportunistically enriches that file with LSP document symbols before chunking so indexing can still use AST-backed structure instead of falling back straight to whole-file chunks
 - `index_directory(...)` and `refresh_files(...)` now expose real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and Qdrant upsert
 
 ## Important Python Modules
@@ -103,6 +104,8 @@ Useful SDK retrieval primitives:
 - `QuickContext.get_operation_status(...)` / `QuickContext.list_operation_statuses(...)`: poll live operation snapshots with stage, files remaining, chunk counts, description progress, embedding progress, and Qdrant upsert progress
 - `QuickContext.warm_project(...)`: preload persisted Rust symbol and text indices for a project root before the first real query
 - `QuickContext.start_background_warm(...)`: schedule the same Rust warmup to run once the SDK session goes idle instead of blocking startup
+- `QuickContext.lsp_sessions(...)`: list the active language-server sessions currently tracked by the Rust service, including pid, project root, and live state
+- `QuickContext.lsp_shutdown_all(...)`: explicitly shut down those tracked language-server sessions without stopping the whole Rust service
 - `QuickContext.semantic_search(...)`: main semantic retrieval path; accepts explicit `path=` scoping for external repos when parser/text-first helpers still need the correct root
 - `QuickContext.semantic_search_auto(...)`: semantic-only auto-routing between fast direct retrieval and the deeper bundle path; also accepts explicit `path=` scoping for external repos
 - `QuickContext.structured_search(...)`: typed multi-query retrieval

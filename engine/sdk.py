@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 import time
 from threading import Event, Lock, Thread
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder, CodeChunk
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 from engine.src.parsing import (
     CallGraphTraceResult,
     CallerLookupResult,
+    ExtractedSymbol,
     ExtractionResult,
     ExtractSymbolResult,
     FileEditResult,
@@ -99,6 +100,103 @@ from engine.src.search_modes import BIAS_NAMES, SearchBias, apply_bias, get_bias
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _UNDERSCORE_SPLIT_PATTERN = re.compile(r"_+")
 _CAMEL_BOUNDARY_PATTERN = re.compile(r"([a-z0-9])([A-Z])")
+_LSP_SYMBOL_KIND_MAP = {
+    1: "file",
+    2: "module",
+    3: "namespace",
+    4: "package",
+    5: "class",
+    6: "method",
+    7: "property",
+    8: "field",
+    9: "constructor",
+    10: "enum",
+    11: "interface",
+    12: "function",
+    13: "variable",
+    14: "constant",
+    15: "string",
+    16: "number",
+    17: "boolean",
+    18: "array",
+    19: "object",
+    20: "key",
+    21: "null",
+    22: "enum_member",
+    23: "struct",
+    24: "event",
+    25: "operator",
+    26: "type_parameter",
+}
+_LSP_SKIPPED_KINDS = {
+    "string",
+    "number",
+    "boolean",
+    "array",
+    "object",
+    "key",
+    "null",
+    "event",
+    "operator",
+    "type_parameter",
+}
+_LSP_HIGH_SIGNAL_KINDS = {
+    "module",
+    "namespace",
+    "package",
+    "class",
+    "method",
+    "property",
+    "field",
+    "constructor",
+    "enum",
+    "interface",
+    "function",
+    "enum_member",
+    "struct",
+}
+_LSP_LANGUAGE_ALIASES = {
+    "bash": {"bash"},
+    "c": {"c"},
+    "c_sharp": {"csharp"},
+    "cpp": {"c"},
+    "cxx": {"c"},
+    "css": {"css"},
+    "dockerfile": {"dockerfile"},
+    "elixir": {"elixir"},
+    "erlang": {"erlang"},
+    "go": {"go"},
+    "haskell": {"haskell"},
+    "html": {"html"},
+    "java": {"java"},
+    "javascript": {"typescript"},
+    "json": {"json"},
+    "jsonc": {"json"},
+    "jsx": {"typescript"},
+    "kotlin": {"kotlin"},
+    "lua": {"lua"},
+    "markdown": {"markdown"},
+    "nim": {"nim"},
+    "ocaml": {"ocaml"},
+    "perl": {"perl"},
+    "php": {"php"},
+    "python": {"python"},
+    "r": {"r"},
+    "ruby": {"ruby", "ruby_solargraph"},
+    "rust": {"rust"},
+    "scala": {"scala"},
+    "svelte": {"svelte"},
+    "swift": {"swift"},
+    "terraform": {"terraform"},
+    "toml": {"toml"},
+    "tsx": {"typescript"},
+    "typescript": {"typescript"},
+    "verilog": {"verilog"},
+    "vhdl": {"vhdl"},
+    "vue": {"vue"},
+    "yaml": {"yaml"},
+    "zig": {"zig"},
+}
 
 
 def _human_readable_bytes(num_bytes: int) -> str:
@@ -149,6 +247,7 @@ class QuickContext:
         self._file_caches: dict[str, FileSignatureCache] = {}
         self._symbol_file_compact_cache: dict[str, tuple[int, int, list]] = {}
         self._symbol_file_extract_cache: dict[str, tuple[int, int, list]] = {}
+        self._lsp_ready_language_cache: dict[str, set[str]] = {}
         self._reranker: "ColBERTReranker | None" = None
         self._activity_lock = Lock()
         self._active_operations = 0
@@ -1319,6 +1418,32 @@ class QuickContext:
         return self.parser_service.lsp_workspace_symbols(
             query=query, file=file,
             ensure_server=ensure_server, timeout_ms=timeout_ms,
+        )
+
+    def lsp_sessions(
+        self,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """
+        List active LSP server sessions tracked by the Rust service.
+        """
+        return self.parser_service.lsp_sessions(
+            ensure_server=ensure_server,
+            timeout_ms=timeout_ms,
+        )
+
+    def lsp_shutdown_all(
+        self,
+        ensure_server: bool = True,
+        timeout_ms: int = 10000,
+    ) -> dict:
+        """
+        Shut down all active LSP server sessions tracked by the Rust service.
+        """
+        return self.parser_service.lsp_shutdown_all(
+            ensure_server=ensure_server,
+            timeout_ms=timeout_ms,
         )
 
     def semantic_search(
@@ -3307,6 +3432,222 @@ class QuickContext:
             return file_path[4:]
         return file_path
 
+    def _lsp_ready_language_ids(self, path: str | Path) -> set[str]:
+        """
+        Return the set of language ids with a ready or installed LSP for the target path.
+        """
+        resolved = str(Path(path).resolve())
+        cached = self._lsp_ready_language_cache.get(resolved)
+        if cached is not None:
+            return cached
+
+        try:
+            plan = self.lsp_check(resolved)
+        except Exception:
+            ready: set[str] = set()
+        else:
+            ready = {
+                str(server.language_id)
+                for server in plan.servers
+                if str(server.status).lower() in {"ready", "installed"}
+            }
+        self._lsp_ready_language_cache[resolved] = ready
+        return ready
+
+    def _language_lsp_aliases(self, language: str) -> set[str]:
+        """
+        Map parser language names to one or more LSP language ids.
+        """
+        normalized = str(language or "").strip().lower().replace("-", "_")
+        aliases = _LSP_LANGUAGE_ALIASES.get(normalized)
+        if aliases is not None:
+            return aliases
+        if normalized:
+            return {normalized}
+        return set()
+
+    def _file_text_and_offsets(self, file_path: str) -> tuple[str, list[int]]:
+        """
+        Read file text once and compute line-start character offsets.
+        """
+        text = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+        offsets = [0]
+        for idx, char in enumerate(text):
+            if char == "\n":
+                offsets.append(idx + 1)
+        return text, offsets
+
+    def _position_to_char_offset(
+        self,
+        line_offsets: list[int],
+        text: str,
+        line: int,
+        character: int,
+    ) -> int:
+        """
+        Convert an LSP line/character position to a character offset.
+        """
+        if not line_offsets:
+            return 0
+        safe_line = max(0, min(int(line), len(line_offsets) - 1))
+        line_start = line_offsets[safe_line]
+        line_end = line_offsets[safe_line + 1] if safe_line + 1 < len(line_offsets) else len(text)
+        return max(line_start, min(line_start + max(0, int(character)), line_end))
+
+    def _flatten_lsp_document_symbols(
+        self,
+        nodes: list[Any],
+        parent: str | None = None,
+    ) -> list[tuple[dict[str, Any], str | None]]:
+        """
+        Flatten hierarchical LSP document symbols into a parent-aware list.
+        """
+        flattened: list[tuple[dict[str, Any], str | None]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            flattened.append((node, parent))
+            child_parent = str(node.get("name", "") or "").strip() or parent
+            children = node.get("children")
+            if isinstance(children, list) and children:
+                flattened.extend(self._flatten_lsp_document_symbols(children, parent=child_parent))
+        return flattened
+
+    def _lsp_symbols_to_extracted_symbols(
+        self,
+        file_path: str,
+        language: str,
+        payload: Any,
+    ) -> list[ExtractedSymbol]:
+        """
+        Convert LSP document symbols into extracted-symbol records for chunking.
+        """
+        if not isinstance(payload, list):
+            return []
+
+        try:
+            text, line_offsets = self._file_text_and_offsets(file_path)
+        except Exception:
+            return []
+
+        out: list[ExtractedSymbol] = []
+        seen_ranges: set[tuple[str, int, int]] = set()
+        for node, parent in self._flatten_lsp_document_symbols(payload):
+            name = str(node.get("name", "") or "").strip()
+            if not name:
+                continue
+            kind = _LSP_SYMBOL_KIND_MAP.get(int(node.get("kind", 0) or 0), "symbol")
+            if kind in _LSP_SKIPPED_KINDS:
+                continue
+
+            node_range = node.get("range")
+            if not isinstance(node_range, dict):
+                continue
+            start = node_range.get("start") or {}
+            end = node_range.get("end") or {}
+            start_line = int(start.get("line", 0) or 0)
+            end_line = int(end.get("line", start_line) or start_line)
+            start_char = int(start.get("character", 0) or 0)
+            end_char = int(end.get("character", 0) or 0)
+
+            char_start = self._position_to_char_offset(line_offsets, text, start_line, start_char)
+            char_end = self._position_to_char_offset(line_offsets, text, end_line, end_char)
+            if char_end <= char_start:
+                fallback_line = min(end_line + 1, len(line_offsets) - 1)
+                char_end = self._position_to_char_offset(line_offsets, text, fallback_line, 0)
+            if char_end <= char_start:
+                continue
+
+            source = text[char_start:char_end].strip()
+            if not source:
+                continue
+
+            range_key = (name, char_start, char_end)
+            if range_key in seen_ranges:
+                continue
+            seen_ranges.add(range_key)
+
+            byte_start = len(text[:char_start].encode("utf-8"))
+            byte_end = len(text[:char_end].encode("utf-8"))
+            detail = node.get("detail")
+            signature = str(detail).strip() if detail is not None and str(detail).strip() else None
+            out.append(
+                ExtractedSymbol(
+                    name=name,
+                    kind=kind,
+                    language=language,
+                    file_path=file_path,
+                    line_start=start_line,
+                    line_end=max(start_line, end_line),
+                    byte_start=byte_start,
+                    byte_end=byte_end,
+                    source=source,
+                    signature=signature,
+                    docstring=None,
+                    params=None,
+                    return_type=None,
+                    parent=parent,
+                    visibility=None,
+                    role=None,
+                )
+            )
+
+        if len(out) > 48:
+            preferred = [symbol for symbol in out if symbol.kind in _LSP_HIGH_SIGNAL_KINDS]
+            if preferred:
+                out = preferred
+
+        return out
+
+    def _enrich_extraction_results_with_lsp_symbols(
+        self,
+        results: list[ExtractionResult],
+        root_path: str | Path,
+    ) -> tuple[list[ExtractionResult], int]:
+        """
+        Fill empty parser extraction results with LSP document symbols when a ready server exists.
+        """
+        if not results:
+            return results, 0
+
+        candidates = [
+            result
+            for result in results
+            if not result.symbols and not result.errors and self._language_lsp_aliases(result.language)
+        ]
+        if not candidates:
+            return results, 0
+
+        ready_language_ids = self._lsp_ready_language_ids(root_path)
+        if not ready_language_ids:
+            return results, 0
+
+        enriched_count = 0
+        enriched_results: list[ExtractionResult] = []
+        for result in results:
+            aliases = self._language_lsp_aliases(result.language)
+            if result.symbols or result.errors or not aliases.intersection(ready_language_ids):
+                enriched_results.append(result)
+                continue
+
+            try:
+                payload = self.lsp_symbols(result.file_path)
+                lsp_symbols = self._lsp_symbols_to_extracted_symbols(
+                    file_path=result.file_path,
+                    language=result.language,
+                    payload=payload,
+                )
+            except Exception:
+                lsp_symbols = []
+
+            if lsp_symbols:
+                enriched_results.append(replace(result, symbols=lsp_symbols))
+                enriched_count += 1
+            else:
+                enriched_results.append(result)
+
+        return enriched_results, enriched_count
+
     def _load_file_compact_symbols(self, file_path: str) -> list:
         """
         Load compact extracted symbols for one file with stat-based cache invalidation.
@@ -4218,6 +4559,12 @@ class QuickContext:
             for entry in extraction_entries:
                 extracted_candidates.extend(self.extract_symbols(entry.file_path))
         extract_stage_duration_seconds = time.time() - extract_started
+        extracted_candidates, lsp_enriched_files = self._enrich_extraction_results_with_lsp_symbols(
+            extracted_candidates,
+            root_path=directory,
+        )
+        if show_progress and lsp_enriched_files > 0:
+            print(f"Enriched {lsp_enriched_files} files with LSP document symbols")
 
         for result in extracted_candidates:
             file_cache.update_from_extraction(
@@ -4244,7 +4591,10 @@ class QuickContext:
                 files_analyzed=len(changed_results),
                 artifact_downgraded_files=artifact_downgraded_files,
                 symbols_extracted=sum(len(result.symbols) for result in changed_results),
-                message=f"Prepared {len(changed_results)} changed files for indexing",
+                message=(
+                    f"Prepared {len(changed_results)} changed files for indexing"
+                    + (f" ({lsp_enriched_files} LSP-enriched)" if lsp_enriched_files else "")
+                ),
             )
 
         if show_progress and unchanged_files > 0:
@@ -4843,9 +5193,10 @@ class QuickContext:
         if not resolved_paths:
             raise ValueError("No file paths provided")
 
-        detected_project = detect_project_name(Path(resolved_paths[0]).parent, manual_override=project_name)
+        lsp_enrich_root = Path(resolved_paths[0]).parent
+        detected_project = detect_project_name(lsp_enrich_root, manual_override=project_name)
         indexer = self._get_indexer(detected_project)
-        file_cache = self._get_file_cache(Path(resolved_paths[0]).parent)
+        file_cache = self._get_file_cache(lsp_enrich_root)
         existing_paths: list[str] = []
         deleted_paths: list[str] = []
         for fp in resolved_paths:
@@ -5028,6 +5379,10 @@ class QuickContext:
                 ]
             else:
                 results = self.extract_symbols(file_path)
+                results, _ = self._enrich_extraction_results_with_lsp_symbols(
+                    results,
+                    root_path=lsp_enrich_root,
+                )
             extract_stage_duration_seconds += time.time() - extract_started
             chunk_started = time.time()
             new_chunks = self.chunker.build_chunks(results)

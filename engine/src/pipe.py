@@ -1280,6 +1280,20 @@ class PipeClient:
             raise PipeError(resp.get("message", "lsp workspace symbols failed"))
         return resp.get("data", {})
 
+    def lsp_sessions(self) -> dict:
+        """List active LSP server sessions tracked by the service."""
+        resp = self.request({"method": "lsp_sessions"})
+        if resp.get("status") == "error":
+            raise PipeError(resp.get("message", "lsp sessions failed"))
+        return resp.get("data", {})
+
+    def lsp_shutdown_all(self) -> dict:
+        """Shut down all tracked LSP server sessions."""
+        resp = self.request({"method": "lsp_shutdown_all"})
+        if resp.get("status") == "error":
+            raise PipeError(resp.get("message", "lsp shutdown all failed"))
+        return resp.get("data", {})
+
     def shutdown(self) -> None:
         """Send a shutdown request to the server, then close the transport."""
         try:

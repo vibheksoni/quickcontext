@@ -181,6 +181,12 @@ async fn run_windows() -> std::io::Result<()> {
         }
     }
 
+    {
+        let mgr = lsp::manager::global();
+        let mut mgr = mgr.lock().await;
+        mgr.shutdown_all().await;
+    }
+
     Ok(())
 }
 
@@ -227,6 +233,12 @@ async fn run_unix() -> std::io::Result<()> {
                 });
             }
         }
+    }
+
+    {
+        let mgr = lsp::manager::global();
+        let mut mgr = mgr.lock().await;
+        mgr.shutdown_all().await;
     }
 
     Ok(())
@@ -562,6 +574,8 @@ async fn dispatch(req: Request, specs: &[LanguageSpec], cancel: &CancellationTok
             record_undo.unwrap_or(true),
         ),
         Request::Ping => Response::ok_data(serde_json::json!("pong")),
+        Request::LspSessions => handle_lsp_sessions().await,
+        Request::LspShutdownAll => handle_lsp_shutdown_all().await,
         Request::Shutdown => {
             eprintln!("[quickcontext] shutdown requested");
             cancel.cancel();
@@ -863,6 +877,36 @@ async fn handle_lsp_workspace_symbols(query: &str, file: Option<&str>) -> Respon
         Ok(val) => Response::ok_data(val),
         Err(e) => Response::error(e),
     }
+}
+
+
+async fn handle_lsp_sessions() -> Response {
+    let mgr = lsp::manager::global();
+    let mut mgr = mgr.lock().await;
+    let sessions = mgr.active_sessions();
+    let rows: Vec<serde_json::Value> = sessions
+        .into_iter()
+        .map(|session| serde_json::json!({
+            "server_name": session.server_name,
+            "language_id": session.language_id,
+            "project_root": session.project_root,
+            "pid": session.pid,
+            "initialized": session.initialized,
+            "alive": session.alive,
+        }))
+        .collect();
+    Response::ok_data(serde_json::json!({ "sessions": rows }))
+}
+
+
+async fn handle_lsp_shutdown_all() -> Response {
+    let mgr = lsp::manager::global();
+    let mut mgr = mgr.lock().await;
+    let session_count = mgr.active_sessions().len();
+    mgr.shutdown_all().await;
+    Response::ok_data(serde_json::json!({
+        "stopped_sessions": session_count,
+    }))
 }
 
 

@@ -1210,6 +1210,217 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("trial", description.keywords)
         self.assertIn("eligibility", description.keywords)
 
+    def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                file_path = Path(tmp) / "sample.rs"
+                file_path.write_text(
+                    "struct App;\n\nimpl App {\n    fn serve(&self) {\n        println!(\"ok\");\n    }\n}\n",
+                    encoding="utf-8",
+                )
+                payload = [
+                    {
+                        "name": "App",
+                        "kind": 23,
+                        "detail": "struct App",
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 11},
+                        },
+                        "selectionRange": {
+                            "start": {"line": 0, "character": 7},
+                            "end": {"line": 0, "character": 10},
+                        },
+                        "children": [
+                            {
+                                "name": "serve",
+                                "kind": 6,
+                                "detail": "fn(&self)",
+                                "range": {
+                                    "start": {"line": 3, "character": 4},
+                                    "end": {"line": 5, "character": 5},
+                                },
+                                "selectionRange": {
+                                    "start": {"line": 3, "character": 7},
+                                    "end": {"line": 3, "character": 12},
+                                },
+                            }
+                        ],
+                    }
+                ]
+
+                symbols = qc._lsp_symbols_to_extracted_symbols(
+                    file_path=str(file_path.resolve()),
+                    language="rust",
+                    payload=payload,
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual([item.name for item in symbols], ["App", "serve"])
+        self.assertEqual(symbols[0].kind, "struct")
+        self.assertEqual(symbols[1].kind, "method")
+        self.assertEqual(symbols[1].parent, "App")
+        self.assertIn("fn serve", symbols[1].source)
+
+    def test_lsp_symbols_to_extracted_symbols_prefers_high_signal_kinds_when_outline_is_large(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                file_path = Path(tmp) / "sample.rs"
+                lines = [f"const VALUE_{idx}: usize = {idx};" for idx in range(50)]
+                lines.extend(
+                    [
+                        "",
+                        "fn serve() {",
+                        "    println!(\"ok\");",
+                        "}",
+                    ]
+                )
+                file_path.write_text("\n".join(lines), encoding="utf-8")
+                payload = [
+                    {
+                        "name": f"VALUE_{idx}",
+                        "kind": 14,
+                        "range": {
+                            "start": {"line": idx, "character": 0},
+                            "end": {"line": idx, "character": len(lines[idx])},
+                        },
+                        "selectionRange": {
+                            "start": {"line": idx, "character": 6},
+                            "end": {"line": idx, "character": 13},
+                        },
+                    }
+                    for idx in range(50)
+                ]
+                payload.append(
+                    {
+                        "name": "serve",
+                        "kind": 12,
+                        "detail": "fn serve()",
+                        "range": {
+                            "start": {"line": 51, "character": 0},
+                            "end": {"line": 53, "character": 1},
+                        },
+                        "selectionRange": {
+                            "start": {"line": 51, "character": 3},
+                            "end": {"line": 51, "character": 8},
+                        },
+                    }
+                )
+                symbols = qc._lsp_symbols_to_extracted_symbols(
+                    file_path=str(file_path.resolve()),
+                    language="rust",
+                    payload=payload,
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual([item.name for item in symbols], ["serve"])
+
+    def test_enrich_extraction_results_with_lsp_symbols_uses_ready_language(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                file_path = Path(tmp) / "sample.rs"
+                file_path.write_text("fn serve() {\n    println!(\"ok\");\n}\n", encoding="utf-8")
+                result = ExtractionResult(
+                    file_path=str(file_path.resolve()),
+                    language="rust",
+                    symbols=[],
+                    errors=[],
+                    file_hash="hash",
+                    file_size=file_path.stat().st_size,
+                    file_mtime=int(file_path.stat().st_mtime),
+                )
+                payload = [
+                    {
+                        "name": "serve",
+                        "kind": 12,
+                        "detail": "fn serve()",
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 2, "character": 1},
+                        },
+                        "selectionRange": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 8},
+                        },
+                    }
+                ]
+                with mock.patch.object(qc, "_lsp_ready_language_ids", return_value={"rust"}), mock.patch.object(
+                    qc,
+                    "lsp_symbols",
+                    return_value=payload,
+                ) as lsp_symbols:
+                    enriched, count = qc._enrich_extraction_results_with_lsp_symbols(
+                        [result],
+                        root_path=file_path.parent,
+                    )
+        finally:
+            qc.close()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(enriched[0].symbols[0].name, "serve")
+        lsp_symbols.assert_called_once()
+
+    def test_enrich_extraction_results_with_lsp_symbols_skips_unready_languages(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            result = ExtractionResult(
+                file_path="sample.py",
+                language="python",
+                symbols=[],
+                errors=[],
+                file_hash="hash",
+                file_size=10,
+                file_mtime=0,
+            )
+            with mock.patch.object(qc, "_lsp_ready_language_ids", return_value={"rust"}), mock.patch.object(
+                qc,
+                "lsp_symbols",
+                side_effect=AssertionError("lsp_symbols should not run"),
+            ):
+                enriched, count = qc._enrich_extraction_results_with_lsp_symbols([result], root_path=".")
+        finally:
+            qc.close()
+
+        self.assertEqual(count, 0)
+        self.assertEqual(enriched[0].symbols, [])
+
     def test_merge_related_edges_deduplicates_related_files(self) -> None:
         qc = QuickContext(
             EngineConfig(

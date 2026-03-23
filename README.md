@@ -42,6 +42,7 @@ When the repo you want to inspect is outside the process cwd, pass that repo roo
 Full alias/shadow indexing now writes a local resume manifest under `.quickcontext/`, so if indexing is interrupted it can reuse the in-progress shadow collection instead of discarding files that were already upserted.
 When `fast=True`, the indexer now downgrades obvious large minified JavaScript bundle artifacts to a small number of coarse file chunks before deep extraction. That keeps generated trees indexable without paying full parser cost on huge hashed bundles.
 Those generated artifact chunks now also prepend a deterministic semantic projection of extracted services, methods, types, fields, and relevant strings so semantic retrieval has better signal on dist-heavy JavaScript bundles even when fast mode skips full symbol extraction.
+If Rust extraction returns no symbols for a file and a ready language server exists for that language, the SDK now opportunistically enriches that file with LSP document symbols before chunking so indexing can still use AST-backed structure instead of falling back straight to whole-file chunks.
 The indexing stats now include real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and Qdrant upsert.
 
 ## Status
@@ -277,6 +278,8 @@ Useful environment variables:
 ```text
 python -m engine parse .
 python -m engine lsp-setup <path>
+python -m engine lsp-sessions
+python -m engine lsp-shutdown-all
 python -m engine grep "CollectionManager"
 python -m engine skeleton . --markdown
 python -m engine text-search "auth token"
@@ -334,6 +337,8 @@ Notes:
 - Some servers have automatic install commands; others are reported as manual-only with notes.
 - The command checks whether the expected LSP binary is already on `PATH`.
 - `lsp-check` reports `ready`, `missing`, `installed`, or `error` based on binary presence plus a lightweight probe where available.
+- `lsp-sessions` lists the language servers the Rust service is actively tracking, including pid and project root.
+- `lsp-shutdown-all` explicitly shuts down those tracked language-server sessions for cleanup without stopping the whole service.
 
 ## Validation
 

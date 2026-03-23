@@ -271,6 +271,10 @@ pub enum Request {
         #[serde(default)]
         file: Option<String>,
     },
+    #[serde(rename = "lsp_sessions")]
+    LspSessions,
+    #[serde(rename = "lsp_shutdown_all")]
+    LspShutdownAll,
     #[serde(rename = "file_read")]
     FileRead {
         file: String,
