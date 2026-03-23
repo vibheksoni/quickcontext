@@ -7,6 +7,10 @@ import math
 import re
 
 from engine.src.artifact_index import ARTIFACT_FALLBACK_ERROR
+from engine.src.artifact_semantics import (
+    build_artifact_semantic_projection,
+    extract_artifact_semantic_signals,
+)
 from engine.src.parsing import ExtractedSymbol, ExtractionResult
 
 
@@ -169,6 +173,7 @@ class ChunkBuilder:
 
             snippet_bytes = content_bytes[offset:chunk_end]
             snippet_text = snippet_bytes.decode("utf-8", errors="ignore")
+            signals = extract_artifact_semantic_signals(snippet_text, file_name=Path(file_path).name)
             normalized_source = self._normalize_artifact_excerpt(
                 file_path=file_path,
                 chunk_index=chunk_idx,
@@ -182,12 +187,23 @@ class ChunkBuilder:
 
             line_start = content[:offset].count("\n") + 1
             line_end = content[:chunk_end].count("\n") + 1
+            symbol_name = (
+                (signals.methods[0] if signals.methods else None)
+                or (signals.field_names[0] if signals.field_names else None)
+                or f"<artifact_chunk_{chunk_idx}>"
+            )
+            parent = signals.services[0].split(".")[-1] if signals.services else None
+            signature = None
+            if signals.methods:
+                signature = "methods: " + ", ".join(signals.methods[:4])
+            elif signals.field_names:
+                signature = "fields: " + ", ".join(signals.field_names[:4])
             chunk_id = self._generate_chunk_id(
                 file_path,
-                f"<artifact_chunk_{chunk_idx}>",
+                symbol_name,
                 "file_artifact",
-                None,
-                None,
+                parent,
+                signature,
                 offset,
                 chunk_end,
             )
@@ -197,15 +213,15 @@ class ChunkBuilder:
                     source=self._truncate_source(normalized_source),
                     language=language,
                     file_path=file_path,
-                    symbol_name=f"<artifact_chunk_{chunk_idx}>",
+                    symbol_name=symbol_name,
                     symbol_kind="file_artifact",
                     line_start=line_start,
                     line_end=line_end,
                     byte_start=offset,
                     byte_end=chunk_end,
-                    signature=None,
+                    signature=signature,
                     docstring=None,
-                    parent=None,
+                    parent=parent,
                     visibility=None,
                     role="generated",
                     file_hash=resolved_file_hash,
@@ -222,10 +238,22 @@ class ChunkBuilder:
             return [0]
 
         max_start = max(0, total_bytes - window_size)
-        offsets = {
-            int(round((max_start * idx) / max(1, chunk_count - 1)))
-            for idx in range(chunk_count)
-        }
+        target_count = chunk_count
+        if total_bytes > window_size * 2:
+            target_count = max(target_count, 3)
+        if total_bytes > window_size * 6:
+            target_count = max(target_count, 4)
+
+        offsets = {0, max_start}
+        if target_count >= 3:
+            offsets.add(int(round(max_start * 0.5)))
+        if target_count >= 4:
+            offsets.add(int(round(max_start * 0.25)))
+            offsets.add(int(round(max_start * 0.75)))
+
+        if len(offsets) < target_count:
+            for idx in range(target_count):
+                offsets.add(int(round((max_start * idx) / max(1, target_count - 1))))
         return sorted(offsets)
 
     def _normalize_artifact_excerpt(
@@ -240,6 +268,14 @@ class ChunkBuilder:
         """
         Reformat a sampled artifact excerpt so it stays searchable without tripping minified-file heuristics.
         """
+        projection = build_artifact_semantic_projection(
+            source=source,
+            file_path=file_path,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
+            byte_start=byte_start,
+            byte_end=byte_end,
+        )
         normalized = source.replace("\r\n", "\n").replace("\r", "\n")
         normalized = re.sub(r"([;{}])", r"\1\n", normalized)
         lines: list[str] = []
@@ -254,13 +290,10 @@ class ChunkBuilder:
             if len(lines) >= 180:
                 break
 
-        header = (
-            f"Generated bundle artifact excerpt from {Path(file_path).name}\n"
-            f"Chunk {chunk_index + 1} of {chunk_count}\n"
-            f"Approx byte range {byte_start}-{byte_end}\n"
-        )
         body = "\n".join(lines)
-        return f"{header}\n{body}".strip()
+        if body:
+            return f"{projection}\n\nRaw excerpt:\n{body}".strip()
+        return projection
 
     def _symbol_to_chunk(self, symbol: ExtractedSymbol, file_hash: str) -> Optional[CodeChunk]:
         """

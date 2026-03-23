@@ -5,6 +5,7 @@ import json
 import asyncio
 import re
 
+from engine.src.artifact_semantics import extract_artifact_semantic_signals
 from engine.src.chunker import CodeChunk
 
 
@@ -93,6 +94,47 @@ def build_fallback_description(chunk: CodeChunk) -> ChunkDescription:
     """
     path_tail = "/".join(Path(chunk.file_path).parts[-3:])
     docstring_summary = _docstring_summary(chunk.docstring)
+
+    if chunk.symbol_kind == "file_artifact":
+        signals = extract_artifact_semantic_signals(chunk.source, file_name=Path(chunk.file_path).name)
+        summary_bits: list[str] = []
+        if signals.services:
+            summary_bits.append("services " + ", ".join(service.split(".")[-1] for service in signals.services[:2]))
+        if signals.methods:
+            summary_bits.append("methods " + ", ".join(signals.methods[:4]))
+        if signals.field_names:
+            summary_bits.append("fields " + ", ".join(signals.field_names[:5]))
+        if signals.string_literals:
+            summary_bits.append("messages " + " | ".join(signals.string_literals[:2]))
+
+        description = f"Generated {chunk.language} bundle artifact"
+        if path_tail:
+            description += f" from {path_tail}"
+        if summary_bits:
+            description += " exposing " + "; ".join(summary_bits)
+        description += "."
+
+        keywords: list[str] = []
+        for token in [
+            chunk.language,
+            "generated",
+            "bundle",
+            *(signals.keywords[:10]),
+            *_split_identifier_tokens(path_tail, max_tokens=6),
+        ]:
+            if not token or token in keywords:
+                continue
+            keywords.append(token)
+            if len(keywords) >= 12:
+                break
+
+        return ChunkDescription(
+            chunk_id=chunk.chunk_id,
+            description=description,
+            keywords=keywords,
+            token_count=0,
+            cost_usd=0.0,
+        )
 
     if docstring_summary:
         description = docstring_summary

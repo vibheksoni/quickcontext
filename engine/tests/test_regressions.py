@@ -360,6 +360,57 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(filtered)
         self.assertEqual(stats.skipped_minified, 0)
 
+    def test_chunk_builder_artifact_fallback_projects_bundle_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "bundle.12345678.js"
+            bundle_text = """
+            let service = {
+              checkProTrialEligibility: { name: "CheckProTrialEligibility" },
+              subscribeToPlan: { name: "SubscribeToPlan" }
+            };
+            this.checkProTrialEligibility = async (e) =>
+              await this.client.checkProTrialEligibility(new l.KAc({ authToken: e }));
+            this.getPlanStatus = async (e) =>
+              await this.client.getPlanStatus(new l.Dq$({ authToken: e, includeTopUpStatus: !0 }));
+            (sg.typeName = "exa.seat_management_pb.CheckProTrialEligibilityResponse");
+            (sg.fields = a.C.util.newFieldList(() => [
+              { no: 1, name: "is_eligible", kind: "scalar", T: 8 },
+              { no: 2, name: "used_trial", kind: "scalar", T: 8 },
+              { no: 3, name: "windsurf_pro_trial_end_time", kind: "message", T: r.D },
+            ]));
+            "User is not logged in."
+            "API server URL is not set."
+            """.strip()
+            file_path.write_text(bundle_text, encoding="utf-8")
+
+            extraction = ExtractionResult(
+                file_path=str(file_path.resolve()),
+                language="javascript",
+                symbols=[],
+                errors=[ARTIFACT_FALLBACK_ERROR],
+                file_hash="artifact-hash",
+                file_size=file_path.stat().st_size,
+                file_mtime=int(file_path.stat().st_mtime),
+            )
+            builder = ChunkBuilder()
+            chunks = builder.build_chunks([extraction])
+
+        self.assertTrue(chunks)
+        self.assertEqual(chunks[0].symbol_name, "CheckProTrialEligibility")
+        self.assertIn("Methods: CheckProTrialEligibility", chunks[0].source)
+        self.assertIn("Fields: is_eligible, used_trial", chunks[0].source)
+        self.assertIn("keywords: bundle", chunks[0].source.lower())
+        self.assertIn("check, pro, trial", chunks[0].source.lower())
+
+    def test_artifact_sampling_includes_midpoint_for_large_bundles(self) -> None:
+        builder = ChunkBuilder(artifact_chunk_size=24000, artifact_max_chunks=8)
+        offsets = builder._artifact_sample_offsets(total_bytes=900000, window_size=24000, chunk_count=2)
+        self.assertEqual(offsets[0], 0)
+        self.assertEqual(offsets[-1], 876000)
+        self.assertIn(438000, offsets)
+        self.assertGreaterEqual(len(offsets), 3)
+
     def test_dual_embedder_parallelizes_remote_code_and_description_embeddings(self) -> None:
         chunk = CodeChunk(
             chunk_id="chunk-1",
@@ -1122,6 +1173,42 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("engine/src/searcher.py", description.description.replace("\\", "/"))
         self.assertIn("query", description.keywords)
         self.assertIn("searcher", description.keywords)
+
+    def test_fallback_description_uses_artifact_semantic_projection(self) -> None:
+        chunk = CodeChunk(
+            chunk_id="chunk-1",
+            source=(
+                "Generated bundle artifact from bundle.12345678.js\n"
+                "Chunk 1 of 1\n"
+                "Approx byte range 0-512\n"
+                "Services: exa.seat_management_pb.SeatManagementService\n"
+                "Methods: CheckProTrialEligibility, SubscribeToPlan, GetPlanStatus\n"
+                "Types: exa.seat_management_pb.CheckProTrialEligibilityResponse\n"
+                "Fields: is_eligible, used_trial, on_trial, windsurf_pro_trial_end_time\n"
+                "Keywords: trial, eligibility, plan, billing, auth, token, windsurf\n"
+                "Strings: User is not logged in. | API server URL is not set.\n"
+            ),
+            language="javascript",
+            file_path=str(Path("windsurf.com/_next/static/chunks/7805-75cc1319b82a8bdf.js").resolve()),
+            symbol_name="CheckProTrialEligibility",
+            symbol_kind="file_artifact",
+            line_start=1,
+            line_end=20,
+            byte_start=0,
+            byte_end=512,
+            signature="methods: CheckProTrialEligibility, SubscribeToPlan",
+            docstring=None,
+            parent="SeatManagementService",
+            visibility=None,
+            role="generated",
+            file_hash="hash",
+        )
+
+        description = build_fallback_description(chunk)
+        self.assertIn("CheckProTrialEligibility", description.description)
+        self.assertIn("used_trial", description.description)
+        self.assertIn("trial", description.keywords)
+        self.assertIn("eligibility", description.keywords)
 
     def test_merge_related_edges_deduplicates_related_files(self) -> None:
         qc = QuickContext(
