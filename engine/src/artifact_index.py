@@ -118,6 +118,17 @@ def should_downgrade_artifact_profile(profile: ArtifactIndexProfile) -> bool:
     if language not in {"javascript", "typescript", "tsx", "jsx"}:
         return False
 
+    # Large hashed bundles are often transpiled/generated even when they are not
+    # technically minified into a few giant lines. These files still explode the
+    # symbol/chunk count while carrying relatively low retrieval value.
+    if (
+        profile.bundle_like_name
+        and profile.file_size >= 256 * 1024
+        and profile.line_count >= 6000
+        and profile.avg_line_length >= 28
+    ):
+        return True
+
     if not profile.raw_minified_like:
         return False
 

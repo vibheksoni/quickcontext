@@ -155,7 +155,7 @@ class ChunkBuilder:
 
         desired_chunks = min(
             self._artifact_max_chunks,
-            max(1, math.ceil(total_bytes / (2 * 1024 * 1024))),
+            max(1, math.ceil(total_bytes / (512 * 1024))),
         )
         window_size = min(self._artifact_chunk_size, self._max_chunk_bytes)
         offsets = self._artifact_sample_offsets(total_bytes, window_size, desired_chunks)

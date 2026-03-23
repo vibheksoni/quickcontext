@@ -316,6 +316,22 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(should_downgrade_artifact_profile(downgraded))
         self.assertFalse(should_downgrade_artifact_profile(kept))
 
+    def test_should_downgrade_large_hashed_generated_bundle_even_without_minified_lines(self) -> None:
+        generated_bundle = ArtifactIndexProfile(
+            file_path="assets/7805-75cc1319b82a8bdf.js",
+            language="javascript",
+            file_size=900 * 1024,
+            file_mtime=0,
+            file_hash="hash",
+            line_count=18000,
+            max_line_length=140,
+            avg_line_length=35.0,
+            whitespace_ratio=0.11,
+            raw_minified_like=False,
+            bundle_like_name=True,
+        )
+        self.assertTrue(should_downgrade_artifact_profile(generated_bundle))
+
     def test_chunk_builder_artifact_fallback_creates_coarse_searchable_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
