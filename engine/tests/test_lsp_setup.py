@@ -115,3 +115,15 @@ class LspSetupTests(unittest.TestCase):
 
         self.assertEqual(plan.target_path, str(root.resolve()))
         self.assertTrue(any(server.status == "missing" for server in plan.servers))
+
+    def test_lsp_check_preserves_install_steps_for_missing_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "requirements.txt").write_text("requests\n", encoding="utf-8")
+            (root / "app.py").write_text("print('hello')\n", encoding="utf-8")
+            with mock.patch("engine.src.lsp_setup.shutil.which", return_value=None):
+                plan = build_lsp_check_plan(root)
+
+        by_name = {server.name: server for server in plan.servers}
+        self.assertEqual(by_name["pyright"].status, "missing")
+        self.assertTrue(by_name["pyright"].install_steps)

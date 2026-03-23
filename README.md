@@ -313,11 +313,18 @@ Check readiness after install:
 python -m engine lsp-check "C:/path/to/project"
 ```
 
+One-step guided flow:
+
+```text
+python -m engine lsp-setup "C:/path/to/project" --install --check
+```
+
 Windows PowerShell wrapper:
 
 ```powershell
 .\scripts\setup_project_lsps.ps1 -Path "C:\path\to\project"
 .\scripts\setup_project_lsps.ps1 -Path "C:\path\to\project" -Install
+.\scripts\setup_project_lsps.ps1 -Path "C:\path\to\project" -Install -Check
 ```
 
 Notes:

@@ -174,6 +174,7 @@ LSP setup:
 
 - `python -m engine lsp-setup <path>` detects likely language servers for a target project and prints install commands for missing binaries
 - `python -m engine lsp-setup <path> --install` runs the supported auto-install commands
+- `python -m engine lsp-setup <path> --install --check` runs supported installs and then immediately prints the readiness report
 - `python -m engine lsp-check <path>` reports whether each likely language server is missing, installed, probe-ready, or failing a lightweight probe
 - `scripts/setup_project_lsps.ps1` is the Windows PowerShell wrapper around that CLI command
 
