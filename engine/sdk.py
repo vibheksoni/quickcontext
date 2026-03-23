@@ -101,6 +101,7 @@ from engine.src.search_modes import BIAS_NAMES, SearchBias, apply_bias, get_bias
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _UNDERSCORE_SPLIT_PATTERN = re.compile(r"_+")
 _CAMEL_BOUNDARY_PATTERN = re.compile(r"([a-z0-9])([A-Z])")
+_GENERATED_BUNDLE_NAME_PATTERN = re.compile(r"(?:^|[._-])[0-9a-f]{6,}(?:[._-]|$)")
 _LSP_SYMBOL_KIND_MAP = {
     1: "file",
     2: "module",
@@ -2071,6 +2072,7 @@ class QuickContext:
             limit=limit,
         )
         primary_results = self._text_matches_to_search_results(primary_matches)
+        primary_results = self._focus_generated_file_match_results(query, primary_results)
         import_related = self._text_import_related_files_for_results(
             query=query,
             results=primary_results,
@@ -2103,6 +2105,54 @@ class QuickContext:
             ),
             "related_callers": [],
         }
+
+    def _focus_generated_file_match_results(
+        self,
+        query: str,
+        results: list,
+        max_files: int = 2,
+    ) -> list:
+        """
+        Replace low-signal generated-bundle file matches with a tighter grep-backed focus snippet.
+        """
+        if not results or max_files <= 0:
+            return results
+
+        query_terms = [term for term in extract_keywords(query, max_keywords=6) if len(term) >= 4]
+        if not query_terms:
+            return results
+
+        focused: list = []
+        refined = 0
+        for item in results:
+            file_path = str(getattr(item, "file_path", "") or "")
+            symbol_kind = str(getattr(item, "symbol_kind", "") or "").lower()
+            if (
+                refined >= max_files
+                or symbol_kind != "file_match"
+                or not self._looks_like_generated_bundle_path(file_path)
+            ):
+                focused.append(item)
+                continue
+
+            refined_item = self._focus_single_artifact_result(query_terms=query_terms, item=item, path=file_path)
+            focused.append(refined_item or item)
+            if refined_item is not None:
+                refined += 1
+        return focused
+
+    def _looks_like_generated_bundle_path(self, file_path: str) -> bool:
+        normalized = str(file_path or "").replace("\\", "/")
+        name = Path(normalized).name.lower()
+        return bool(
+            name.endswith(".js")
+            and (
+                _GENERATED_BUNDLE_NAME_PATTERN.search(name)
+                or name.startswith("bundle.")
+                or name.startswith("vendor.")
+                or "~" in name
+            )
+        )
 
     def _text_import_related_files_for_results(
         self,

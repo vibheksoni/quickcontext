@@ -1556,6 +1556,51 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("is_eligible", focused[0].source)
         self.assertEqual(focused[0].line_start, 39)
 
+    def test_focus_generated_file_match_results_uses_file_local_grep_snippet(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            from engine.src.searcher import SearchResult
+
+            match = SearchResult(
+                1.0,
+                "bundle.12345678.js",
+                "bundle.12345678.js",
+                "file_match",
+                1,
+                3,
+                "wrong snippet",
+                "wrong snippet",
+            )
+            grep_match = type(
+                "GrepMatch",
+                (),
+                {
+                    "line_number": 20,
+                    "context_before": ("const a = 1;",),
+                    "line": 'const used_trial = false;',
+                    "context_after": ('const is_eligible = true;',),
+                },
+            )()
+            grep_result = type("GrepResult", (), {"matches": [grep_match]})()
+            with mock.patch.object(qc, "grep_text", return_value=grep_result):
+                focused = qc._focus_generated_file_match_results(
+                    "What are the requirements to start a free trial?",
+                    [match],
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual(focused[0].symbol_name, "<artifact_focus>")
+        self.assertIn("used_trial", focused[0].source)
+
     def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
         qc = QuickContext(
             EngineConfig(
