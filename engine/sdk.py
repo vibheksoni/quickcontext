@@ -16,6 +16,7 @@ from engine.src.artifact_index import (
     analyze_artifact_candidate,
     should_downgrade_artifact_profile,
 )
+from engine.src.artifact_semantics import extract_artifact_semantic_signals
 from engine.src.dedup import (
     DeduplicationResult,
     content_hash,
@@ -1495,7 +1496,7 @@ class QuickContext:
             searcher = self._get_searcher(project, rerank=rerank)
 
             if mode == "code":
-                return searcher.search_code(
+                results = searcher.search_code(
                     query=query,
                     limit=limit,
                     language=language,
@@ -1505,9 +1506,10 @@ class QuickContext:
                     rerank=rerank,
                     include_source=include_source,
                 )
+                return self._focus_artifact_results(query, results, retrieval_root) if include_source else results
 
             if mode == "desc":
-                return searcher.search_description(
+                results = searcher.search_description(
                     query=query,
                     limit=limit,
                     language=language,
@@ -1517,8 +1519,9 @@ class QuickContext:
                     rerank=rerank,
                     include_source=include_source,
                 )
+                return self._focus_artifact_results(query, results, retrieval_root) if include_source else results
 
-            return searcher.search_hybrid(
+            results = searcher.search_hybrid(
                 query=query,
                 limit=limit,
                 language=language,
@@ -1535,6 +1538,7 @@ class QuickContext:
                 rerank_candidate_multiplier=rerank_candidate_multiplier,
                 include_source=include_source,
             )
+            return self._focus_artifact_results(query, results, retrieval_root) if include_source else results
 
     def semantic_search_bundle(
         self,
@@ -1608,6 +1612,8 @@ class QuickContext:
                 )
             related_callers = self._related_callers_for_results(results, path=retrieval_root)
             final_anchors = self._hydrate_search_result_sources(anchors) if include_source else anchors
+            if include_source:
+                final_anchors = self._focus_artifact_results(query, final_anchors, retrieval_root)
 
             return {
                 "query": query,
@@ -1841,6 +1847,7 @@ class QuickContext:
                 raise
             payload["symbol_query"] = None
             if payload.get("mode") == "search":
+                payload["results"] = self._focus_artifact_results(query, payload["results"], retrieval_root)
                 lexical_related = self._lexical_related_files_for_query(
                     query=query,
                     results=payload["results"],
@@ -2790,6 +2797,103 @@ class QuickContext:
             hydrated.append(replace(item, source=source))
         return hydrated
 
+    def _focus_artifact_results(
+        self,
+        query: str,
+        results: list,
+        path: str | Path,
+        max_files: int = 2,
+    ) -> list:
+        """
+        Replace broad artifact blobs with a tighter file-local grep-backed focus snippet.
+        """
+        if not results or max_files <= 0:
+            return results
+
+        query_terms = [term for term in extract_keywords(query, max_keywords=6) if len(term) >= 4]
+        if not query_terms:
+            return results
+
+        focused: list = []
+        refined_files = 0
+        for item in results:
+            if (
+                refined_files >= max_files
+                or str(getattr(item, "symbol_kind", "")).lower() != "file_artifact"
+                or not getattr(item, "file_path", None)
+            ):
+                focused.append(item)
+                continue
+
+            refined = self._focus_single_artifact_result(
+                query_terms=query_terms,
+                item=item,
+                path=path,
+            )
+            focused.append(refined or item)
+            if refined is not None:
+                refined_files += 1
+        return focused
+
+    def _focus_single_artifact_result(
+        self,
+        query_terms: list[str],
+        item: object,
+        path: str | Path,
+    ):
+        """
+        Build a more focused snippet inside one generated artifact file.
+        """
+        file_path = str(getattr(item, "file_path", "") or "")
+        if not file_path:
+            return None
+
+        best_match = None
+        best_score = 0
+        seen_lines: dict[int, dict] = {}
+        for term in query_terms[:4]:
+            try:
+                grep = self.grep_text(
+                    term,
+                    path=file_path,
+                    limit=12,
+                    before_context=2,
+                    after_context=2,
+                )
+            except Exception:
+                continue
+
+            for match in grep.matches:
+                state = seen_lines.setdefault(
+                    int(match.line_number),
+                    {"match": match, "terms": set()},
+                )
+                state["terms"].add(term)
+
+        for state in seen_lines.values():
+            match = state["match"]
+            block = "\n".join([*match.context_before, match.line, *match.context_after]).lower()
+            coverage = len(state["terms"])
+            exact_mentions = sum(1 for term in query_terms if term in block)
+            score = (coverage * 3) + exact_mentions
+            if score > best_score:
+                best_score = score
+                best_match = match
+
+        if best_match is None or best_score <= 0:
+            return None
+
+        snippet_lines = [*best_match.context_before, best_match.line, *best_match.context_after]
+        start_line = max(1, int(best_match.line_number) - len(best_match.context_before))
+        end_line = start_line + len(snippet_lines) - 1
+        return replace(
+            item,
+            symbol_name="<artifact_focus>",
+            line_start=start_line,
+            line_end=end_line,
+            source="\n".join(snippet_lines),
+        )
+
     def _text_matches_to_related_files(
         self,
         query: str,
@@ -3665,8 +3769,30 @@ class QuickContext:
         if not artifact_chunks:
             return descriptions
 
+        max_per_file = max(1, int(llm_cfg.artifact_metadata_chunks_per_file))
+        selected_chunks: list[CodeChunk] = []
+        for file_path in sorted({chunk.file_path for chunk in artifact_chunks}):
+            file_chunks = [chunk for chunk in artifact_chunks if chunk.file_path == file_path]
+
+            def _artifact_score(chunk: CodeChunk) -> float:
+                if chunk.symbol_name == "<artifact_summary>":
+                    return 100.0
+                signals = extract_artifact_semantic_signals(chunk.source, file_name=Path(chunk.file_path).name)
+                score = 0.0
+                score += len(signals.call_targets) * 2.0
+                score += len(signals.methods) * 1.4
+                score += len(signals.field_names) * 0.9
+                score += len(signals.message_types) * 1.1
+                score += len(signals.string_literals) * 0.5
+                if "Raw excerpt:" in chunk.source:
+                    score += 0.25
+                return score
+
+            ranked = sorted(file_chunks, key=_artifact_score, reverse=True)
+            selected_chunks.extend(ranked[:max_per_file])
+
         generated = self.describer.generate_lightweight_metadata_batch(
-            artifact_chunks,
+            selected_chunks,
             request_batch_size=max(1, int(llm_cfg.artifact_metadata_batch_size)),
             max_tokens=max(64, int(llm_cfg.artifact_metadata_max_tokens)),
             progress_callback=progress_callback,

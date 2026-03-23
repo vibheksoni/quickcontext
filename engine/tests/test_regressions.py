@@ -1382,6 +1382,143 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(out[0].description, "Compact generated metadata")
         self.assertEqual(out[1].chunk_id, descriptions[1].chunk_id)
 
+    def test_maybe_generate_lightweight_artifact_metadata_limits_chunks_per_file(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=LLMConfig(artifact_metadata_enabled=True, artifact_metadata_chunks_per_file=2),
+                vectors=[],
+            )
+        )
+        try:
+            summary_chunk = CodeChunk(
+                chunk_id="artifact-summary",
+                source="Generated bundle summary",
+                language="javascript",
+                file_path="bundle.js",
+                symbol_name="<artifact_summary>",
+                symbol_kind="file_artifact",
+                line_start=1,
+                line_end=10,
+                byte_start=0,
+                byte_end=100,
+                signature=None,
+                docstring=None,
+                parent=None,
+                visibility=None,
+                role="generated",
+                file_hash="hash",
+            )
+            chunk_a = CodeChunk(
+                chunk_id="artifact-a",
+                source="CallTargets: client.checkTrial\nMethods: CheckTrial\nFields: is_eligible",
+                language="javascript",
+                file_path="bundle.js",
+                symbol_name="CheckTrial",
+                symbol_kind="file_artifact",
+                line_start=11,
+                line_end=20,
+                byte_start=101,
+                byte_end=200,
+                signature=None,
+                docstring=None,
+                parent=None,
+                visibility=None,
+                role="generated",
+                file_hash="hash",
+            )
+            chunk_b = CodeChunk(
+                chunk_id="artifact-b",
+                source="Fields: foo, bar",
+                language="javascript",
+                file_path="bundle.js",
+                symbol_name="foo",
+                symbol_kind="file_artifact",
+                line_start=21,
+                line_end=30,
+                byte_start=201,
+                byte_end=300,
+                signature=None,
+                docstring=None,
+                parent=None,
+                visibility=None,
+                role="generated",
+                file_hash="hash",
+            )
+            descriptions = [
+                build_fallback_description(summary_chunk),
+                build_fallback_description(chunk_a),
+                build_fallback_description(chunk_b),
+            ]
+            generated = [
+                ChunkDescription("artifact-summary", "summary", ["bundle"], 1, 0.001),
+                ChunkDescription("artifact-a", "a", ["trial"], 1, 0.001),
+            ]
+            with mock.patch.object(
+                qc.describer,
+                "generate_lightweight_metadata_batch",
+                return_value=generated,
+            ) as generator:
+                out = qc._maybe_generate_lightweight_artifact_metadata(
+                    [summary_chunk, chunk_a, chunk_b],
+                    descriptions,
+                )
+        finally:
+            qc.close()
+
+        called_chunks = generator.call_args.args[0]
+        self.assertEqual([chunk.chunk_id for chunk in called_chunks], ["artifact-summary", "artifact-a"])
+        self.assertEqual(out[2].chunk_id, descriptions[2].chunk_id)
+
+    def test_focus_artifact_results_uses_file_local_grep_snippet(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            from engine.src.searcher import SearchResult
+
+            artifact = SearchResult(
+                1.0,
+                "bundle.js",
+                "<artifact_summary>",
+                "file_artifact",
+                1,
+                50,
+                "Generated bundle summary",
+                "summary",
+            )
+            grep_match = type(
+                "GrepMatch",
+                (),
+                {
+                    "line_number": 40,
+                    "context_before": ("let a = 1;",),
+                    "line": 'const is_eligible = true;',
+                    "context_after": ('const used_trial = false;',),
+                },
+            )()
+            grep_result = type("GrepResult", (), {"matches": [grep_match]})()
+            with mock.patch.object(qc, "grep_text", return_value=grep_result):
+                focused = qc._focus_artifact_results(
+                    "What are the requirements to start a free trial?",
+                    [artifact],
+                    path=".",
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual(focused[0].symbol_name, "<artifact_focus>")
+        self.assertIn("is_eligible", focused[0].source)
+        self.assertEqual(focused[0].line_start, 39)
+
     def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
         qc = QuickContext(
             EngineConfig(

@@ -112,6 +112,7 @@ class LLMConfig:
     artifact_metadata_enabled: bool = False
     artifact_metadata_batch_size: int = 4
     artifact_metadata_max_tokens: int = 512
+    artifact_metadata_chunks_per_file: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +255,7 @@ class EngineConfig:
                QC_DESC_PROVIDER, QC_DESC_MODEL, QC_DESC_DIMENSION, QC_DESC_API_KEY,
                QC_LLM_PROVIDER, QC_LLM_MODEL, QC_LLM_MAX_TOKENS, QC_LLM_API_KEY,
                QC_LLM_ARTIFACT_METADATA_ENABLED, QC_LLM_ARTIFACT_METADATA_BATCH_SIZE,
-               QC_LLM_ARTIFACT_METADATA_MAX_TOKENS.
+               QC_LLM_ARTIFACT_METADATA_MAX_TOKENS, QC_LLM_ARTIFACT_METADATA_CHUNKS_PER_FILE.
         Returns: EngineConfig — Config built from env vars with defaults.
         """
         qdrant = QdrantConfig(
@@ -322,6 +323,7 @@ class EngineConfig:
             artifact_metadata_enabled=os.environ.get("QC_LLM_ARTIFACT_METADATA_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
             artifact_metadata_batch_size=int(os.environ.get("QC_LLM_ARTIFACT_METADATA_BATCH_SIZE", "4")),
             artifact_metadata_max_tokens=int(os.environ.get("QC_LLM_ARTIFACT_METADATA_MAX_TOKENS", "512")),
+            artifact_metadata_chunks_per_file=int(os.environ.get("QC_LLM_ARTIFACT_METADATA_CHUNKS_PER_FILE", "2")),
         )
 
         return EngineConfig(
