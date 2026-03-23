@@ -1594,6 +1594,7 @@ class RegressionTests(unittest.TestCase):
                 focused = qc._focus_generated_file_match_results(
                     "What are the requirements to start a free trial?",
                     [match],
+                    path="C:/tmp/windsurf.com",
                 )
         finally:
             qc.close()
@@ -1601,6 +1602,117 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(focused[0].symbol_name, "<artifact_focus>")
         self.assertIn("used_trial", focused[0].source)
         self.assertGreater(focused[0].score, match.score)
+
+    def test_focus_generated_file_match_results_penalizes_generic_start_only_snippet(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            from engine.src.searcher import SearchResult
+
+            match = SearchResult(
+                1.0,
+                "bundle.12345678.js",
+                "bundle.12345678.js",
+                "file_match",
+                1,
+                3,
+                "wrong snippet",
+                "wrong snippet",
+            )
+            start_match = type(
+                "GrepMatch",
+                (),
+                {
+                    "line_number": 10,
+                    "context_before": ("return (",),
+                    "line": 'b.start(\"visible\")',
+                    "context_after": ("});",),
+                },
+            )()
+            trial_match = type(
+                "GrepMatch",
+                (),
+                {
+                    "line_number": 40,
+                    "context_before": ("let a = 1;",),
+                    "line": 'const used_trial = false;',
+                    "context_after": ('const windsurf_pro_trial_end_time = 1;',),
+                },
+            )()
+
+            def _fake_grep(query, path, limit, before_context, after_context):
+                if query == "start":
+                    return type("GrepResult", (), {"matches": [start_match]})()
+                return type("GrepResult", (), {"matches": [trial_match]})()
+
+            with mock.patch.object(qc, "grep_text", side_effect=_fake_grep):
+                focused = qc._focus_generated_file_match_results(
+                    "What are the requirements to start a free trial?",
+                    [match],
+                    path="C:/tmp/windsurf.com",
+                )
+        finally:
+            qc.close()
+
+        self.assertIn("used_trial", focused[0].source)
+
+    def test_focus_generated_file_match_results_penalizes_project_name_only_match(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=None,
+                vectors=[],
+            )
+        )
+        try:
+            from engine.src.searcher import SearchResult
+
+            match = SearchResult(
+                10.0,
+                "bundle.12345678.js",
+                "bundle.12345678.js",
+                "file_match",
+                1,
+                3,
+                "wrong snippet",
+                "wrong snippet",
+            )
+            grep_match = type(
+                "GrepMatch",
+                (),
+                {
+                    "line_number": 20,
+                    "context_before": ("const a = 1;",),
+                    "line": 'const logo = \"/logo/windsurf.svg\";',
+                    "context_after": ("});",),
+                },
+            )()
+
+            def _fake_grep(query, path, limit, before_context, after_context):
+                if query == "windsurf":
+                    return type("GrepResult", (), {"matches": [grep_match]})()
+                return type("GrepResult", (), {"matches": []})()
+
+            with mock.patch.object(qc, "grep_text", side_effect=_fake_grep):
+                focused = qc._focus_generated_file_match_results(
+                    "What are the requirements to start a Windsurf free trial?",
+                    [match],
+                    path="C:/tmp/windsurf.com",
+                    max_files=1,
+                )
+        finally:
+            qc.close()
+
+        self.assertLess(focused[0].score, match.score)
 
     def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
         qc = QuickContext(

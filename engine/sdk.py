@@ -2072,7 +2072,7 @@ class QuickContext:
             limit=limit,
         )
         primary_results = self._text_matches_to_search_results(primary_matches)
-        primary_results = self._focus_generated_file_match_results(query, primary_results)
+        primary_results = self._focus_generated_file_match_results(query, primary_results, path=path)
         import_related = self._text_import_related_files_for_results(
             query=query,
             results=primary_results,
@@ -2110,6 +2110,7 @@ class QuickContext:
         self,
         query: str,
         results: list,
+        path: str | Path,
         max_files: int = 2,
     ) -> list:
         """
@@ -2135,7 +2136,7 @@ class QuickContext:
                 focused.append(item)
                 continue
 
-            refined_item = self._focus_single_artifact_result(query_terms=query_terms, item=item, path=file_path)
+            refined_item = self._focus_single_artifact_result(query_terms=query_terms, item=item, path=path)
             focused.append(refined_item or item)
             if refined_item is not None:
                 refined += 1
@@ -2902,6 +2903,10 @@ class QuickContext:
         best_match = None
         best_score = 0
         seen_lines: dict[int, dict] = {}
+        generic_action_terms = {"start", "show", "load", "open", "run", "begin", "init"}
+        project_terms = {term for term in self._split_symbol_text_tokens(Path(str(path or "")).name) if len(term) >= 4}
+        domain_terms = [term for term in query_terms if term not in generic_action_terms]
+        domain_terms = [term for term in domain_terms if term not in project_terms]
         for term in query_terms[:4]:
             try:
                 grep = self.grep_text(
@@ -2927,6 +2932,8 @@ class QuickContext:
             coverage = len(state["terms"])
             exact_mentions = sum(1 for term in query_terms if term in block)
             score = (coverage * 3) + exact_mentions
+            if state["terms"].issubset(generic_action_terms) and domain_terms and not any(term in block for term in domain_terms):
+                score *= 0.25
             if score > best_score:
                 best_score = score
                 best_match = match
@@ -2937,9 +2944,16 @@ class QuickContext:
         snippet_lines = [*best_match.context_before, best_match.line, *best_match.context_after]
         start_line = max(1, int(best_match.line_number) - len(best_match.context_before))
         end_line = start_line + len(snippet_lines) - 1
+        penalty_factor = 1.0
+        if seen_lines and best_match is not None:
+            state = seen_lines.get(int(best_match.line_number))
+            matched_terms = state["terms"] if state is not None else set()
+            block = "\n".join(snippet_lines).lower()
+            if matched_terms and matched_terms.issubset(project_terms) and domain_terms and not any(term in block for term in domain_terms):
+                penalty_factor = 0.55
         return replace(
             item,
-            score=float(getattr(item, "score", 0.0)) + (best_score * 0.05),
+            score=(float(getattr(item, "score", 0.0)) * penalty_factor) + (best_score * 0.05),
             symbol_name="<artifact_focus>",
             line_start=start_line,
             line_end=end_line,
