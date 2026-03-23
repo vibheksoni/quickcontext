@@ -32,7 +32,12 @@ def find_project_root(start_path: str | Path) -> Optional[Path]:
     if current.is_file():
         current = current.parent
 
+    start = current
+    home = Path.home().resolve()
+
     while current != current.parent:
+        if current == home and current != start:
+            break
         for marker in PROJECT_MARKERS:
             if (current / marker).exists():
                 return current

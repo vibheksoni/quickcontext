@@ -9,6 +9,7 @@ from engine.src.config import EngineConfig, QdrantConfig
 from engine.src.indexer import IndexStats
 from engine.src.operation_status import GLOBAL_OPERATION_REGISTRY
 from engine.src.parsing import TextSearchMatch
+from engine.src.project import detect_project_name
 from engine.src.sdk_models import ProjectCollectionInfo
 
 
@@ -51,6 +52,18 @@ class SDKSurfaceTests(unittest.TestCase):
         self.assertFalse(info.collection.indexed)
         self.assertEqual(info.folders[0].relative_path, ".")
         self.assertIn("src", {item.relative_path for item in info.folders})
+
+    def test_detect_project_name_ignores_home_level_markers_for_external_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".project").write_text("", encoding="utf-8")
+            target = home / "Downloads" / "windsurf.com"
+            target.mkdir(parents=True)
+
+            with mock.patch("engine.src.project.Path.home", return_value=home):
+                project_name = detect_project_name(target)
+
+        self.assertEqual(project_name, "windsurf_com")
 
     def test_list_projects_returns_typed_collection_info(self) -> None:
         qc = QuickContext(EngineConfig(qdrant=QdrantConfig()))
