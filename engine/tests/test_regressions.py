@@ -1600,6 +1600,7 @@ class RegressionTests(unittest.TestCase):
 
         self.assertEqual(focused[0].symbol_name, "<artifact_focus>")
         self.assertIn("used_trial", focused[0].source)
+        self.assertGreater(focused[0].score, match.score)
 
     def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
         qc = QuickContext(

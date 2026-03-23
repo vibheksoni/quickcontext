@@ -2139,6 +2139,7 @@ class QuickContext:
             focused.append(refined_item or item)
             if refined_item is not None:
                 refined += 1
+        focused.sort(key=lambda item: float(getattr(item, "score", 0.0)), reverse=True)
         return focused
 
     def _looks_like_generated_bundle_path(self, file_path: str) -> bool:
@@ -2938,6 +2939,7 @@ class QuickContext:
         end_line = start_line + len(snippet_lines) - 1
         return replace(
             item,
+            score=float(getattr(item, "score", 0.0)) + (best_score * 0.05),
             symbol_name="<artifact_focus>",
             line_start=start_line,
             line_end=end_line,
