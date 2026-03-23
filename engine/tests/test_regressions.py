@@ -11,13 +11,13 @@ import builtins
 from engine.__main__ import _find_command
 from engine.sdk import QuickContext
 from engine.src.artifact_index import ARTIFACT_FALLBACK_ERROR, ArtifactIndexProfile, should_downgrade_artifact_profile
-from engine.src.artifact_semantics import find_artifact_signal_offsets
+from engine.src.artifact_semantics import extract_artifact_semantic_signals, find_artifact_signal_offsets
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.collection import CollectionManager
-from engine.src.config import CollectionVectorConfig, EngineConfig, QdrantConfig
+from engine.src.config import CollectionVectorConfig, EngineConfig, LLMConfig, QdrantConfig
 from engine.src.dedup import deduplicate_chunks
-from engine.src.describer import DescriptionGenerator, build_fallback_description
+from engine.src.describer import ChunkDescription, DescriptionGenerator, build_fallback_description
 from engine.src.embedder import DualEmbedder, EmbeddingProviderStats
 from engine.src.filecache import FileSignatureCache
 from engine.src.index_resume import ResumeFile, ResumeState, build_settings_fingerprint, clear_state, load_state, save_state
@@ -398,11 +398,38 @@ class RegressionTests(unittest.TestCase):
             chunks = builder.build_chunks([extraction])
 
         self.assertTrue(chunks)
-        self.assertEqual(chunks[0].symbol_name, "CheckProTrialEligibility")
-        self.assertIn("Methods: CheckProTrialEligibility", chunks[0].source)
-        self.assertIn("Fields: is_eligible, used_trial", chunks[0].source)
-        self.assertIn("keywords: bundle", chunks[0].source.lower())
-        self.assertIn("check, pro, trial", chunks[0].source.lower())
+        joined_sources = "\n".join(chunk.source for chunk in chunks)
+        self.assertTrue(any("CheckProTrialEligibility" in chunk.source for chunk in chunks))
+        self.assertIn("used_trial", joined_sources)
+        self.assertIn("is_eligible", joined_sources)
+        self.assertIn("keywords: bundle", joined_sources.lower())
+        self.assertIn("check, pro, trial", joined_sources.lower())
+
+    def test_chunk_builder_artifact_fallback_adds_distributed_summary_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file_path = root / "bundle.12345678.js"
+            chunk_a = 'this.checkProTrialEligibility = async (e) => client.checkProTrialEligibility(e);\\n{name:"CheckProTrialEligibility"}\\n'
+            filler = "const filler = 1;\\n" * 8000
+            chunk_b = 'this.getPlanStatus = async (e) => client.getPlanStatus(e);\\n{name:"GetPlanStatus"}\\n'
+            file_path.write_text(chunk_a + filler + chunk_b, encoding="utf-8")
+
+            extraction = ExtractionResult(
+                file_path=str(file_path.resolve()),
+                language="javascript",
+                symbols=[],
+                errors=[ARTIFACT_FALLBACK_ERROR],
+                file_hash="artifact-hash",
+                file_size=file_path.stat().st_size,
+                file_mtime=int(file_path.stat().st_mtime),
+            )
+            builder = ChunkBuilder()
+            chunks = builder.build_chunks([extraction])
+
+        self.assertTrue(chunks)
+        self.assertIn("Generated bundle summary", chunks[0].source)
+        self.assertIn("client.checkProTrialEligibility", chunks[0].source)
+        self.assertIn("client.getPlanStatus", chunks[0].source)
 
     def test_artifact_sampling_includes_midpoint_for_large_bundles(self) -> None:
         builder = ChunkBuilder(artifact_chunk_size=24000, artifact_max_chunks=8)
@@ -425,6 +452,39 @@ class RegressionTests(unittest.TestCase):
         trial_offset = source.index("checkProTrialEligibility")
         self.assertTrue(offsets)
         self.assertTrue(any(abs(offset - trial_offset) < 200 for offset in offsets))
+
+    def test_extract_artifact_semantic_signals_prefers_mixed_case_over_enum_noise(self) -> None:
+        source = """
+        (sg.typeName = "exa.seat_management_pb.CheckProTrialEligibilityResponse");
+        this.checkProTrialEligibility = async (e) => client.checkProTrialEligibility(e);
+        { no: 1, name: "PAYMENT_PERIOD_UNSPECIFIED", kind: "enum", T: 14 },
+        { no: 2, name: "QUERY_DATA_SOURCE_UNSPECIFIED", kind: "enum", T: 14 },
+        { no: 3, name: "used_trial", kind: "scalar", T: 8 },
+        """.strip()
+        signals = extract_artifact_semantic_signals(source, file_name="bundle.js")
+        self.assertEqual(signals.methods[0], "checkProTrialEligibility")
+        self.assertEqual(signals.message_types[0], "exa.seat_management_pb.CheckProTrialEligibilityResponse")
+        self.assertEqual(signals.field_names[0], "used_trial")
+
+    def test_description_generator_parses_lightweight_batch_response(self) -> None:
+        generator = DescriptionGenerator(model="m", api_key="k")
+        parsed = generator._parse_lightweight_batch_response(
+            """
+            <items>
+              <item id="0">
+                <description>Handles trial eligibility checks.</description>
+                <keywords>trial|eligibility|plan|billing</keywords>
+              </item>
+              <item id="1">
+                <description>Defines account session state.</description>
+                <keywords>auth|account|session</keywords>
+              </item>
+            </items>
+            """
+        )
+        self.assertEqual(parsed["0"]["description"], "Handles trial eligibility checks.")
+        self.assertEqual(parsed["0"]["keywords"], ["trial", "eligibility", "plan", "billing"])
+        self.assertEqual(parsed["1"]["keywords"], ["auth", "account", "session"])
 
     def test_dual_embedder_parallelizes_remote_code_and_description_embeddings(self) -> None:
         chunk = CodeChunk(
@@ -1224,6 +1284,79 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("used_trial", description.description)
         self.assertIn("trial", description.keywords)
         self.assertIn("eligibility", description.keywords)
+
+    def test_maybe_generate_lightweight_artifact_metadata_replaces_only_artifact_chunks(self) -> None:
+        qc = QuickContext(
+            EngineConfig(
+                qdrant=None,
+                code_embedding=None,
+                desc_embedding=None,
+                llm=LLMConfig(artifact_metadata_enabled=True),
+                vectors=[],
+            )
+        )
+        try:
+            artifact_chunk = CodeChunk(
+                chunk_id="artifact-1",
+                source="generated artifact packet",
+                language="javascript",
+                file_path="bundle.js",
+                symbol_name="artifact",
+                symbol_kind="file_artifact",
+                line_start=1,
+                line_end=5,
+                byte_start=0,
+                byte_end=50,
+                signature=None,
+                docstring=None,
+                parent=None,
+                visibility=None,
+                role="generated",
+                file_hash="hash",
+            )
+            normal_chunk = CodeChunk(
+                chunk_id="normal-1",
+                source="def run(): pass",
+                language="python",
+                file_path="run.py",
+                symbol_name="run",
+                symbol_kind="function",
+                line_start=1,
+                line_end=1,
+                byte_start=0,
+                byte_end=15,
+                signature="run()",
+                docstring=None,
+                parent=None,
+                visibility=None,
+                role=None,
+                file_hash="hash",
+            )
+            descriptions = [
+                build_fallback_description(artifact_chunk),
+                build_fallback_description(normal_chunk),
+            ]
+            generated = ChunkDescription(
+                chunk_id="artifact-1",
+                description="Compact generated metadata",
+                keywords=["trial", "eligibility"],
+                token_count=5,
+                cost_usd=0.001,
+            )
+            with mock.patch.object(
+                qc.describer,
+                "generate_lightweight_metadata_batch",
+                return_value=[generated],
+            ):
+                out = qc._maybe_generate_lightweight_artifact_metadata(
+                    [artifact_chunk, normal_chunk],
+                    descriptions,
+                )
+        finally:
+            qc.close()
+
+        self.assertEqual(out[0].description, "Compact generated metadata")
+        self.assertEqual(out[1].chunk_id, descriptions[1].chunk_id)
 
     def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
         qc = QuickContext(

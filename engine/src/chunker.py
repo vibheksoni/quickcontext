@@ -11,6 +11,8 @@ from engine.src.artifact_semantics import (
     build_artifact_semantic_projection,
     extract_artifact_semantic_signals,
     find_artifact_signal_offsets,
+    rank_artifact_signal_offsets,
+    render_artifact_signal_packet,
 )
 from engine.src.parsing import ExtractedSymbol, ExtractionResult
 
@@ -157,9 +159,17 @@ class ChunkBuilder:
         total_bytes = len(content_bytes)
         if total_bytes == 0:
             return []
+        file_signals = extract_artifact_semantic_signals(content, file_name=Path(file_path).name)
+        summary_signals = self._artifact_summary_signals(
+            source=content,
+            file_name=Path(file_path).name,
+            total_bytes=total_bytes,
+            window_size=min(self._artifact_chunk_size, self._max_chunk_bytes),
+        )
+        reserve_summary = 1 if summary_signals is not None else 0
 
         desired_chunks = min(
-            self._artifact_max_chunks,
+            max(1, self._artifact_max_chunks - reserve_summary),
             max(1, math.ceil(total_bytes / (512 * 1024))),
         )
         window_size = min(self._artifact_chunk_size, self._max_chunk_bytes)
@@ -171,6 +181,53 @@ class ChunkBuilder:
         )
         chunks: list[CodeChunk] = []
 
+        if summary_signals is not None:
+            summary_source = render_artifact_signal_packet(
+                file_path=file_path,
+                heading=f"Generated bundle summary for {Path(file_path).name}",
+                signals=summary_signals,
+                extra_lines=["Scope: distributed structural hotspots across the file"],
+            )
+            summary_symbol_name = (
+                (summary_signals.call_targets[0] if summary_signals.call_targets else None)
+                or (summary_signals.methods[0] if summary_signals.methods else None)
+                or (summary_signals.field_names[0] if summary_signals.field_names else None)
+                or "<artifact_summary>"
+            )
+            summary_signature = None
+            if summary_signals.call_targets:
+                summary_signature = "calls: " + ", ".join(summary_signals.call_targets[:4])
+            elif summary_signals.methods:
+                summary_signature = "methods: " + ", ".join(summary_signals.methods[:4])
+            chunks.append(
+                CodeChunk(
+                    chunk_id=self._generate_chunk_id(
+                        file_path,
+                        summary_symbol_name,
+                        "file_artifact",
+                        summary_signals.services[0].split(".")[-1] if summary_signals.services else None,
+                        summary_signature,
+                        0,
+                        total_bytes,
+                    ),
+                    source=self._truncate_source(summary_source),
+                    language=language,
+                    file_path=file_path,
+                    symbol_name=summary_symbol_name,
+                    symbol_kind="file_artifact",
+                    line_start=1,
+                    line_end=max(1, content.count("\n") + 1),
+                    byte_start=0,
+                    byte_end=total_bytes,
+                    signature=summary_signature,
+                    docstring=None,
+                    parent=summary_signals.services[0].split(".")[-1] if summary_signals.services else None,
+                    visibility=None,
+                    role="generated",
+                    file_hash=resolved_file_hash,
+                )
+            )
+
         for chunk_idx, offset in enumerate(offsets):
             target_end = min(total_bytes, offset + window_size)
             chunk_end = self._find_smart_chunk_end(content_bytes, offset, target_end)
@@ -180,6 +237,12 @@ class ChunkBuilder:
             snippet_bytes = content_bytes[offset:chunk_end]
             snippet_text = snippet_bytes.decode("utf-8", errors="ignore")
             signals = extract_artifact_semantic_signals(snippet_text, file_name=Path(file_path).name)
+            neighbor_signals = self._neighbor_artifact_signals(
+                source=content,
+                file_name=Path(file_path).name,
+                center_offset=offset,
+                window_size=window_size,
+            )
             normalized_source = self._normalize_artifact_excerpt(
                 file_path=file_path,
                 chunk_index=chunk_idx,
@@ -187,6 +250,8 @@ class ChunkBuilder:
                 byte_start=offset,
                 byte_end=chunk_end,
                 source=snippet_text,
+                file_signals=file_signals,
+                neighbor_signals=neighbor_signals,
             )
             if not normalized_source.strip():
                 continue
@@ -236,6 +301,45 @@ class ChunkBuilder:
 
         return chunks
 
+    def _artifact_summary_signals(
+        self,
+        source: str,
+        file_name: str,
+        total_bytes: int,
+        window_size: int,
+    ):
+        """
+        Aggregate same-file structural signals from distributed hotspots into one summary packet.
+        """
+        bucket_count = max(6, min(12, int(math.ceil(total_bytes / max(1, window_size * 2)))))
+        ranked_offsets = rank_artifact_signal_offsets(source, limit=512)
+        if not ranked_offsets:
+            return None
+
+        bucket_best: dict[int, int] = {}
+        for char_offset, _score in ranked_offsets:
+            byte_offset = len(source[:char_offset].encode("utf-8"))
+            bucket = min(bucket_count - 1, max(0, int((byte_offset / max(1, total_bytes)) * bucket_count)))
+            if bucket not in bucket_best:
+                bucket_best[bucket] = byte_offset
+
+        source_bytes = source.encode("utf-8")
+        snippets: list[str] = []
+        for bucket in sorted(bucket_best):
+            byte_offset = bucket_best[bucket]
+            start = max(0, byte_offset - 480)
+            end = min(total_bytes, byte_offset + 1400)
+            if end <= start:
+                continue
+            snippet = source_bytes[start:end].decode("utf-8", errors="ignore")
+            if snippet.strip():
+                snippets.append(snippet)
+
+        if not snippets:
+            return None
+
+        return extract_artifact_semantic_signals("\n".join(snippets), file_name=file_name)
+
     def _artifact_sample_offsets(
         self,
         total_bytes: int,
@@ -265,11 +369,17 @@ class ChunkBuilder:
             ordered_offsets.append(normalized)
 
         if source:
-            for char_offset in find_artifact_signal_offsets(source, limit=max(target_count * 4, 8)):
+            ranked_offsets = rank_artifact_signal_offsets(source, limit=max(target_count * 24, 96))
+            bucket_count = max(target_count, 4)
+            bucket_best: dict[int, int] = {}
+            for char_offset, _score in ranked_offsets:
                 byte_offset = len(source[:char_offset].encode("utf-8"))
-                _append_offset(byte_offset - (window_size // 6))
-                if len(ordered_offsets) >= target_count:
-                    break
+                bucket = min(bucket_count - 1, max(0, int((byte_offset / max(1, total_bytes)) * bucket_count)))
+                if bucket not in bucket_best:
+                    bucket_best[bucket] = byte_offset
+
+            for bucket in sorted(bucket_best):
+                _append_offset(bucket_best[bucket] - (window_size // 6))
 
         _append_offset(0)
         _append_offset(max_start)
@@ -285,6 +395,42 @@ class ChunkBuilder:
 
         return ordered_offsets[:target_count]
 
+    def _neighbor_artifact_signals(
+        self,
+        source: str,
+        file_name: str,
+        center_offset: int,
+        window_size: int,
+    ):
+        """
+        Collect bounded nearby same-file signals around one artifact hotspot.
+        """
+        source_bytes = source.encode("utf-8")
+        total_bytes = len(source_bytes)
+        if total_bytes == 0:
+            return None
+
+        char_offsets = find_artifact_signal_offsets(source, limit=24)
+        nearby_chunks: list[str] = []
+        for char_offset in char_offsets:
+            byte_offset = len(source[:char_offset].encode("utf-8"))
+            if abs(byte_offset - center_offset) > window_size * 1.2:
+                continue
+            start = max(0, byte_offset - 320)
+            end = min(total_bytes, byte_offset + 960)
+            if end <= start:
+                continue
+            snippet = source_bytes[start:end].decode("utf-8", errors="ignore")
+            if snippet.strip():
+                nearby_chunks.append(snippet)
+            if len(nearby_chunks) >= 3:
+                break
+
+        if not nearby_chunks:
+            return None
+
+        return extract_artifact_semantic_signals("\n".join(nearby_chunks), file_name=file_name)
+
     def _normalize_artifact_excerpt(
         self,
         file_path: str,
@@ -293,6 +439,8 @@ class ChunkBuilder:
         byte_start: int,
         byte_end: int,
         source: str,
+        file_signals=None,
+        neighbor_signals=None,
     ) -> str:
         """
         Reformat a sampled artifact excerpt so it stays searchable without tripping minified-file heuristics.
@@ -304,6 +452,8 @@ class ChunkBuilder:
             chunk_count=chunk_count,
             byte_start=byte_start,
             byte_end=byte_end,
+            file_signals=file_signals,
+            neighbor_signals=neighbor_signals,
         )
         normalized = source.replace("\r\n", "\n").replace("\r", "\n")
         normalized = re.sub(r"([;{}])", r"\1\n", normalized)
