@@ -1059,7 +1059,7 @@ def quickcontext_search_playbook(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m quickcontext_mcp")
+    parser = argparse.ArgumentParser(prog="python -m qc_mcp")
     parser.add_argument("--config", dest="config_path", default=None)
     parser.add_argument("--transport", choices=["stdio", "http", "streamable-http", "sse"], default=None)
     parser.add_argument("--host", default=None)

@@ -242,11 +242,11 @@ def main(argv: list[str] | None = None) -> int:
     if os.name == "nt":
         print(rf"  {venv_python} -m engine status")
         print(rf"  {venv_python} -m engine index . --project quickcontext --no-descriptions")
-        print(rf"  {venv_python} -m quickcontext_mcp")
+        print(rf"  {venv_python} -m qc_mcp")
     else:
         print(f"  {venv_python} -m engine status")
         print(f"  {venv_python} -m engine index . --project quickcontext --no-descriptions")
-        print(f"  {venv_python} -m quickcontext_mcp")
+        print(f"  {venv_python} -m qc_mcp")
     return 0
 
 

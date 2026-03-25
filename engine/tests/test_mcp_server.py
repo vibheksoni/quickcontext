@@ -8,7 +8,7 @@ from fastmcp import Client
 
 from engine.src.config import EngineConfig, MCPConfig
 from engine.src.sdk_models import IndexOperationSnapshot
-from quickcontext_mcp.server import _now_iso, main, mcp
+from qc_mcp.server import _now_iso, main, mcp
 
 
 def _run(coro):
@@ -63,7 +63,7 @@ class MCPServerTests(unittest.TestCase):
         }
 
         async def _test() -> None:
-            with patch("quickcontext_mcp.server._search_impl", return_value=fake_response):
+            with patch("qc_mcp.server._search_impl", return_value=fake_response):
                 async with Client(mcp) as client:
                     result = await client.call_tool(
                         "search",
@@ -101,7 +101,7 @@ class MCPServerTests(unittest.TestCase):
         }
 
         async def _test() -> None:
-            with patch("quickcontext_mcp.server._project_info_impl", return_value=fake_response):
+            with patch("qc_mcp.server._project_info_impl", return_value=fake_response):
                 async with Client(mcp) as client:
                     result = await client.call_tool("project_info", {"path": "C:/repo"})
             payload = result.data
@@ -125,7 +125,7 @@ class MCPServerTests(unittest.TestCase):
         )
 
         async def _test() -> None:
-            with patch("quickcontext_mcp.server.QuickContext.get_operation_status", return_value=record):
+            with patch("qc_mcp.server.QuickContext.get_operation_status", return_value=record):
                 async with Client(mcp) as client:
                     result = await client.call_tool("index_status", {"run_id": "run123"})
             payload = result.data
@@ -155,7 +155,7 @@ class MCPServerTests(unittest.TestCase):
             (project_root / "package.json").write_text("{}", encoding="utf-8")
 
             async def _test() -> None:
-                with patch("quickcontext_mcp.server.QuickContext.start_index_directory", return_value=existing):
+                with patch("qc_mcp.server.QuickContext.start_index_directory", return_value=existing):
                     async with Client(mcp) as client:
                         result = await client.call_tool("index", {"path": str(project_root)})
                 payload = result.data
@@ -175,7 +175,7 @@ class MCPServerTests(unittest.TestCase):
                 stateless_http=True,
             )
         )
-        with patch("quickcontext_mcp.server._load_config", return_value=config), patch("quickcontext_mcp.server.mcp.run") as run:
+        with patch("qc_mcp.server._load_config", return_value=config), patch("qc_mcp.server.mcp.run") as run:
             main([])
 
         run.assert_called_once_with(

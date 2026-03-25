@@ -8,7 +8,7 @@ It currently has three main parts:
 
 - `service/`: a Rust binary for parsing, grep, skeleton generation, text search, protocol search, pattern search, symbol and caller lookup, import graph analysis, and local IPC
 - `engine/`: a Python SDK and CLI for indexing, Qdrant collection management, chunking, deduplication, embeddings, retrieval, watch mode, and edit operations
-- `quickcontext_mcp/`: a thin FastMCP server that wraps the Python SDK with agent-friendly indexing and retrieval tools
+- `qc_mcp/`: a thin FastMCP server that wraps the Python SDK with agent-friendly indexing and retrieval tools
 
 The SDK now includes AI-facing retrieval helpers:
 
@@ -108,7 +108,7 @@ with QuickContext(config) as qc:
 ## Repository Layout
 
 - `engine/`: Python package and CLI entrypoint
-- `quickcontext_mcp/`: FastMCP server package
+- `qc_mcp/`: FastMCP server package
 - `service/`: Rust service and command-line binary
 - `docker-compose.yml`: local Qdrant container
 - `requirements.txt`: Python dependencies
@@ -276,7 +276,7 @@ After bootstrap:
 ```text
 .venv/Scripts/python.exe -m engine status
 .venv/Scripts/python.exe -m engine index . --project quickcontext --no-descriptions
-.venv/Scripts/python.exe -m quickcontext_mcp
+.venv/Scripts/python.exe -m qc_mcp
 ```
 
 ## Setup
@@ -353,13 +353,13 @@ For path-scoped MCP tools, always pass an explicit target path. Do not rely on t
 Run it locally over stdio:
 
 ```text
-venv/Scripts/python.exe -m quickcontext_mcp
+venv/Scripts/python.exe -m qc_mcp
 ```
 
 Run it as a long-lived HTTP server:
 
 ```text
-venv/Scripts/python.exe -m quickcontext_mcp
+venv/Scripts/python.exe -m qc_mcp
 ```
 
 To switch the MCP server to HTTP, set the `mcp` section in `quickcontext.json`:
@@ -379,7 +379,7 @@ To switch the MCP server to HTTP, set the `mcp` section in `quickcontext.json`:
 You can also override those values directly on startup without using environment variables:
 
 ```text
-venv/Scripts/python.exe -m quickcontext_mcp --config quickcontext.json --transport http --host 127.0.0.1 --port 8000
+venv/Scripts/python.exe -m qc_mcp --config quickcontext.json --transport http --host 127.0.0.1 --port 8000
 ```
 
 ## Common Python CLI Commands

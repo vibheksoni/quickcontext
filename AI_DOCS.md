@@ -25,7 +25,7 @@ The project is still in progress. There is room to improve architecture, speed, 
 
 - `service/`: Rust binary and IPC server
 - `engine/`: Python SDK and CLI
-- `quickcontext_mcp/`: thin FastMCP server wrapping the SDK
+- `qc_mcp/`: thin FastMCP server wrapping the SDK
 
 Flow:
 
