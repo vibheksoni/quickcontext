@@ -195,6 +195,12 @@ Common SDK and engine flow:
 
 Use the CLI to validate and benchmark the same underlying service and SDK behavior. Do not treat CLI startup as the main product surface.
 
+Bootstrap:
+
+- `scripts/bootstrap_quickcontext.py` is the fastest intended first-run setup path
+- `scripts/setup_quickcontext.ps1` is the Windows wrapper around that bootstrap flow
+- the bootstrap defaults to the local profile, a debug Rust service build, JSON-backed runtime config, and HTTP-only local Qdrant for fewer first-run issues
+
 LSP setup:
 
 - `python -m engine lsp-setup <path>` detects likely language servers for a target project and prints install commands for missing binaries

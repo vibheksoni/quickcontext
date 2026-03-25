@@ -304,6 +304,8 @@ scripts/*
 !scripts/text_retrieval_benchmark.py
 !scripts/warm_project_benchmark.py
 !scripts/index_phase_benchmark.py
+!scripts/bootstrap_quickcontext.py
+!scripts/setup_quickcontext.ps1
 !scripts/setup_project_lsps.ps1
 quickcontext.local.json
 deepwiki_util/

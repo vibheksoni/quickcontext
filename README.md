@@ -238,7 +238,50 @@ The Python layer looks for the service binary at:
 
 If the binary lives somewhere else, set `service.path` in `quickcontext.json`.
 
+## Quick Start
+
+The fastest first-run path is the bootstrap script. It creates `.venv`, installs Python dependencies, builds the Rust service, writes `quickcontext.json`, starts local Qdrant, and runs `engine init`.
+If `quickcontext.json` already exists, the bootstrap preserves the current provider and API settings and only fills in missing runtime defaults.
+
+Windows PowerShell:
+
+```powershell
+.\scripts\setup_quickcontext.ps1
+```
+
+Cross-platform Python:
+
+```text
+python scripts/bootstrap_quickcontext.py
+```
+
+What the bootstrap uses by default:
+
+- local config profile
+- debug Rust service build for faster first setup
+- HTTP-only local Qdrant config (`prefer_grpc: false`) for fewer Windows port issues
+- no API keys required
+
+Useful variants:
+
+```text
+python scripts/bootstrap_quickcontext.py --service-build release
+python scripts/bootstrap_quickcontext.py --profile cloud
+python scripts/bootstrap_quickcontext.py --config _ignore/bootstrap.local.json
+python scripts/bootstrap_quickcontext.py --dry-run
+```
+
+After bootstrap:
+
+```text
+.venv/Scripts/python.exe -m engine status
+.venv/Scripts/python.exe -m engine index . --project quickcontext --no-descriptions
+.venv/Scripts/python.exe -m quickcontext_mcp
+```
+
 ## Setup
+
+The steps below are the manual fallback if you do not want to use the bootstrap script.
 
 ### Windows
 

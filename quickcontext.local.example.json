@@ -3,7 +3,7 @@
     "host": "localhost",
     "port": 6333,
     "grpc_port": 6334,
-    "prefer_grpc": true,
+    "prefer_grpc": false,
     "collection": "codebase",
     "timeout": 30.0
   },
