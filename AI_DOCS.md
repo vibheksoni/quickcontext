@@ -82,6 +82,20 @@ Important config ideas:
 - on Windows, LSP readiness checks and Rust LSP spawning now resolve npm-global binaries directly, so installing npm-based language servers does not require restarting the shell just to make them discoverable
 - `index_directory(...)` and `refresh_files(...)` now expose real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and Qdrant upsert
 
+Indexing profile guidance:
+
+- Recommended default for most repos: keep full extraction but disable LLM descriptions
+  - CLI: `python -m engine index <path> --project <name> --no-descriptions`
+  - SDK: `QuickContext.index_directory(..., generate_descriptions=False)`
+- `--fast` is a speed-first profile, not just a cheaper description toggle
+  - it disables descriptions and also tightens chunk filtering defaults
+  - use it for very large repos, rough first passes, or speed-first iteration
+- `--no-skip-minified` is the important coverage toggle when generated frontend assets matter
+  - use it for dist-heavy repos, built bundles, and generated JavaScript output
+- Full LLM descriptions should be treated as an opt-in premium pass
+  - they can help on some conceptual queries, but they materially increase indexing time and cost
+  - the public recommendation should favor `--no-descriptions` unless there is a concrete quality reason to pay for full descriptions
+
 ## Important Python Modules
 
 - `engine/src/cli.py`: CLI surface

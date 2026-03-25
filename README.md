@@ -4,7 +4,7 @@
 
 quickcontext is a local code context engine for code search, indexing, parsing, and retrieval.
 
-It currently has two main parts:
+It currently has three main parts:
 
 - `service/`: a Rust binary for parsing, grep, skeleton generation, text search, protocol search, pattern search, symbol and caller lookup, import graph analysis, and local IPC
 - `engine/`: a Python SDK and CLI for indexing, Qdrant collection management, chunking, deduplication, embeddings, retrieval, watch mode, and edit operations
@@ -57,7 +57,7 @@ This repository is still a work in progress.
 - The current focus is the Rust service and Python engine
 - The design can still be improved in many places
 - We want contributors
-- A first-class MCP layer is planned but not part of the tracked repo yet
+- The tracked MCP layer is intentionally thin and wraps the Python SDK instead of becoming a separate parallel system
 
 If you want to help build it, issues and pull requests are welcome.
 
@@ -99,7 +99,7 @@ with QuickContext(config) as qc:
     stats = qc.index_directory(
         ".",
         project_name="quickcontext",
-        fast=True,
+        generate_descriptions=False,
         show_progress=False,
     )
     print(stats.total_chunks, stats.upserted_points)
@@ -158,7 +158,7 @@ cp quickcontext.local.example.json quickcontext.json
 
 This example uses local Qdrant, `fastembed`, and `llm: null`.
 
-For that setup, index with `--fast` or `--no-descriptions`.
+For that setup, index with `--no-descriptions` or `--fast`.
 
 ### Cloud config
 
@@ -175,6 +175,37 @@ cp quickcontext.example.json quickcontext.json
 ```
 
 Then replace the placeholder API keys before indexing.
+
+## Choosing An Indexing Profile
+
+The CLI and SDK support a few distinct indexing profiles. They are not equivalent.
+
+Recommended starting point for most repos:
+
+- CLI: `python -m engine index . --project <name> --no-descriptions`
+- SDK: `QuickContext.index_directory(..., generate_descriptions=False)`
+
+That profile keeps full extraction and normal chunk coverage, but skips LLM-authored descriptions. quickcontext still builds lightweight local fallback descriptions and still embeds them, so semantic and hybrid retrieval continue to work without paying the full LLM indexing cost.
+
+Profile guide:
+
+- `--no-descriptions`
+  Recommended default for most repos. Skips LLM description generation, keeps the normal indexing path, and usually preserves most retrieval quality at a much lower indexing cost.
+- `--fast`
+  Fastest indexing mode. It skips descriptions and also applies stricter filtering defaults. Use it for quick benchmarking, very large repos, or rough first-pass indexing when you want speed over recall.
+- `--no-skip-minified`
+  Keeps likely minified or generated chunks instead of filtering them. Use this when you care about built assets, dist bundles, or generated JavaScript output. It is often the right companion flag for frontend production builds.
+- default mode with no indexing flags
+  Full extraction plus LLM-generated descriptions, while still skipping likely minified noise by default. Use this when you want the richest descriptions and are willing to pay the extra time and API cost.
+
+Practical guidance:
+
+- Human-authored source repo: start with `--no-descriptions`
+- Dist-heavy frontend repo where built bundles matter: start with `--no-descriptions --no-skip-minified`
+- Very large repo or speed-first iteration: start with `--fast`
+- Premium indexing pass when you explicitly want richer natural-language descriptions: use the default mode without `--no-descriptions`
+
+The biggest indexing cost is usually description generation, not parsing or embedding. If you are unsure, start with `--no-descriptions` and only move to full descriptions when you have a concrete quality reason to do it.
 
 ### Service path
 
@@ -202,7 +233,7 @@ Copy-Item quickcontext.local.example.json quickcontext.json
 
 python -m engine status
 python -m engine init
-python -m engine index . --project quickcontext --fast
+python -m engine index . --project quickcontext --no-descriptions
 ```
 
 ### Linux
@@ -221,7 +252,7 @@ cp quickcontext.local.example.json quickcontext.json
 
 python -m engine status
 python -m engine init
-python -m engine index . --project quickcontext --fast
+python -m engine index . --project quickcontext --no-descriptions
 ```
 
 ## Running The Rust Service
