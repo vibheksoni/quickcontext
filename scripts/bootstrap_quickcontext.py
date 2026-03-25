@@ -149,6 +149,7 @@ def _write_config(
     print(f"+ write {config_path}")
     if dry_run:
         return
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(payload, encoding="utf-8")
 
 
