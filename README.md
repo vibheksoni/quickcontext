@@ -2,274 +2,36 @@
 
 ![quickcontext](assets/QuickContext-banner.png)
 
-quickcontext is a local code context engine for code search, indexing, parsing, and retrieval.
+quickcontext is a local code context engine built around a long-lived Rust service and a Python SDK.
 
-It currently has three main parts:
+The repository has four main surfaces:
 
-- `service/`: a Rust binary for parsing, grep, skeleton generation, text search, protocol search, pattern search, symbol and caller lookup, import graph analysis, and local IPC
-- `engine/`: a Python SDK and CLI for indexing, Qdrant collection management, chunking, deduplication, embeddings, retrieval, watch mode, and edit operations
-- `qc_mcp/`: a thin FastMCP server that wraps the Python SDK with agent-friendly indexing and retrieval tools
-
-The SDK now includes AI-facing retrieval helpers:
-
-- `QuickContext.retrieve_context_auto(...)`
-  Default AI entrypoint. It routes exact symbol questions to the Rust symbol index first, expands behavior-oriented symbol questions with same-file helper symbols from indexed Rust metadata plus targeted source hydration, falls back to semantic or bundle retrieval for broader natural-language questions, enriches strong text-primary queries with import-aware and module-local related files, accepts explicit `path=` scoping when the target repo is outside the current working directory, and degrades to Rust text retrieval when an external repo has not been vector-indexed yet.
-- `QuickContext.project_info(...)`
-  Stable project discovery entrypoint for downstream wrappers. It reports the detected project name, cache state, parser connectivity, Qdrant availability, current collection metadata, and optional folder scopes.
-- `QuickContext.list_projects(...)`
-  Returns typed project collection summaries so wrappers no longer need to import `CollectionManager` directly just to discover indexed projects.
-- `QuickContext.qdrant_available(...)`
-  Explicit backend health probe for wrappers that need to distinguish “no indexed projects” from “vector store is currently unreachable”.
-- `QuickContext.start_index_directory(...)`
-  Starts SDK-owned background indexing and returns a pollable operation snapshot instead of forcing each wrapper to invent its own job registry.
-- `QuickContext.start_refresh_files(...)`
-  Starts SDK-owned background refresh work with the same pollable snapshot model.
-- `QuickContext.get_operation_status(...)` and `QuickContext.list_operation_statuses(...)`
-  Poll live indexing and refresh snapshots, including stage, files remaining, chunks kept, description progress, embedding progress, and points upserted.
-- `QuickContext.warm_project(...)`
-  Optional startup warmup for the long-lived Rust service. It preloads the persisted Rust symbol and text indices for a project so the first real query is cheaper.
-- `QuickContext.start_background_warm(...)`
-  Optional idle warmup for long-lived SDK sessions. It schedules the same project warmup to happen once the session goes idle instead of blocking startup.
-- `QuickContext.semantic_search_auto(...)`
-  Lets the SDK choose between fast direct semantic retrieval and the deeper graph-aware bundle path. It also accepts explicit `path=` scoping for external repos.
-- `QuickContext.semantic_search_bundle(...)`
-  Returns semantic anchors plus distinct semantic neighbor files, related import-graph files, and caller context for deeper codebase exploration. It also accepts explicit `path=` scoping for external repos.
-
-Use `retrieve_context_auto(...)` as the default for AI workflows, `semantic_search(...)` for direct semantic retrieval, `semantic_search_auto(...)` when you specifically want semantic-only auto-routing, and `semantic_search_bundle(...)` when you explicitly want the deeper cross-file expansion path.
-If you run the service as a long-lived process, call `warm_project('.')` once after startup to preload local indices before the first heavy query. If you do not want to pay that startup cost up front, call `start_background_warm('.')` and let the SDK defer the same warmup until the session goes idle.
-Entering `with QuickContext(...)` keeps subsystems lazy: parser-only flows do not preconnect Qdrant, and vector features still connect on first use.
-When the repo you want to inspect is outside the process cwd, pass that repo root through `path=` on the AI-facing retrieval helpers so Rust symbol/text routing, helper expansion, caller expansion, and benchmark harnesses stay scoped to the right codebase.
-Full alias/shadow indexing now writes a local resume manifest under `.quickcontext/`, so if indexing is interrupted it can reuse the in-progress shadow collection instead of discarding files that were already upserted.
-When `fast=True`, the indexer now downgrades obvious large minified JavaScript bundle artifacts to a small number of coarse file chunks before deep extraction. That keeps generated trees indexable without paying full parser cost on huge hashed bundles.
-Those generated artifact chunks now also prepend a deterministic semantic projection of extracted services, methods, types, fields, and relevant strings so semantic retrieval has better signal on dist-heavy JavaScript bundles even when fast mode skips full symbol extraction.
-Generated artifact chunk sampling now prefers structurally interesting hotspots from extracted service/type/method/field/string signals before filling the remaining windows with broad file coverage, so large generated bundles are more likely to expose the relevant region to semantic retrieval.
-Large generated bundle files now also emit one distributed summary packet that aggregates signals from multiple structural hotspots across the file, giving semantic retrieval one cheaper file-level anchor in addition to the per-window artifact chunks.
-Generated artifact fallback descriptions can optionally be upgraded with compact batched LLM metadata behind the `artifact_metadata_*` LLM config knobs, so you can experiment with richer generated-code interpretation without enabling full per-chunk descriptions.
-AI-facing retrieval now tries to replace top generated-bundle summary hits with a tighter file-local grep-backed focus snippet before returning results, so agents see the most relevant local evidence inside a generated file instead of only a broad artifact packet.
-If Rust extraction returns no symbols for a file and a ready language server exists for that language, the SDK now opportunistically enriches that file with LSP document symbols before chunking so indexing can still use AST-backed structure instead of falling back straight to whole-file chunks.
-On Windows, npm-installed language servers are now resolved directly from the npm global bin directory for readiness checks and Rust-side LSP spawning, so installing them does not require restarting the shell just to make them discoverable.
-The indexing stats now include real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and Qdrant upsert.
-
-## Status
-
-This repository is still a work in progress.
-
-- The current focus is the Rust service and Python engine
-- The design can still be improved in many places
-- We want contributors
-- The tracked MCP layer is intentionally thin and wraps the Python SDK instead of becoming a separate parallel system
-
-If you want to help build it, issues and pull requests are welcome.
-
-## AI Agent Setup
-
-This repository includes [AI_DOCS.md](AI_DOCS.md) as the clean agent-facing project guide.
-
-If your coding assistant expects `AGENTS.md` or `CLAUDE.md`, copy `AI_DOCS.md` to the filename your tool expects in your local setup.
-
-## Python SDK Examples
-
-```python
-from engine.sdk import QuickContext
-from engine.src.config import EngineConfig
-
-config = EngineConfig.from_json("quickcontext.json")
-
-with QuickContext(config) as qc:
-    qc.warm_project(".")
-
-    payload = qc.retrieve_context_auto(
-        "How does the Python layer decide how to connect to the Rust service on Windows versus Linux?",
-        project_name="quickcontext",
-        path=".",
-        limit=3,
-    )
-
-    for item in payload["results"]:
-        print(item.file_path, item.symbol_name, item.line_start, item.line_end)
-```
-
-```python
-from engine.sdk import QuickContext
-from engine.src.config import EngineConfig
-
-config = EngineConfig.from_json("quickcontext.json")
-
-with QuickContext(config) as qc:
-    stats = qc.index_directory(
-        ".",
-        project_name="quickcontext",
-        generate_descriptions=False,
-        show_progress=False,
-    )
-    print(stats.total_chunks, stats.upserted_points)
-```
-
-## Repository Layout
-
-- `engine/`: Python package and CLI entrypoint
-- `qc_mcp/`: FastMCP server package
-- `service/`: Rust service and command-line binary
-- `docker-compose.yml`: local Qdrant container
-- `requirements.txt`: Python dependencies
-- `quickcontext.local.example.json`: local config using `fastembed`
-- `quickcontext.example.json`: cloud config using `litellm`
-
-## Platform Support
-
-The transport layer supports both Windows and Linux.
-
-- Windows transport: named pipe `\\.\pipe\quickcontext`
-- Linux transport: `transport.unix_socket_path` from `quickcontext.json` when set, then `$XDG_RUNTIME_DIR/quickcontext.sock`, then `/tmp/quickcontext-<user>.sock`
-
-The request protocol is the same on both platforms: 4-byte little-endian length prefix plus JSON payload.
-
-The Rust text-search path now persists file-category and path-field metadata alongside content terms, so lexical retrieval can use both content and file-path signals while downweighting low-priority generated/test-like files.
-
-## Requirements
-
-- Python 3.10 or newer
-- Rust toolchain with Cargo
-- Native C/C++ build toolchain for the tree-sitter grammar crates
-- Docker if you want local Qdrant with `docker compose`
-- Windows or Linux
-
-## Configuration
-
-The Python CLI resolves configuration in this order:
-
-1. `quickcontext.json` or `.quickcontext.json`
-2. built-in defaults from `engine/src/config.py`
-
-Legacy `QC_*` environment variables still work as a fallback, but the recommended setup path is a checked-in or copied JSON config file.
-
-### Local config
-
-Windows:
-
-```powershell
-Copy-Item quickcontext.local.example.json quickcontext.json
-```
-
-Linux:
-
-```bash
-cp quickcontext.local.example.json quickcontext.json
-```
-
-This example uses local Qdrant, `fastembed`, and `llm: null`.
-
-For that setup, index with `--no-descriptions` or `--fast`.
-
-### Cloud config
-
-Windows:
-
-```powershell
-Copy-Item quickcontext.example.json quickcontext.json
-```
-
-Linux:
-
-```bash
-cp quickcontext.example.json quickcontext.json
-```
-
-Then replace the placeholder API keys before indexing.
-
-Runtime settings such as the Rust service path, Unix socket override, and MCP transport options also live in `quickcontext.json` now:
-
-```json
-{
-  "service": {
-    "path": null
-  },
-  "transport": {
-    "windows_pipe_name": "\\\\.\\pipe\\quickcontext",
-    "unix_socket_path": null
-  },
-  "mcp": {
-    "transport": "stdio",
-    "host": "127.0.0.1",
-    "port": 8000,
-    "http_path": "/mcp/",
-    "stateless_http": false
-  }
-}
-```
-
-## Choosing An Indexing Profile
-
-The CLI and SDK support a few distinct indexing profiles. They are not equivalent.
-
-Recommended starting point for most repos:
-
-- CLI: `python -m engine index . --project <name> --no-descriptions`
-- SDK: `QuickContext.index_directory(..., generate_descriptions=False)`
-
-That profile keeps full extraction and normal chunk coverage, but skips LLM-authored descriptions. quickcontext still builds lightweight local fallback descriptions and still embeds them, so semantic and hybrid retrieval continue to work without paying the full LLM indexing cost.
-
-Profile guide:
-
-- `--no-descriptions`
-  Recommended default for most repos. Skips LLM description generation, keeps the normal indexing path, and usually preserves most retrieval quality at a much lower indexing cost.
-- `--fast`
-  Fastest indexing mode. It skips descriptions and also applies stricter filtering defaults. Use it for quick benchmarking, very large repos, or rough first-pass indexing when you want speed over recall.
-- `--no-skip-minified`
-  Keeps likely minified or generated chunks instead of filtering them. Use this when you care about built assets, dist bundles, or generated JavaScript output. It is often the right companion flag for frontend production builds.
-- default mode with no indexing flags
-  Full extraction plus LLM-generated descriptions, while still skipping likely minified noise by default. Use this when you want the richest descriptions and are willing to pay the extra time and API cost.
-
-Practical guidance:
-
-- Human-authored source repo: start with `--no-descriptions`
-- Dist-heavy frontend repo where built bundles matter: start with `--no-descriptions --no-skip-minified`
-- Very large repo or speed-first iteration: start with `--fast`
-- Premium indexing pass when you explicitly want richer natural-language descriptions: use the default mode without `--no-descriptions`
-
-The biggest indexing cost is usually description generation, not parsing or embedding. If you are unsure, start with `--no-descriptions` and only move to full descriptions when you have a concrete quality reason to do it.
-
-### Service path
-
-The Python layer looks for the service binary at:
-
-- `service/target/release/quickcontext-service.exe`
-- `service/target/release/quickcontext-service`
-
-If the binary lives somewhere else, set `service.path` in `quickcontext.json`.
+- `engine/`
+  Python SDK for indexing, retrieval, embeddings, Qdrant orchestration, and wrapper-friendly APIs
+- CLI
+  Terminal surface for setup, indexing, maintenance, inspection, and benchmarking
+- `qc_mcp/`
+  Thin FastMCP wrapper over the SDK
+- `service/`
+  Rust backend for parsing, grep, symbol lookup, text search, import graphs, protocol extraction, pattern matching, file operations, and IPC
 
 ## Quick Start
 
-The fastest first-run path is the bootstrap script. It creates `.venv`, installs Python dependencies, builds the Rust service, writes `quickcontext.json`, starts local Qdrant, and runs `engine init`.
-If `quickcontext.json` already exists, the bootstrap preserves the current provider and API settings and only fills in missing runtime defaults.
+Use the bootstrap flow for the fastest local setup.
 
-Windows PowerShell:
+Windows:
 
 ```powershell
 .\scripts\setup_quickcontext.ps1
 ```
 
-Cross-platform Python:
+Cross-platform:
 
 ```text
 python scripts/bootstrap_quickcontext.py
 ```
 
-What the bootstrap uses by default:
-
-- local config profile
-- debug Rust service build for faster first setup
-- HTTP-only local Qdrant config (`prefer_grpc: false`) for fewer Windows port issues
-- no API keys required
-
-Useful variants:
-
-```text
-python scripts/bootstrap_quickcontext.py --service-build release
-python scripts/bootstrap_quickcontext.py --profile cloud
-python scripts/bootstrap_quickcontext.py --config _ignore/bootstrap.local.json
-python scripts/bootstrap_quickcontext.py --dry-run
-```
+If `quickcontext.json` already exists, the bootstrap keeps the existing provider and API settings and only fills in missing runtime defaults.
 
 After bootstrap:
 
@@ -279,212 +41,56 @@ After bootstrap:
 .venv/Scripts/python.exe -m qc_mcp
 ```
 
-## Setup
+## Documentation
 
-The steps below are the manual fallback if you do not want to use the bootstrap script.
+Detailed docs are split by surface:
 
-### Windows
+- [SDK](docs/sdk.md)
+- [CLI](docs/cli.md)
+- [MCP](docs/mcp.md)
+- [Service](docs/service.md)
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+Agent-facing implementation notes live in [AI_DOCS.md](AI_DOCS.md).
 
-cargo build --release --manifest-path service/Cargo.toml
-docker compose up -d qdrant
+## Configuration
 
-Copy-Item quickcontext.local.example.json quickcontext.json
+quickcontext reads `quickcontext.json` or `.quickcontext.json`.
 
-python -m engine status
-python -m engine init
-python -m engine index . --project quickcontext --no-descriptions
-```
+Start from one of these examples:
 
-### Linux
+- `quickcontext.local.example.json`
+  Local Qdrant, local embeddings, no API keys required
+- `quickcontext.example.json`
+  Cloud embeddings and LLM configuration
 
-```bash
-sudo apt-get install -y build-essential
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+The JSON config model includes:
 
-cargo build --release --manifest-path service/Cargo.toml
-docker compose up -d qdrant
-
-cp quickcontext.local.example.json quickcontext.json
-
-python -m engine status
-python -m engine init
-python -m engine index . --project quickcontext --no-descriptions
-```
-
-## Running The Rust Service
-
-The Python layer can auto-start the Rust service if the binary exists at the default path. Running it manually is still the clearest option.
-
-Windows:
-
-```powershell
-.\service\target\release\quickcontext-service.exe serve
-```
-
-Linux:
-
-```bash
-./service/target/release/quickcontext-service serve
-```
-
-## MCP Server
-
-The tracked repository now includes a thin FastMCP wrapper around the Python SDK. The MCP surface is intentionally narrow:
-
-- `project_info`: inspect one path, detect the project name, check index state, and list useful folder scopes
-- `list_projects`: list currently indexed projects
-- `index`: index a path for semantic retrieval and suppress duplicate active runs for the same target
-- `index_status`: inspect the latest or active indexing run
-- `search`: main AI-facing retrieval tool with `auto`, `text`, `semantic`, and `bundle` modes
-- `grep`: exact literal grep through the Rust service
-- `symbol_lookup`: exact or near-exact identifier lookup through the Rust symbol index
-
-For path-scoped MCP tools, always pass an explicit target path. Do not rely on the MCP server process working directory.
-
-Run it locally over stdio:
-
-```text
-venv/Scripts/python.exe -m qc_mcp
-```
-
-Run it as a long-lived HTTP server:
-
-```text
-venv/Scripts/python.exe -m qc_mcp
-```
-
-To switch the MCP server to HTTP, set the `mcp` section in `quickcontext.json`:
-
-```json
-{
-  "mcp": {
-    "transport": "http",
-    "host": "127.0.0.1",
-    "port": 8000,
-    "http_path": "/mcp/",
-    "stateless_http": false
-  }
-}
-```
-
-You can also override those values directly on startup without using environment variables:
-
-```text
-venv/Scripts/python.exe -m qc_mcp --config quickcontext.json --transport http --host 127.0.0.1 --port 8000
-```
-
-## Common Python CLI Commands
-
-```text
-python -m engine parse .
-python -m engine lsp-setup <path>
-python -m engine lsp-sessions
-python -m engine lsp-shutdown-all
-python -m engine grep "CollectionManager"
-python -m engine skeleton . --markdown
-python -m engine text-search "auth token"
-python -m engine protocol-search "request response"
-python -m engine pattern-search "(function_definition name: (identifier) @name)" --lang python
-python -m engine search "chunk filter" --project quickcontext
-python -m engine warm .
-python -m engine benchmark-context --project quickcontext --path . --cases-file scripts/context_retrieval_cases_template.json
-python -m engine benchmark-compare --project quickcontext --path . --cases-file scripts/context_retrieval_cases_template.json
-python -m engine refresh engine/src/config.py --project quickcontext
-python -m engine watch .
-python -m engine list-projects
-python -m engine status
-```
-
-## LSP Setup
-
-quickcontext can detect which language servers a target project likely needs and print install commands for missing ones.
-
-Preview the plan:
-
-```text
-python -m engine lsp-setup "C:/path/to/project"
-```
-
-Run supported auto-installs:
-
-```text
-python -m engine lsp-setup "C:/path/to/project" --install
-```
-
-Check readiness after install:
-
-```text
-python -m engine lsp-check "C:/path/to/project"
-```
-
-One-step guided flow:
-
-```text
-python -m engine lsp-setup "C:/path/to/project" --install --check
-```
-
-Windows PowerShell wrapper:
-
-```powershell
-.\scripts\setup_project_lsps.ps1 -Path "C:\path\to\project"
-.\scripts\setup_project_lsps.ps1 -Path "C:\path\to\project" -Install
-.\scripts\setup_project_lsps.ps1 -Path "C:\path\to\project" -Install -Check
-```
-
-Notes:
-
-- The setup command is project-scoped. Pass the actual target repo path.
-- Some servers have automatic install commands; others are reported as manual-only with notes.
-- The command checks whether the expected LSP binary is already on `PATH`.
-- `lsp-check` reports `ready`, `missing`, `installed`, or `error` based on binary presence plus a lightweight probe where available.
-- `lsp-sessions` lists the language servers the Rust service is actively tracking, including pid and project root.
-- `lsp-shutdown-all` explicitly shuts down those tracked language-server sessions for cleanup without stopping the whole service.
+- `qdrant`
+- `code_embedding`
+- `desc_embedding`
+- `llm`
+- `service`
+- `transport`
+- `mcp`
 
 ## Validation
 
-Useful validation commands during development:
+Useful validation commands:
 
 ```text
 cargo check --manifest-path service/Cargo.toml
 cargo test --manifest-path service/Cargo.toml
 python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py
-venv/Scripts/python.exe -m unittest engine.tests.test_regressions
-venv/Scripts/python.exe scripts/retrieval_benchmark.py --config quickcontext.json --project quickcontext
-venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/context_retrieval_cases.json --strategy context-auto
-venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project external-bench --path <target-root> --cases-file scripts/augmentintent_dist_cases.json --strategy context-auto
-venv/Scripts/python.exe -m engine --config quickcontext.json benchmark-context --project external-bench --path <target-root> --cases-file scripts/context_retrieval_cases_template.json --strategy context-auto
-venv/Scripts/python.exe -m engine --config quickcontext.json benchmark-compare --project external-bench --path <target-root> --cases-file scripts/context_retrieval_cases_template.json
-venv/Scripts/python.exe scripts/symbol_context_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/symbol_context_cases.json --strategy context-auto
-venv/Scripts/python.exe scripts/context_retrieval_benchmark.py --config quickcontext.json --project quickcontext --cases-file scripts/graph_retrieval_cases.json --strategy context-auto
-venv/Scripts/python.exe scripts/text_retrieval_benchmark.py --config quickcontext.json --cases-file scripts/context_retrieval_cases.json --show-top 3
-venv/Scripts/python.exe scripts/warm_project_benchmark.py --config quickcontext.json --project quickcontext --path . --query "How does CodeSearcher.search_hybrid merge code and description vectors?"
+venv/Scripts/python.exe -m unittest engine.tests.test_regressions engine.tests.test_mcp_server engine.tests.test_bootstrap_setup
 ```
 
-For local performance work, keep benchmark notes in `BENCHMARK_LOCAL.md`. That file is intentionally gitignored.
+## Requirements
 
-## Contributing
-
-Contributors are wanted.
-
-Good areas to help with:
-
-- indexing quality
-- retrieval and ranking
-- protocol extraction quality
-- chunking and deduplication
-- Linux and cross-platform polish
-- future MCP support
-
-If you want to contribute, start by reading [AI_DOCS.md](AI_DOCS.md).
+- Python 3.10 or newer
+- Rust toolchain with Cargo
+- Native build tooling for the tree-sitter grammar crates
+- Docker if you want local Qdrant with `docker compose`
+- Windows or Linux
 
 ## License
 
