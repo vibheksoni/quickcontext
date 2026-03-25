@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 from fastmcp import Client
 
+from engine.src.config import EngineConfig, MCPConfig
 from engine.src.sdk_models import IndexOperationSnapshot
-from quickcontext_mcp.server import _now_iso, mcp
+from quickcontext_mcp.server import _now_iso, main, mcp
 
 
 def _run(coro):
@@ -163,3 +164,24 @@ class MCPServerTests(unittest.TestCase):
                 self.assertEqual(payload.duplicate_of, "run999")
 
             _run(_test())
+
+    def test_main_uses_mcp_settings_from_config(self) -> None:
+        config = EngineConfig(
+            mcp=MCPConfig(
+                transport="http",
+                host="0.0.0.0",
+                port=9100,
+                http_path="/custom-mcp/",
+                stateless_http=True,
+            )
+        )
+        with patch("quickcontext_mcp.server._load_config", return_value=config), patch("quickcontext_mcp.server.mcp.run") as run:
+            main([])
+
+        run.assert_called_once_with(
+            transport="http",
+            host="0.0.0.0",
+            port=9100,
+            path="/custom-mcp/",
+            stateless_http=True,
+        )

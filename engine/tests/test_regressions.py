@@ -15,7 +15,7 @@ from engine.src.artifact_semantics import extract_artifact_semantic_signals, fin
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.collection import CollectionManager
-from engine.src.config import CollectionVectorConfig, EngineConfig, LLMConfig, QdrantConfig
+from engine.src.config import CollectionVectorConfig, EngineConfig, LLMConfig, QdrantConfig, ServiceConfig, TransportConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import ChunkDescription, DescriptionGenerator, build_fallback_description
 from engine.src.embedder import DualEmbedder, EmbeddingProviderStats
@@ -3831,11 +3831,27 @@ class RegressionTests(unittest.TestCase):
                 "b.py": IndexedFileState(file_hash="hash-b", point_count=1),
             }
             completed, pending = qc._resume_pending_files(expected, indexed)
+            self.assertEqual(completed, ["a.py"])
+            self.assertEqual(pending, ["b.py", "c.py"])
         finally:
             qc.close()
 
-        self.assertEqual(completed, ["a.py"])
-        self.assertEqual(pending, ["b.py", "c.py"])
+    def test_rust_parser_service_uses_configured_runtime_paths(self) -> None:
+        config = EngineConfig(
+            qdrant=None,
+            code_embedding=None,
+            desc_embedding=None,
+            llm=None,
+            service=ServiceConfig(path="C:/tools/quickcontext-service.exe"),
+            transport=TransportConfig(windows_pipe_name=r"\\.\pipe\quickcontext-custom"),
+        )
+        with mock.patch("engine.src.parsing.PipeClient") as client:
+            RustParserService(config=config)
+
+        client.assert_called_once_with(
+            pipe_name=r"\\.\pipe\quickcontext-custom",
+            service_path="C:/tools/quickcontext-service.exe",
+        )
 
     def test_index_resume_state_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

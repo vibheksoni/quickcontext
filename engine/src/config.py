@@ -6,6 +6,7 @@ import json
 
 
 CONFIG_FILENAMES = ["quickcontext.json", ".quickcontext.json"]
+WINDOWS_PIPE_NAME = r"\\.\pipe\quickcontext"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,49 @@ class QdrantConfig:
         url: str — Full HTTP URL for the Qdrant instance.
         """
         return f"http://{self.host}:{self.port}"
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceConfig:
+    """
+    Rust service runtime configuration.
+
+    path: Optional[str] — Explicit path to the quickcontext-service binary.
+    """
+
+    path: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class TransportConfig:
+    """
+    Local IPC transport configuration.
+
+    windows_pipe_name: str — Named pipe used on Windows.
+    unix_socket_path: Optional[str] — Explicit Unix socket path override.
+    """
+
+    windows_pipe_name: str = WINDOWS_PIPE_NAME
+    unix_socket_path: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class MCPConfig:
+    """
+    FastMCP server runtime configuration.
+
+    transport: str — MCP transport, usually "stdio" or "http".
+    host: str — HTTP bind host when transport is HTTP.
+    port: int — HTTP bind port when transport is HTTP.
+    http_path: str — HTTP route path when transport is HTTP.
+    stateless_http: bool — Whether HTTP mode should be stateless.
+    """
+
+    transport: str = "stdio"
+    host: str = "127.0.0.1"
+    port: int = 8000
+    http_path: str = "/mcp/"
+    stateless_http: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +184,9 @@ class EngineConfig:
     code_embedding: Optional[EmbeddingConfig] — Embedding config for code vectors. None = no code embeddings.
     desc_embedding: Optional[EmbeddingConfig] — Embedding config for description vectors. None = no desc embeddings.
     llm: Optional[LLMConfig] — LLM config for code description generation. None = no LLM descriptions.
+    service: ServiceConfig — Rust service runtime configuration.
+    transport: TransportConfig — Local IPC transport configuration.
+    mcp: MCPConfig — MCP runtime configuration.
     vectors: list[CollectionVectorConfig] — Named vector spaces for the collection.
     """
 
@@ -152,6 +199,9 @@ class EngineConfig:
         )
     )
     llm: Optional[LLMConfig] = field(default_factory=LLMConfig)
+    service: ServiceConfig = field(default_factory=ServiceConfig)
+    transport: TransportConfig = field(default_factory=TransportConfig)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
     vectors: list[CollectionVectorConfig] = field(
         default_factory=lambda: [
             CollectionVectorConfig(name="code", dimension=768, distance="cosine"),
@@ -174,6 +224,9 @@ class EngineConfig:
         code_raw = data.get("code_embedding", _sentinel)
         desc_raw = data.get("desc_embedding", _sentinel)
         llm_raw = data.get("llm", _sentinel)
+        service_raw = data.get("service", _sentinel)
+        transport_raw = data.get("transport", _sentinel)
+        mcp_raw = data.get("mcp", _sentinel)
         vectors_data = data.get("vectors", None)
 
         if qdrant_raw is None:
@@ -219,6 +272,30 @@ class EngineConfig:
                 if k in LLMConfig.__dataclass_fields__
             })
 
+        if service_raw is _sentinel or not service_raw:
+            service = ServiceConfig()
+        else:
+            service = ServiceConfig(**{
+                k: v for k, v in service_raw.items()
+                if k in ServiceConfig.__dataclass_fields__
+            })
+
+        if transport_raw is _sentinel or not transport_raw:
+            transport = TransportConfig()
+        else:
+            transport = TransportConfig(**{
+                k: v for k, v in transport_raw.items()
+                if k in TransportConfig.__dataclass_fields__
+            })
+
+        if mcp_raw is _sentinel or not mcp_raw:
+            mcp = MCPConfig()
+        else:
+            mcp = MCPConfig(**{
+                k: v for k, v in mcp_raw.items()
+                if k in MCPConfig.__dataclass_fields__
+            })
+
         vectors = [
             CollectionVectorConfig(**v) for v in vectors_data
         ] if vectors_data else [
@@ -231,6 +308,9 @@ class EngineConfig:
             code_embedding=code_embedding,
             desc_embedding=desc_embedding,
             llm=llm,
+            service=service,
+            transport=transport,
+            mcp=mcp,
             vectors=vectors,
         )
 
@@ -250,12 +330,13 @@ class EngineConfig:
         """
         Build EngineConfig from environment variables.
 
-        Reads: QC_QDRANT_HOST, QC_QDRANT_PORT, QC_QDRANT_COLLECTION,
+        Reads legacy QC_QDRANT_HOST, QC_QDRANT_PORT, QC_QDRANT_COLLECTION,
                QC_CODE_PROVIDER, QC_CODE_MODEL, QC_CODE_DIMENSION, QC_CODE_API_KEY,
                QC_DESC_PROVIDER, QC_DESC_MODEL, QC_DESC_DIMENSION, QC_DESC_API_KEY,
                QC_LLM_PROVIDER, QC_LLM_MODEL, QC_LLM_MAX_TOKENS, QC_LLM_API_KEY,
                QC_LLM_ARTIFACT_METADATA_ENABLED, QC_LLM_ARTIFACT_METADATA_BATCH_SIZE,
-               QC_LLM_ARTIFACT_METADATA_MAX_TOKENS, QC_LLM_ARTIFACT_METADATA_CHUNKS_PER_FILE.
+               QC_LLM_ARTIFACT_METADATA_MAX_TOKENS, QC_LLM_ARTIFACT_METADATA_CHUNKS_PER_FILE,
+               QC_SERVICE_PATH, QC_SOCKET_PATH, QC_MCP_*.
         Returns: EngineConfig — Config built from env vars with defaults.
         """
         qdrant = QdrantConfig(
@@ -326,11 +407,31 @@ class EngineConfig:
             artifact_metadata_chunks_per_file=int(os.environ.get("QC_LLM_ARTIFACT_METADATA_CHUNKS_PER_FILE", "2")),
         )
 
+        service = ServiceConfig(
+            path=os.environ.get("QC_SERVICE_PATH"),
+        )
+
+        transport = TransportConfig(
+            windows_pipe_name=os.environ.get("QC_WINDOWS_PIPE_NAME", WINDOWS_PIPE_NAME),
+            unix_socket_path=os.environ.get("QC_SOCKET_PATH"),
+        )
+
+        mcp = MCPConfig(
+            transport=os.environ.get("QC_MCP_TRANSPORT", "stdio"),
+            host=os.environ.get("QC_MCP_HOST", "127.0.0.1"),
+            port=int(os.environ.get("QC_MCP_PORT", "8000")),
+            http_path=os.environ.get("QC_MCP_HTTP_PATH", "/mcp/"),
+            stateless_http=os.environ.get("QC_MCP_STATELESS_HTTP", "false").lower() in {"1", "true", "yes", "on"},
+        )
+
         return EngineConfig(
             qdrant=qdrant,
             code_embedding=code_embedding,
             desc_embedding=desc_embedding,
             llm=llm,
+            service=service,
+            transport=transport,
+            mcp=mcp,
         )
 
     @staticmethod
@@ -362,8 +463,8 @@ class EngineConfig:
         """
         Auto-discover configuration. Priority:
         1. quickcontext.json / .quickcontext.json (walk up from CWD)
-        2. Environment variables (QC_* prefix)
-        3. Built-in defaults (fastembed, localhost Qdrant)
+        2. Legacy environment variables (QC_* prefix)
+        3. Built-in defaults
 
         Returns: EngineConfig — Resolved configuration.
         """

@@ -52,15 +52,16 @@ The protocol is the same on all supported platforms:
 Endpoints:
 
 - Windows: `\\.\pipe\quickcontext`
-- Linux: `QC_SOCKET_PATH`, then `$XDG_RUNTIME_DIR/quickcontext.sock`, then `/tmp/quickcontext-<user>.sock`
+- Linux: `transport.unix_socket_path` from `quickcontext.json` when set, then `$XDG_RUNTIME_DIR/quickcontext.sock`, then `/tmp/quickcontext-<user>.sock`
 
 ## Configuration
 
 Configuration resolution order:
 
 1. `quickcontext.json` or `.quickcontext.json`
-2. `QC_*` environment variables
-3. built-in defaults from `engine/src/config.py`
+2. built-in defaults from `engine/src/config.py`
+
+Legacy `QC_*` environment variables still exist as a fallback, but the intended setup path is the JSON config file.
 
 Important config ideas:
 
@@ -68,6 +69,7 @@ Important config ideas:
 - indexing and semantic search require Qdrant plus embedding configuration
 - local example config uses `fastembed`
 - cloud example config uses `litellm`
+- runtime settings such as the Rust service path, Unix socket override, and MCP transport options now belong in `quickcontext.json` under `service`, `transport`, and `mcp`
 - embedding dimensions must match the Qdrant collection vector dimensions
 - the Rust symbol index snapshot lives in `.quickcontext/symbol_index.redb` and uses a compact binary payload format for faster cold loads
 - the persisted Rust text index also stores file-category and path-field metadata so text search can blend content and path signals while downweighting low-priority file classes

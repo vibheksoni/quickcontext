@@ -20,6 +20,20 @@
     "batch_size": 32
   },
   "llm": null,
+  "service": {
+    "path": null
+  },
+  "transport": {
+    "windows_pipe_name": "\\\\.\\pipe\\quickcontext",
+    "unix_socket_path": null
+  },
+  "mcp": {
+    "transport": "stdio",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "http_path": "/mcp/",
+    "stateless_http": false
+  },
   "vectors": [
     {
       "name": "code",

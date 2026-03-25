@@ -349,7 +349,7 @@ class QuickContext:
         return True
 
     def _background_warm_once(self, path: str | Path) -> None:
-        service = RustParserService()
+        service = RustParserService(config=self._config)
         try:
             service.warm_project(path=path)
         finally:
@@ -511,7 +511,7 @@ class QuickContext:
         Returns: RustParserService — Lazy-initialized Rust pipe parser wrapper.
         """
         if self._parser_service is None:
-            self._parser_service = RustParserService()
+            self._parser_service = RustParserService(config=self._config)
         return self._parser_service
 
     @property

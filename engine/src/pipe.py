@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from engine.src.config import EngineConfig
+
 
 IS_WINDOWS = os.name == "nt"
 WINDOWS_PIPE_NAME = r"\\.\pipe\quickcontext"
@@ -75,7 +77,13 @@ if IS_WINDOWS:
     kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
 
 
-def _default_unix_socket_path() -> str:
+def _default_unix_socket_path(config: EngineConfig | None = None) -> str:
+    configured_path = ""
+    if config is not None:
+        configured_path = str(config.transport.unix_socket_path or "").strip()
+    if configured_path:
+        return configured_path
+
     env_path = os.environ.get(SOCKET_PATH_ENV_VAR, "").strip()
     if env_path:
         return env_path
@@ -89,7 +97,16 @@ def _default_unix_socket_path() -> str:
     return str(Path("/tmp") / f"quickcontext-{safe_user}.sock")
 
 
-PIPE_NAME = WINDOWS_PIPE_NAME if IS_WINDOWS else _default_unix_socket_path()
+def resolve_pipe_name(config: EngineConfig | None = None) -> str:
+    if IS_WINDOWS:
+        configured_pipe = ""
+        if config is not None:
+            configured_pipe = str(config.transport.windows_pipe_name or "").strip()
+        return configured_pipe or WINDOWS_PIPE_NAME
+    return _default_unix_socket_path(config)
+
+
+PIPE_NAME = resolve_pipe_name()
 
 
 class PipeError(Exception):
@@ -138,8 +155,8 @@ class PipeClient:
     * service_path -- Optional[str], path to quickcontext-service binary for auto-start
     """
 
-    def __init__(self, pipe_name: str = PIPE_NAME, service_path: Optional[str] = None):
-        self._pipe_name = pipe_name
+    def __init__(self, pipe_name: Optional[str] = None, service_path: Optional[str] = None):
+        self._pipe_name = pipe_name or PIPE_NAME
         self._service_path = service_path
         self._handle: Optional[int] = None
         self._socket: Optional[socket.socket] = None

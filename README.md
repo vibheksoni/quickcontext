@@ -120,7 +120,7 @@ with QuickContext(config) as qc:
 The transport layer supports both Windows and Linux.
 
 - Windows transport: named pipe `\\.\pipe\quickcontext`
-- Linux transport: Unix socket from `QC_SOCKET_PATH`, then `$XDG_RUNTIME_DIR/quickcontext.sock`, then `/tmp/quickcontext-<user>.sock`
+- Linux transport: `transport.unix_socket_path` from `quickcontext.json` when set, then `$XDG_RUNTIME_DIR/quickcontext.sock`, then `/tmp/quickcontext-<user>.sock`
 
 The request protocol is the same on both platforms: 4-byte little-endian length prefix plus JSON payload.
 
@@ -139,8 +139,9 @@ The Rust text-search path now persists file-category and path-field metadata alo
 The Python CLI resolves configuration in this order:
 
 1. `quickcontext.json` or `.quickcontext.json`
-2. `QC_*` environment variables
-3. built-in defaults from `engine/src/config.py`
+2. built-in defaults from `engine/src/config.py`
+
+Legacy `QC_*` environment variables still work as a fallback, but the recommended setup path is a checked-in or copied JSON config file.
 
 ### Local config
 
@@ -175,6 +176,27 @@ cp quickcontext.example.json quickcontext.json
 ```
 
 Then replace the placeholder API keys before indexing.
+
+Runtime settings such as the Rust service path, Unix socket override, and MCP transport options also live in `quickcontext.json` now:
+
+```json
+{
+  "service": {
+    "path": null
+  },
+  "transport": {
+    "windows_pipe_name": "\\\\.\\pipe\\quickcontext",
+    "unix_socket_path": null
+  },
+  "mcp": {
+    "transport": "stdio",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "http_path": "/mcp/",
+    "stateless_http": false
+  }
+}
+```
 
 ## Choosing An Indexing Profile
 
@@ -214,7 +236,7 @@ The Python layer looks for the service binary at:
 - `service/target/release/quickcontext-service.exe`
 - `service/target/release/quickcontext-service`
 
-If the binary lives somewhere else, set `QC_SERVICE_PATH`.
+If the binary lives somewhere else, set `service.path` in `quickcontext.json`.
 
 ## Setup
 
@@ -294,20 +316,28 @@ venv/Scripts/python.exe -m quickcontext_mcp
 Run it as a long-lived HTTP server:
 
 ```text
-set QC_MCP_TRANSPORT=http
-set QC_MCP_HOST=127.0.0.1
-set QC_MCP_PORT=8000
 venv/Scripts/python.exe -m quickcontext_mcp
 ```
 
-Useful environment variables:
+To switch the MCP server to HTTP, set the `mcp` section in `quickcontext.json`:
 
-- `QC_MCP_CONFIG`: explicit config file path. Defaults to `quickcontext.json`, then `.quickcontext.json`, then auto config resolution.
-- `QC_MCP_TRANSPORT`: `stdio` or `http`
-- `QC_MCP_HOST`: HTTP bind host
-- `QC_MCP_PORT`: HTTP bind port
-- `QC_MCP_HTTP_PATH`: HTTP MCP route path, default `/mcp/`
-- `QC_MCP_STATELESS_HTTP`: `true` or `false` for stateless HTTP mode
+```json
+{
+  "mcp": {
+    "transport": "http",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "http_path": "/mcp/",
+    "stateless_http": false
+  }
+}
+```
+
+You can also override those values directly on startup without using environment variables:
+
+```text
+venv/Scripts/python.exe -m quickcontext_mcp --config quickcontext.json --transport http --host 127.0.0.1 --port 8000
+```
 
 ## Common Python CLI Commands
 

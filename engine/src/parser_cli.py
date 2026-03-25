@@ -15,8 +15,7 @@ def _load_config(config_path: str | None) -> EngineConfig:
 
 
 def _service(config: EngineConfig) -> RustParserService:
-    del config
-    return RustParserService()
+    return RustParserService(config=config)
 
 
 def _print_json(data) -> None:

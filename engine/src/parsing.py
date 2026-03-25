@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any, Optional
 import os
 
-from engine.src.pipe import PIPE_NAME, PipeClient, PipeProtocolError
+from engine.src.config import EngineConfig
+from engine.src.pipe import PipeClient, PipeProtocolError, resolve_pipe_name
 
 
 def _normalize_file_path(value: Any) -> str:
@@ -1581,13 +1582,20 @@ class RustParserService:
     _client: PipeClient — Low-level transport client.
     """
 
-    def __init__(self, pipe_name: str = PIPE_NAME, service_path: Optional[str] = None):
+    def __init__(
+        self,
+        pipe_name: Optional[str] = None,
+        service_path: Optional[str] = None,
+        config: EngineConfig | None = None,
+    ):
         """
         pipe_name: str — Transport endpoint path.
         service_path: Optional[str] — Optional explicit service binary path.
         """
-        resolved_service_path = service_path or _default_service_path()
-        self._client = PipeClient(pipe_name=pipe_name, service_path=resolved_service_path)
+        resolved_config = config or EngineConfig.auto()
+        resolved_pipe_name = pipe_name or resolve_pipe_name(resolved_config)
+        resolved_service_path = service_path or _default_service_path(resolved_config)
+        self._client = PipeClient(pipe_name=resolved_pipe_name, service_path=resolved_service_path)
 
     @property
     def connected(self) -> bool:
@@ -2801,12 +2809,18 @@ class RustParserService:
         return self._client.lsp_shutdown_all()
 
 
-def _default_service_path() -> Optional[str]:
+def _default_service_path(config: EngineConfig | None = None) -> Optional[str]:
     """
     Resolve default Rust service binary path.
 
     Returns: Optional[str] — Absolute path to quickcontext-service binary if found.
     """
+    configured_path = None
+    if config is not None:
+        configured_path = config.service.path
+    if configured_path:
+        return str(configured_path)
+
     env_path = os.environ.get("QC_SERVICE_PATH")
     if env_path:
         return env_path

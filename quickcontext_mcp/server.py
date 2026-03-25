@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
@@ -257,22 +258,21 @@ class ProjectsResource(BaseModel):
 
 class IndexJobsResource(BaseModel):
     runs: list[IndexRunView]
+
+
 _CONFIG_LOCK = Lock()
 _CONFIG_CACHE: tuple[str, EngineConfig] | None = None
+_CONFIG_PATH_OVERRIDE: str = ""
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _resolve_config_path() -> str:
+    if _CONFIG_PATH_OVERRIDE:
+        return _CONFIG_PATH_OVERRIDE
+
     configured = os.environ.get("QC_MCP_CONFIG")
     if configured:
         return str(Path(configured).resolve())
@@ -1058,16 +1058,33 @@ def quickcontext_search_playbook(
     )
 
 
-def main() -> None:
-    transport = os.environ.get("QC_MCP_TRANSPORT", "stdio").strip().lower() or "stdio"
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="python -m quickcontext_mcp")
+    parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--transport", choices=["stdio", "http", "streamable-http", "sse"], default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--http-path", dest="http_path", default=None)
+    parser.add_argument("--stateless-http", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    global _CONFIG_PATH_OVERRIDE
+
+    args = _build_arg_parser().parse_args(argv)
+    _CONFIG_PATH_OVERRIDE = str(Path(args.config_path).resolve()) if args.config_path else ""
+    config = _load_config()
+
+    transport = (args.transport or config.mcp.transport or "stdio").strip().lower() or "stdio"
     if transport == "streamable-http":
         transport = "http"
 
     run_kwargs: dict[str, Any] = {}
     if transport in {"http", "sse"}:
-        run_kwargs["host"] = os.environ.get("QC_MCP_HOST", "127.0.0.1")
-        run_kwargs["port"] = int(os.environ.get("QC_MCP_PORT", "8000"))
-        run_kwargs["path"] = os.environ.get("QC_MCP_HTTP_PATH", "/mcp/")
-        run_kwargs["stateless_http"] = _env_flag("QC_MCP_STATELESS_HTTP", False)
+        run_kwargs["host"] = args.host or config.mcp.host
+        run_kwargs["port"] = int(args.port or config.mcp.port)
+        run_kwargs["path"] = args.http_path or config.mcp.http_path
+        run_kwargs["stateless_http"] = bool(args.stateless_http or config.mcp.stateless_http)
 
     mcp.run(transport=transport, **run_kwargs)
