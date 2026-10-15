@@ -1,23 +1,20 @@
 {
-  "qdrant": {
-    "host": "localhost",
-    "port": 6333,
-    "grpc_port": 6334,
-    "prefer_grpc": false,
-    "collection": "codebase",
-    "timeout": 30.0
+  "store": {
+    "path": null,
+    "upsert_batch_size": 512,
+    "max_cached_collections": 4
   },
   "code_embedding": {
     "provider": "fastembed",
     "model": "jinaai/jina-embeddings-v2-base-code",
     "dimension": 768,
-    "batch_size": 32
+    "batch_size": 16
   },
   "desc_embedding": {
     "provider": "fastembed",
     "model": "BAAI/bge-small-en-v1.5",
     "dimension": 384,
-    "batch_size": 32
+    "batch_size": 16
   },
   "llm": null,
   "service": {

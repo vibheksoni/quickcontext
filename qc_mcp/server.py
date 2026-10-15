@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
-from typing import Annotated, Any, Literal
+from threading import Lock, Thread
+from typing import Annotated, Any, Iterator, Literal
 import os
 import uuid
 
@@ -29,6 +30,9 @@ Use `grep` for exact literals and `symbol_lookup` for precise identifiers, funct
 Use `index` before semantic retrieval when the target codebase is not yet indexed or when the index should be refreshed.
 Pass `path` whenever the target repository is outside the current server working directory.
 Keep tool calls scoped and incremental: start with a narrow folder or project path when possible.
+
+Use `collect` to save anything worth remembering (findings, notes, snippets, tool output, docs) into a named
+collection, `recall` to retrieve it later by meaning or keywords, and `forget` to remove it.
 """.strip()
 
 
@@ -130,8 +134,8 @@ class ProjectInfoResponse(BaseModel):
     path: str
     project_name: str
     indexed: bool
-    qdrant_enabled: bool
-    qdrant_available: bool
+    vector_store_enabled: bool
+    vector_store_available: bool
     parser_connected: bool
     cache_entries: int
     cache_disk_bytes: int
@@ -143,7 +147,7 @@ class ProjectInfoResponse(BaseModel):
 
 
 class ListProjectsResponse(BaseModel):
-    qdrant_available: bool
+    vector_store_available: bool
     projects: list[ProjectSummary]
     active_index_runs: list[IndexRunView] = Field(default_factory=list)
 
@@ -233,6 +237,45 @@ class SymbolLookupResponse(BaseModel):
     results: list[SymbolHit] = Field(default_factory=list)
 
 
+class DocumentHit(BaseModel):
+    id: str
+    text: str
+    score: float = 0.0
+    tags: list[str] = Field(default_factory=list)
+    source: str | None = None
+    kind: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    added_at: float | None = None
+
+
+class CollectResponse(BaseModel):
+    collection: str
+    ids: list[str]
+
+
+class RecallResponse(BaseModel):
+    collection: str
+    query: str
+    mode: str
+    results: list[DocumentHit] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ForgetResponse(BaseModel):
+    collection: str
+    removed: int
+
+
+class DocumentCollectionView(BaseModel):
+    name: str
+    documents: int
+    search: str
+
+
+class CollectionsResponse(BaseModel):
+    collections: list[DocumentCollectionView] = Field(default_factory=list)
+
+
 class CapabilitiesResource(BaseModel):
     product: str = "quickcontext"
     server: str = "quickcontext-mcp"
@@ -243,7 +286,8 @@ class CapabilitiesResource(BaseModel):
     transport_guidance: str = "Use stdio for local desktop clients and streamable HTTP for long-lived multi-client deployments."
     notes: list[str] = Field(
         default_factory=lambda: [
-            "Semantic retrieval requires an indexed project and working Qdrant plus embedding configuration.",
+            "Semantic retrieval requires an indexed project plus embedding configuration; vectors live in an embedded SQLite store, no server needed.",
+            "collect/recall/forget give agents a persistent document memory with hybrid vector + BM25 recall.",
             "Text, grep, and symbol lookup routes work through the Rust service and do not require vector search.",
             "Repeated index calls for the same path/project attach to the existing active run instead of starting another index operation.",
             "Index status is backed by SDK-owned operation snapshots, including stage, files remaining, chunk counts, embedding progress, and upsert progress.",
@@ -263,6 +307,8 @@ class IndexJobsResource(BaseModel):
 _CONFIG_LOCK = Lock()
 _CONFIG_CACHE: tuple[str, EngineConfig] | None = None
 _CONFIG_PATH_OVERRIDE: str = ""
+_SDK_LOCK = Lock()
+_SDK: tuple[EngineConfig, QuickContext] | None = None
 
 
 def _now_iso() -> str:
@@ -302,6 +348,50 @@ def _load_config() -> EngineConfig:
         return config
 
 
+def _shared_sdk() -> QuickContext:
+    """
+    Return the process-wide SDK instance so embedding models, the Rust pipe, and
+    in-memory vector matrices stay warm across tool calls.
+    """
+    global _SDK
+
+    config = _load_config()
+    with _SDK_LOCK:
+        if _SDK is None or _SDK[0] is not config:
+            if _SDK is not None:
+                _SDK[1].close()
+            _SDK = (config, QuickContext(config))
+        return _SDK[1]
+
+
+@contextmanager
+def _session() -> Iterator[QuickContext]:
+    yield _shared_sdk()
+
+
+def _warm_shared_sdk() -> None:
+    """
+    Open the vector store and load local embedding models before the first tool
+    call so it does not pay model start-up. Remote providers are left alone to
+    avoid billable warm-up requests. Failures are ignored; tools retry lazily.
+    """
+    try:
+        qc = _shared_sdk()
+        if qc.config.store is not None:
+            qc.connect()
+        for attribute, embedding in (("code_provider", qc.config.code_embedding), ("desc_provider", qc.config.desc_embedding)):
+            if embedding is not None and embedding.provider == "fastembed":
+                getattr(qc, attribute).embed_single("warmup")
+    except Exception:
+        return
+
+
+def _start_background_warmup() -> None:
+    if os.environ.get("QC_MCP_WARMUP", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    Thread(target=_warm_shared_sdk, name="qc-mcp-warmup", daemon=True).start()
+
+
 def _normalize_scope_path(path: str) -> Path:
     return Path(path or ".").expanduser().resolve()
 
@@ -328,8 +418,8 @@ def _display_path(value: str | Path) -> str:
 def _friendly_error_message(exc: Exception) -> str:
     message = str(exc)
     lowered = message.lower()
-    if "6333" in lowered or "6334" in lowered or "connection refused" in lowered:
-        return "Qdrant is configured but unreachable at localhost:6333/6334. Start Qdrant or update quickcontext.json before indexing or vector search."
+    if "collection not found" in lowered:
+        return f"{message}. Index the project (or collect documents) first."
     return message
 
 
@@ -465,10 +555,9 @@ def _search_impl(
 ) -> SearchResponse:
     scope = _normalize_scope_path(path)
     anchor = _project_anchor(scope)
-    config = _load_config()
     resolved_project = detect_project_name(anchor, manual_override=project_name)
 
-    with QuickContext(config) as qc:
+    with _session() as qc:
         indexed = qc.project_collection_info(resolved_project).indexed
         if mode == "text":
             result = qc.text_search(
@@ -579,8 +668,7 @@ def _search_impl(
 
 
 def _project_info_impl(*, path: str, project_name: str | None) -> ProjectInfoResponse:
-    config = _load_config()
-    with QuickContext(config) as qc:
+    with _session() as qc:
         info = qc.project_info(
             path=path,
             project_name=project_name,
@@ -600,8 +688,8 @@ def _project_info_impl(*, path: str, project_name: str | None) -> ProjectInfoRes
         path=_display_path(info.path),
         project_name=info.project_name,
         indexed=info.indexed,
-        qdrant_enabled=info.qdrant_enabled,
-        qdrant_available=info.qdrant_available,
+        vector_store_enabled=info.vector_store_enabled,
+        vector_store_available=info.vector_store_available,
         parser_connected=info.parser_connected,
         cache_entries=info.cache_entries,
         cache_disk_bytes=info.cache_disk_bytes,
@@ -623,8 +711,7 @@ def _project_info_impl(*, path: str, project_name: str | None) -> ProjectInfoRes
 
 
 def _list_projects_impl() -> ListProjectsResponse:
-    config = _load_config()
-    with QuickContext(config) as qc:
+    with _session() as qc:
         catalog = [
             ProjectSummary(
                 project_name=item.project_name,
@@ -636,9 +723,9 @@ def _list_projects_impl() -> ListProjectsResponse:
             )
             for item in sorted(qc.list_projects(), key=lambda entry: entry.project_name.lower())
         ]
-        qdrant_available = qc.qdrant_available(verify=True)
+        store_available = qc.vector_store_available(verify=True)
     return ListProjectsResponse(
-        qdrant_available=qdrant_available,
+        vector_store_available=store_available,
         projects=catalog,
         active_index_runs=[
             _operation_run_view(record)
@@ -656,8 +743,7 @@ def _grep_impl(
     after_context: int,
 ) -> GrepResponse:
     scope = _normalize_scope_path(path)
-    config = _load_config()
-    with QuickContext(config) as qc:
+    with _session() as qc:
         result = qc.grep_text(
             query=query,
             path=scope,
@@ -689,9 +775,8 @@ def _grep_impl(
 def _symbol_lookup_impl(*, query: str, path: str, project_name: str | None, limit: int) -> SymbolLookupResponse:
     scope = _normalize_scope_path(path)
     anchor = _project_anchor(scope)
-    config = _load_config()
     resolved_project = detect_project_name(anchor, manual_override=project_name)
-    with QuickContext(config) as qc:
+    with _session() as qc:
         result = qc.symbol_lookup(
             query=query,
             path=scope,
@@ -740,8 +825,7 @@ def _index_impl(*, path: str, project_name: str | None, reindex: bool, fast: boo
         )
         return _operation_run_view(failed)
 
-    config = _load_config()
-    with QuickContext(config) as qc:
+    with _session() as qc:
         snapshot = qc.start_index_directory(
             directory=scope,
             force_refresh=reindex,
@@ -750,6 +834,89 @@ def _index_impl(*, path: str, project_name: str | None, reindex: bool, fast: boo
         )
     attached = snapshot.message == "Already running"
     return _operation_run_view(snapshot, attached=attached, duplicate_of=snapshot.operation_id if attached else None)
+
+
+def _document_hit(item: Any) -> DocumentHit:
+    return DocumentHit.model_validate(item.to_dict())
+
+
+def _collect_impl(
+    *,
+    collection: str,
+    items: list[str | dict[str, Any]],
+    tags: list[str] | None,
+    source: str | None,
+    kind: str | None,
+    dedupe_threshold: float | None,
+) -> CollectResponse:
+    with _session() as qc:
+        ids = qc.collect(collection, items, tags=tags, source=source, kind=kind, dedupe_threshold=dedupe_threshold)
+    return CollectResponse(collection=collection, ids=ids)
+
+
+def _recall_impl(
+    *,
+    collection: str,
+    query: str,
+    limit: int,
+    mode: str,
+    tags: list[str] | None,
+    source: str | None,
+    kind: str | None,
+    where: dict[str, Any] | None,
+    diversity: float,
+    half_life_days: float | None,
+) -> RecallResponse:
+    try:
+        with _session() as qc:
+            results = qc.recall(
+                collection,
+                query,
+                limit=limit,
+                mode=mode,
+                tags=tags,
+                source=source,
+                kind=kind,
+                where=where,
+                diversity=diversity,
+                half_life_days=half_life_days,
+            )
+    except Exception as exc:
+        return RecallResponse(collection=collection, query=query, mode=mode, error=_friendly_error_message(exc))
+    return RecallResponse(
+        collection=collection,
+        query=query,
+        mode=mode,
+        results=[_document_hit(item) for item in results],
+    )
+
+
+def _forget_impl(
+    *,
+    collection: str,
+    ids: list[str] | None,
+    tags: list[str] | None,
+    source: str | None,
+    kind: str | None,
+) -> ForgetResponse:
+    with _session() as qc:
+        removed = qc.forget(collection, ids, tags=tags, source=source, kind=kind)
+    return ForgetResponse(collection=collection, removed=removed)
+
+
+def _collections_impl() -> CollectionsResponse:
+    with _session() as qc:
+        rows = qc.documents.collections()
+    return CollectionsResponse(
+        collections=[
+            DocumentCollectionView(
+                name=row["name"],
+                documents=int(row["points_count"]),
+                search="hybrid" if row["vectors"] else "keyword",
+            )
+            for row in rows
+        ]
+    )
 
 
 mcp = FastMCP(
@@ -788,7 +955,7 @@ async def project_info(
 
 @mcp.tool(
     name="list_projects",
-    description="List currently indexed QuickContext projects visible through Qdrant, plus any active indexing runs.",
+    description="List currently indexed QuickContext projects in the local vector store, plus any active indexing runs.",
     tags={"projects", "read", "discovery"},
     annotations={
         "title": "List Indexed Projects",
@@ -866,17 +1033,16 @@ async def index_status(
     ctx: Context = CurrentContext(),
 ) -> IndexStatusResponse:
     await ctx.info("Inspecting index run state")
-    config = _load_config()
 
     if run_id:
-        with QuickContext(config) as qc:
+        with _session() as qc:
             record = qc.get_operation_status(run_id)
         return IndexStatusResponse(runs=[] if record is None else [_operation_run_view(record)])
 
     if path:
         scope = _normalize_scope_path(path)
         anchor = _project_anchor(scope)
-        with QuickContext(config) as qc:
+        with _session() as qc:
             records = qc.get_operation_status_for_target(
                 kind="index",
                 path=anchor,
@@ -884,7 +1050,7 @@ async def index_status(
             )
         return IndexStatusResponse(runs=[_operation_run_view(record) for record in records])
 
-    with QuickContext(config) as qc:
+    with _session() as qc:
         records = qc.list_operation_statuses(active_only=False, limit=20)
     return IndexStatusResponse(runs=[_operation_run_view(record) for record in records if record.kind == "index"])
 
@@ -995,6 +1161,125 @@ async def symbol_lookup(
     )
 
 
+@mcp.tool(
+    name="collect",
+    description="Save text for later recall: findings, notes, code snippets, command output, docs, decisions. Items are plain strings or objects with text plus optional id, tags, source, kind, and custom metadata. Re-collecting identical text updates it instead of duplicating.",
+    tags={"memory", "write"},
+    annotations={
+        "title": "Collect Documents",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    meta={"domain": "agent-memory"},
+)
+async def collect(
+    collection: Annotated[str, Field(description="Collection name, e.g. 'research', 'decisions', or a task ID. Created on first use.")],
+    items: Annotated[list[str | dict[str, Any]], Field(description="Documents to store: strings, or objects with 'text' and optional 'id', 'tags', 'source', 'kind', and extra metadata keys.")],
+    tags: Annotated[list[str] | None, Field(description="Tags applied to every item.")] = None,
+    source: Annotated[str | None, Field(description="Where the content came from (URL, file path, tool name).")] = None,
+    kind: Annotated[str | None, Field(description="Content type, e.g. note, finding, snippet, doc.")] = None,
+    dedupe_threshold: Annotated[float | None, Field(description="Merge into an existing near-identical document (cosine >= this, e.g. 0.95) instead of adding a duplicate.", ge=0.5, le=1.0)] = None,
+    ctx: Context = CurrentContext(),
+) -> CollectResponse:
+    await ctx.info(f"Collecting {len(items)} item(s) into {collection}")
+    return await asyncio.to_thread(
+        _collect_impl,
+        collection=collection,
+        items=items,
+        tags=tags,
+        source=source,
+        kind=kind,
+        dedupe_threshold=dedupe_threshold,
+    )
+
+
+@mcp.tool(
+    name="recall",
+    description="Retrieve previously collected documents relevant to a query. mode='hybrid' fuses semantic and keyword ranking; 'semantic' and 'keyword' use one signal. Filter by tags (any-of), source, kind, or exact metadata values.",
+    tags={"memory", "read", "search"},
+    annotations={
+        "title": "Recall Documents",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    meta={"domain": "agent-memory"},
+)
+async def recall(
+    collection: Annotated[str, Field(description="Collection to search.")],
+    query: Annotated[str, Field(description="What you are looking for, in natural language or keywords.")],
+    limit: Annotated[int, Field(description="Maximum number of documents to return.", ge=1, le=50)] = 8,
+    mode: Annotated[Literal["hybrid", "semantic", "keyword"], Field(description="Ranking strategy.")] = "hybrid",
+    tags: Annotated[list[str] | None, Field(description="Only documents carrying any of these tags.")] = None,
+    source: Annotated[str | None, Field(description="Only documents from this source.")] = None,
+    kind: Annotated[str | None, Field(description="Only documents of this kind.")] = None,
+    where: Annotated[dict[str, Any] | None, Field(description="Exact-match filters on custom metadata keys.")] = None,
+    diversity: Annotated[float, Field(description="0 = pure relevance; ~0.3 drops near-duplicate results (MMR).", ge=0.0, le=1.0)] = 0.0,
+    half_life_days: Annotated[float | None, Field(description="Favor recent documents: scores halve every N days of age.", gt=0)] = None,
+    ctx: Context = CurrentContext(),
+) -> RecallResponse:
+    await ctx.info(f"Recalling from {collection}")
+    return await asyncio.to_thread(
+        _recall_impl,
+        collection=collection,
+        query=query,
+        limit=limit,
+        mode=mode,
+        tags=tags,
+        source=source,
+        kind=kind,
+        where=where,
+        diversity=diversity,
+        half_life_days=half_life_days,
+    )
+
+
+@mcp.tool(
+    name="forget",
+    description="Delete collected documents by ID, or every document matching tags/source/kind.",
+    tags={"memory", "write"},
+    annotations={
+        "title": "Forget Documents",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    meta={"domain": "agent-memory"},
+)
+async def forget(
+    collection: Annotated[str, Field(description="Collection to delete from.")],
+    ids: Annotated[list[str] | None, Field(description="Document IDs to delete.")] = None,
+    tags: Annotated[list[str] | None, Field(description="Delete documents carrying any of these tags.")] = None,
+    source: Annotated[str | None, Field(description="Delete documents from this source.")] = None,
+    kind: Annotated[str | None, Field(description="Delete documents of this kind.")] = None,
+    ctx: Context = CurrentContext(),
+) -> ForgetResponse:
+    await ctx.info(f"Forgetting from {collection}")
+    return await asyncio.to_thread(_forget_impl, collection=collection, ids=ids, tags=tags, source=source, kind=kind)
+
+
+@mcp.tool(
+    name="collections",
+    description="List document collections created with collect, with document counts and search capability.",
+    tags={"memory", "read", "discovery"},
+    annotations={
+        "title": "List Collections",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    meta={"domain": "agent-memory"},
+)
+async def collections(ctx: Context = CurrentContext()) -> CollectionsResponse:
+    await ctx.info("Listing document collections")
+    return await asyncio.to_thread(_collections_impl)
+
+
 @mcp.resource(
     "quickcontext://capabilities",
     title="QuickContext Capabilities",
@@ -1025,8 +1310,7 @@ def projects_resource() -> ProjectsResource:
     meta={"domain": "code-retrieval"},
 )
 def jobs_resource() -> IndexJobsResource:
-    config = _load_config()
-    with QuickContext(config) as qc:
+    with _session() as qc:
         runs = qc.list_operation_statuses(active_only=False, limit=20)
     return IndexJobsResource(runs=[_operation_run_view(record) for record in runs if record.kind == "index"])
 
@@ -1061,6 +1345,7 @@ def quickcontext_search_playbook(
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m qc_mcp")
     parser.add_argument("--config", dest="config_path", default=None)
+    parser.add_argument("--profile", default=None, help="Embedding profile from the config's profiles section.")
     parser.add_argument("--transport", choices=["stdio", "http", "streamable-http", "sse"], default=None)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
@@ -1074,6 +1359,8 @@ def main(argv: list[str] | None = None) -> None:
 
     args = _build_arg_parser().parse_args(argv)
     _CONFIG_PATH_OVERRIDE = str(Path(args.config_path).resolve()) if args.config_path else ""
+    if args.profile:
+        os.environ["QC_PROFILE"] = args.profile
     config = _load_config()
 
     transport = (args.transport or config.mcp.transport or "stdio").strip().lower() or "stdio"
@@ -1087,4 +1374,5 @@ def main(argv: list[str] | None = None) -> None:
         run_kwargs["path"] = args.http_path or config.mcp.http_path
         run_kwargs["stateless_http"] = bool(args.stateless_http or config.mcp.stateless_http)
 
+    _start_background_warmup()
     mcp.run(transport=transport, **run_kwargs)

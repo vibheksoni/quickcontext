@@ -7,7 +7,7 @@ The MCP server is the agent-facing wrapper for quickcontext.
 It is intentionally thin:
 
 - it loads the same `quickcontext.json` config used by the CLI and SDK
-- it creates `QuickContext`
+- it keeps one long-lived `QuickContext` per process so models, the Rust pipe, and in-memory vector matrices stay warm between calls
 - it forwards indexing and retrieval into the SDK
 - it exposes a stable tool surface for agents
 
@@ -33,12 +33,12 @@ That means:
 
 ## Tools
 
-The server exposes seven tools:
+The server exposes eleven tools:
 
 - `project_info`
   Inspect one path, detect the project name, report index state, and list folder scopes.
 - `list_projects`
-  List indexed projects visible through the current Qdrant configuration.
+  List indexed projects in the local vector store.
 - `index`
   Start semantic indexing for a path. Duplicate active runs are attached instead of starting another one.
 - `index_status`
@@ -49,6 +49,14 @@ The server exposes seven tools:
   Exact literal grep through the Rust service.
 - `symbol_lookup`
   Exact or near-exact symbol lookup through the Rust symbol index.
+- `collect`
+  Save notes, findings, snippets, or docs into a named document collection.
+- `recall`
+  Retrieve collected documents with hybrid semantic + keyword ranking and tag/metadata filters.
+- `forget`
+  Delete collected documents by ID or filter.
+- `collections`
+  List document collections.
 
 ## Resources And Prompt
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import time
 from statistics import mean, median
+from typing import Any
 
 import click
 from rich.console import Console
@@ -118,29 +119,35 @@ def _print_strategy_summary(name: str, rows: list[dict], limit: int) -> None:
     console.print(f"  Median latency: {median(latencies):.2f} ms")
 
 
-def _load_config(config_path: str | None) -> EngineConfig:
+def _load_config(config_path: str | None, profile: str | None = None) -> EngineConfig:
     """
     Load engine config from JSON file, auto-discovery, or defaults.
 
     config_path: str | None — Path to JSON config file, or None for auto-discovery.
+    profile: str | None — Embedding profile from the config's "profiles" section.
     Returns: EngineConfig — Resolved configuration.
     """
     if config_path:
-        return EngineConfig.from_json(config_path)
-    return EngineConfig.auto()
+        return EngineConfig.from_json(config_path, profile=profile)
+    return EngineConfig.auto(profile=profile)
 
 
-def _optimize_search_config(config: EngineConfig) -> EngineConfig:
+def _require_store(config: EngineConfig) -> None:
     """
-    Prefer REST for local one-shot search traffic where it is measurably faster.
+    Exit with a readable error when the vector store is disabled.
     """
-    if config.qdrant is None:
-        return config
+    if config.store is None:
+        console.print("[red]The vector store is disabled in config (\"store\": null).[/red]")
+        sys.exit(1)
 
-    host = (config.qdrant.host or "").lower()
-    if config.qdrant.prefer_grpc and host in {"localhost", "127.0.0.1"}:
-        return replace(config, qdrant=replace(config.qdrant, prefer_grpc=False))
-    return config
+
+def _human_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} GB"
 
 
 def _print_lsp_check_plan(plan, json_output: bool) -> None:
@@ -213,22 +220,23 @@ def _print_lsp_check_plan(plan, json_output: bool) -> None:
 
 @click.group()
 @click.option("--config", "config_path", default=None, help="Path to JSON config file.")
+@click.option("--profile", default=None, help="Embedding profile from the config's \"profiles\" section (e.g. local, remote). Also read from QC_PROFILE.")
 @click.pass_context
-def cli(ctx: click.Context, config_path: str | None) -> None:
+def cli(ctx: click.Context, config_path: str | None, profile: str | None) -> None:
     """
     quickcontext engine — local code context engine CLI.
     """
     ctx.ensure_object(dict)
-    ctx.obj["config"] = _load_config(config_path)
+    ctx.obj["config"] = _load_config(config_path, profile)
 
 
 @cli.command()
 @click.pass_context
 def status(ctx: click.Context) -> None:
     """
-    Show engine status: Qdrant connection, collection info, embedding providers.
+    Show engine status: vector store, collection info, embedding providers.
     """
-    config = _optimize_search_config(ctx.obj["config"])
+    config = ctx.obj["config"]
     qc = QuickContext(config)
 
     table = Table(title="quickcontext status")
@@ -236,38 +244,32 @@ def status(ctx: click.Context) -> None:
     table.add_column("Detail", style="white")
     table.add_column("Status", style="green")
 
-    if config.qdrant is not None:
-        alive = False
-        try:
-            qc.connect(verify=True)
-            alive = True
-        except ConnectionError:
-            pass
-
+    if config.store is not None:
+        alive = qc.vector_store_available(verify=True)
         table.add_row(
-            "Qdrant",
-            config.qdrant.url,
-            "[green]connected[/green]" if alive else "[red]unreachable[/red]",
+            "Vector store",
+            config.store.resolved_path,
+            f"[green]ready[/green] ({_human_bytes(qc.store.size_bytes())})" if alive else "[red]unavailable[/red]",
         )
 
         if alive:
-            try:
-                info = qc.collection.info()
+            from engine.src.collection import list_projects
+
+            projects = list_projects(qc.store)
+            documents = qc.documents.collections()
+            table.add_row(
+                "Collections",
+                f"{len(projects)} code project(s), {len(documents)} document collection(s)",
+                f"{sum(item['points_count'] for item in projects + documents)} points",
+            )
+            for vec in config.vectors:
                 table.add_row(
-                    "Collection",
-                    info["name"],
-                    f'[green]{info["status"]}[/green] ({info["points_count"]} points)',
+                    f"  Vector: {vec.name}",
+                    f"dim={vec.dimension} dist={vec.distance}",
+                    "[green]ok[/green]",
                 )
-                for vec_name, vec_info in info["vectors"].items():
-                    table.add_row(
-                        f"  Vector: {vec_name}",
-                        f'dim={vec_info["size"]} dist={vec_info["distance"]}',
-                        "[green]ok[/green]",
-                    )
-            except Exception as exc:
-                table.add_row("Collection", str(config.qdrant.collection), f"[red]{exc}[/red]")
     else:
-        table.add_row("Qdrant", "disabled", "[dim]not configured[/dim]")
+        table.add_row("Vector store", "disabled", "[dim]not configured[/dim]")
 
     if config.code_embedding is not None:
         table.add_row(
@@ -331,7 +333,7 @@ def mcp_hints(ctx: click.Context, project: str | None) -> None:
     """
     Print dynamic search instructions suitable for MCP/system prompts.
     """
-    config = _optimize_search_config(ctx.obj["config"])
+    config = ctx.obj["config"]
 
     try:
         with QuickContext(config) as qc:
@@ -347,20 +349,20 @@ def mcp_hints(ctx: click.Context, project: str | None) -> None:
 @click.pass_context
 def init(ctx: click.Context) -> None:
     """
-    Initialize: connect to Qdrant, create collection if needed.
+    Initialize: create the vector store database (and the default collection, if configured).
     """
     config = ctx.obj["config"]
-
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config. Cannot initialize.[/red]")
-        sys.exit(1)
+    _require_store(config)
 
     try:
         with QuickContext(config) as qc:
-            info = qc.collection.info()
-            console.print(f"[green]Collection '{info['name']}' ready[/green] — {info['points_count']} points")
+            qc.connect(verify=True)
+            console.print(f"[green]Vector store ready[/green] at {qc.store.path}")
+            if config.store.collection:
+                info = qc.collection.info()
+                console.print(f"[green]Collection '{info['name']}' ready[/green] - {info['points_count']} points")
     except ConnectionError as exc:
-        console.print(f"[red]Connection failed:[/red] {exc}")
+        console.print(f"[red]Vector store unavailable:[/red] {exc}")
         sys.exit(1)
 
 
@@ -373,12 +375,9 @@ def reset(ctx: click.Context, confirm: bool, project: str | None) -> None:
     Delete and recreate the collection. Destroys all indexed data.
     """
     config = ctx.obj["config"]
+    _require_store(config)
 
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config. Cannot reset.[/red]")
-        sys.exit(1)
-
-    collection_name = project if project else (config.qdrant.collection or "codebase")
+    collection_name = project if project else (config.store.collection or "codebase")
 
     if not confirm:
         click.confirm(
@@ -603,8 +602,8 @@ def embed_test(ctx: click.Context, text: str, which: str) -> None:
 @click.option("--embedding-max-retries", default=None, type=int, help="Override embedding retry count for this run.")
 @click.option("--embedding-batch-size", default=None, type=int, help="Override embedding batch size for this run.")
 @click.option("--embedding-fixed-batch", is_flag=True, help="Disable adaptive embedding batch resizing for this run.")
-@click.option("--upsert-batch-size", default=None, type=int, help="Override Qdrant upsert batch size for this run.")
-@click.option("--upsert-concurrency", default=None, type=int, help="Override Qdrant upsert worker concurrency for this run.")
+@click.option("--upsert-batch-size", default=None, type=int, help="Override points written per store transaction for this run.")
+@click.option("--upsert-concurrency", default=None, type=int, hidden=True, help="Deprecated; ignored (store writes are a single transaction stream).")
 @click.pass_context
 def index(
     ctx: click.Context,
@@ -630,21 +629,19 @@ def index(
     upsert_concurrency: int | None,
 ) -> None:
     """
-    Index a directory: extract, chunk, optionally describe, embed, and upsert to Qdrant.
+    Index a directory: extract, chunk, optionally describe, embed, and store vectors.
     """
     config = ctx.obj["config"]
 
     try:
         effective_config = config
-        if upsert_batch_size is not None or upsert_concurrency is not None:
-            if effective_config.qdrant is None:
-                raise RuntimeError("Cannot override upsert settings when qdrant is disabled")
-            qdrant_cfg = effective_config.qdrant
-            if upsert_batch_size is not None:
-                qdrant_cfg = replace(qdrant_cfg, upsert_batch_size=max(1, int(upsert_batch_size)))
-            if upsert_concurrency is not None:
-                qdrant_cfg = replace(qdrant_cfg, upsert_concurrency=max(1, int(upsert_concurrency)))
-            effective_config = replace(effective_config, qdrant=qdrant_cfg)
+        if upsert_batch_size is not None:
+            if effective_config.store is None:
+                raise RuntimeError("Cannot override upsert settings when the vector store is disabled")
+            effective_config = replace(
+                effective_config,
+                store=replace(effective_config.store, upsert_batch_size=max(1, int(upsert_batch_size))),
+            )
 
         with QuickContext(effective_config) as qc:
             effective_fast = fast
@@ -661,7 +658,7 @@ def index(
                 effective_fast = True
                 effective_no_descriptions = True
                 if effective_embedding_concurrency is None:
-                    effective_embedding_concurrency = 16
+                    effective_embedding_concurrency = 32
                 if effective_embedding_max_retries is None:
                     effective_embedding_max_retries = 2
                 if effective_embedding_batch_size is None:
@@ -744,8 +741,8 @@ def index(
 @click.option("--embedding-max-retries", default=None, type=int, help="Override embedding retry count for this run.")
 @click.option("--embedding-batch-size", default=None, type=int, help="Override embedding batch size for this run.")
 @click.option("--embedding-fixed-batch", is_flag=True, help="Disable adaptive embedding batch resizing for this run.")
-@click.option("--upsert-batch-size", default=None, type=int, help="Override Qdrant upsert batch size for this run.")
-@click.option("--upsert-concurrency", default=None, type=int, help="Override Qdrant upsert worker concurrency for this run.")
+@click.option("--upsert-batch-size", default=None, type=int, help="Override points written per store transaction for this run.")
+@click.option("--upsert-concurrency", default=None, type=int, hidden=True, help="Deprecated; ignored (store writes are a single transaction stream).")
 @click.pass_context
 def refresh(
     ctx: click.Context,
@@ -778,15 +775,13 @@ def refresh(
 
     try:
         effective_config = config
-        if upsert_batch_size is not None or upsert_concurrency is not None:
-            if effective_config.qdrant is None:
-                raise RuntimeError("Cannot override upsert settings when qdrant is disabled")
-            qdrant_cfg = effective_config.qdrant
-            if upsert_batch_size is not None:
-                qdrant_cfg = replace(qdrant_cfg, upsert_batch_size=max(1, int(upsert_batch_size)))
-            if upsert_concurrency is not None:
-                qdrant_cfg = replace(qdrant_cfg, upsert_concurrency=max(1, int(upsert_concurrency)))
-            effective_config = replace(effective_config, qdrant=qdrant_cfg)
+        if upsert_batch_size is not None:
+            if effective_config.store is None:
+                raise RuntimeError("Cannot override upsert settings when the vector store is disabled")
+            effective_config = replace(
+                effective_config,
+                store=replace(effective_config.store, upsert_batch_size=max(1, int(upsert_batch_size))),
+            )
 
         with QuickContext(effective_config) as qc:
             effective_fast = fast
@@ -803,7 +798,7 @@ def refresh(
                 effective_fast = True
                 effective_no_descriptions = True
                 if effective_embedding_concurrency is None:
-                    effective_embedding_concurrency = 16
+                    effective_embedding_concurrency = 32
                 if effective_embedding_max_retries is None:
                     effective_embedding_max_retries = 2
                 if effective_embedding_batch_size is None:
@@ -920,10 +915,8 @@ def search(
     """
     config = ctx.obj["config"]
 
-    search_client = None
     qc = None
     try:
-        from engine.src.qdrant_search import RestQdrantSearchClient
         from engine.src.searcher import CodeSearcher
 
         qc = QuickContext(config)
@@ -945,13 +938,12 @@ def search(
             bias_code_weight = resolved["code_weight"]
             bias_desc_weight = resolved["desc_weight"]
 
-        if config.qdrant is None:
-            raise RuntimeError("Qdrant is disabled in config. Search is unavailable.")
+        if config.store is None:
+            raise RuntimeError("The vector store is disabled in config. Search is unavailable.")
 
-        search_client = RestQdrantSearchClient(config.qdrant)
         reranker = qc._get_reranker() if rerank else None
         searcher = CodeSearcher(
-            client=search_client,
+            store=qc.store,
             collection_name=project_name,
             code_provider=qc.code_provider,
             desc_provider=qc.desc_provider,
@@ -1029,57 +1021,13 @@ def search(
                 include_source=include_source,
             )
 
-            if not results:
-                console.print("[yellow]No results found[/yellow]")
-                return
+        if not results:
+            console.print("[yellow]No results found[/yellow]")
+            return
 
-            if max_tokens is not None:
-                from engine.src.packer import pack_search_results
-                packed = pack_search_results(results, max_tokens=max_tokens, include_source=True, compress=compress)
-
-                console.print(f"\n[cyan]Search mode:[/cyan] {mode}")
-                if bias is not None:
-                    console.print(f"[cyan]Bias:[/cyan] {bias} -- {bias_preset.description}")
-                console.print(f"[cyan]Query:[/cyan] {query!r}")
-                if use_keywords:
-                    console.print(f"[cyan]Keyword boosting:[/cyan] enabled (weight={keyword_weight})")
-                if rerank:
-                    console.print(f"[cyan]Reranking:[/cyan] ColBERT MaxSim")
-                if path:
-                    console.print(f"[cyan]Path filter:[/cyan] {path}")
-                if symbol_kind:
-                    console.print(f"[cyan]Symbol kind filter:[/cyan] {symbol_kind}")
-                if compress:
-                    console.print(f"[cyan]Compression:[/cyan] {compress}")
-                console.print(f"[cyan]Token budget:[/cyan] {packed.total_tokens}/{packed.max_tokens} tokens")
-                console.print(f"[cyan]Results:[/cyan] {packed.results_included} included, {packed.results_truncated} truncated, {packed.results_dropped} dropped\n")
-
-                for i, result in enumerate(packed.results, 1):
-                    trunc_tag = " [yellow](truncated)[/yellow]" if result.truncated else ""
-                    console.print(f"[bold cyan]{i}. {result.symbol_name}[/bold cyan] [dim]({result.symbol_kind})[/dim]{trunc_tag}")
-                    console.print(f"   [green]Score:[/green] {result.score:.4f}")
-                    console.print(f"   [blue]File:[/blue] {result.file_path}:{result.line_start}-{result.line_end}")
-
-                    if result.language:
-                        console.print(f"   [magenta]Language:[/magenta] {result.language}")
-                    if result.parent:
-                        console.print(f"   [yellow]Parent:[/yellow] {result.parent}")
-                    if result.path_context:
-                        console.print(f"   [yellow]Context:[/yellow] {result.path_context}")
-                    if result.signature:
-                        console.print(f"   [white]Signature:[/white] {result.signature}")
-
-                    desc_text = result.description[:150].encode('ascii', 'replace').decode('ascii')
-                    console.print(f"   [dim]Description:[/dim] {desc_text}{'...' if len(result.description) > 150 else ''}")
-
-                    if show_source and result.source:
-                        console.print(f"   [dim]Source:[/dim]")
-                        for line in result.source.split('\n')[:20]:
-                            safe_line = line.encode('ascii', 'replace').decode('ascii')
-                            console.print(f"     {safe_line}")
-
-                    console.print()
-                return
+        if max_tokens is not None:
+            from engine.src.packer import pack_search_results
+            packed = pack_search_results(results, max_tokens=max_tokens, include_source=True, compress=compress)
 
             console.print(f"\n[cyan]Search mode:[/cyan] {mode}")
             if bias is not None:
@@ -1091,45 +1039,87 @@ def search(
                 console.print(f"[cyan]Reranking:[/cyan] ColBERT MaxSim")
             if path:
                 console.print(f"[cyan]Path filter:[/cyan] {path}")
-            console.print(f"[cyan]Results:[/cyan] {len(results)}\n")
+            if symbol_kind:
+                console.print(f"[cyan]Symbol kind filter:[/cyan] {symbol_kind}")
+            if compress:
+                console.print(f"[cyan]Compression:[/cyan] {compress}")
+            console.print(f"[cyan]Token budget:[/cyan] {packed.total_tokens}/{packed.max_tokens} tokens")
+            console.print(f"[cyan]Results:[/cyan] {packed.results_included} included, {packed.results_truncated} truncated, {packed.results_dropped} dropped\n")
 
-            for i, result in enumerate(results, 1):
-                console.print(f"[bold cyan]{i}. {result.symbol_name}[/bold cyan] [dim]({result.symbol_kind})[/dim]")
+            for i, result in enumerate(packed.results, 1):
+                trunc_tag = " [yellow](truncated)[/yellow]" if result.truncated else ""
+                console.print(f"[bold cyan]{i}. {result.symbol_name}[/bold cyan] [dim]({result.symbol_kind})[/dim]{trunc_tag}")
                 console.print(f"   [green]Score:[/green] {result.score:.4f}")
-                console.print(f"   [blue]File:[/blue] {result.file_path}:{result.line_start}-{result.line_end}")
+                console.print(f"   [blue]File:[/blue] {result.file_path}:{result.line_start}-{result.line_end}", soft_wrap=True)
 
                 if result.language:
                     console.print(f"   [magenta]Language:[/magenta] {result.language}")
-
                 if result.parent:
                     console.print(f"   [yellow]Parent:[/yellow] {result.parent}")
-
                 if result.path_context:
                     console.print(f"   [yellow]Context:[/yellow] {result.path_context}")
-
                 if result.signature:
                     console.print(f"   [white]Signature:[/white] {result.signature}")
 
                 desc_text = result.description[:150].encode('ascii', 'replace').decode('ascii')
                 console.print(f"   [dim]Description:[/dim] {desc_text}{'...' if len(result.description) > 150 else ''}")
 
-                if show_source:
+                if show_source and result.source:
                     console.print(f"   [dim]Source:[/dim]")
-                    source_lines = result.source.split('\n')[:10]
-                    for line in source_lines:
+                    for line in result.source.split('\n')[:20]:
                         safe_line = line.encode('ascii', 'replace').decode('ascii')
                         console.print(f"     {safe_line}")
-                    if len(result.source.split('\n')) > 10:
-                        console.print("     ...")
 
                 console.print()
+            return
+
+        console.print(f"\n[cyan]Search mode:[/cyan] {mode}")
+        if bias is not None:
+            console.print(f"[cyan]Bias:[/cyan] {bias} -- {bias_preset.description}")
+        console.print(f"[cyan]Query:[/cyan] {query!r}")
+        if use_keywords:
+            console.print(f"[cyan]Keyword boosting:[/cyan] enabled (weight={keyword_weight})")
+        if rerank:
+            console.print(f"[cyan]Reranking:[/cyan] ColBERT MaxSim")
+        if path:
+            console.print(f"[cyan]Path filter:[/cyan] {path}")
+        console.print(f"[cyan]Results:[/cyan] {len(results)}\n")
+
+        for i, result in enumerate(results, 1):
+            console.print(f"[bold cyan]{i}. {result.symbol_name}[/bold cyan] [dim]({result.symbol_kind})[/dim]")
+            console.print(f"   [green]Score:[/green] {result.score:.4f}")
+            console.print(f"   [blue]File:[/blue] {result.file_path}:{result.line_start}-{result.line_end}", soft_wrap=True)
+
+            if result.language:
+                console.print(f"   [magenta]Language:[/magenta] {result.language}")
+
+            if result.parent:
+                console.print(f"   [yellow]Parent:[/yellow] {result.parent}")
+
+            if result.path_context:
+                console.print(f"   [yellow]Context:[/yellow] {result.path_context}")
+
+            if result.signature:
+                console.print(f"   [white]Signature:[/white] {result.signature}")
+
+            desc_text = result.description[:150].encode('ascii', 'replace').decode('ascii')
+            console.print(f"   [dim]Description:[/dim] {desc_text}{'...' if len(result.description) > 150 else ''}")
+
+            if show_source:
+                console.print(f"   [dim]Source:[/dim]")
+                source_lines = result.source.split('\n')[:10]
+                for line in source_lines:
+                    safe_line = line.encode('ascii', 'replace').decode('ascii')
+                    console.print(f"     {safe_line}")
+                if len(result.source.split('\n')) > 10:
+                    console.print("     ...")
+
+            console.print()
 
     except Exception as exc:
         console.print(f"[red]Search failed:[/red] {exc}")
         sys.exit(1)
     finally:
-        if search_client is not None:
-            search_client.close()
         if qc is not None:
             qc.close()
 
@@ -1138,21 +1128,18 @@ def search(
 @click.pass_context
 def list_projects(ctx: click.Context) -> None:
     """
-    List all indexed projects (collections) in Qdrant.
+    List all indexed code projects in the vector store.
 
     Uses alias-based discovery to show logical project names,
     filtering out internal versioned backing collections.
     """
     config = ctx.obj["config"]
-
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config. Cannot list projects.[/red]")
-        sys.exit(1)
+    _require_store(config)
 
     try:
         with QuickContext(config) as qc:
-            if not qc.qdrant_available(verify=True):
-                console.print(f"[red]Qdrant is unreachable at {config.qdrant.url}[/red]")
+            if not qc.vector_store_available(verify=True):
+                console.print(f"[red]Vector store unavailable at {config.store.resolved_path}[/red]")
                 sys.exit(1)
             projects = qc.list_projects()
 
@@ -1518,7 +1505,7 @@ def benchmark_context(
     """
     Benchmark AI-facing retrieval on any target repo root using a JSON case file.
     """
-    config = _optimize_search_config(ctx.obj["config"])
+    config = ctx.obj["config"]
     target_root = target_path.resolve()
     cases = json.loads(cases_file.read_text(encoding="utf-8"))
     project_name = project if project else detect_project_name(target_root, manual_override=None)
@@ -1653,7 +1640,7 @@ def benchmark_compare(
     """
     Compare grep, Rust text search, and AI-facing mixed retrieval on the same case file.
     """
-    config = _optimize_search_config(ctx.obj["config"])
+    config = ctx.obj["config"]
     target_root = target_path.resolve()
     cases = json.loads(cases_file.read_text(encoding="utf-8"))
     project_name = project if project else detect_project_name(target_root, manual_override=None)
@@ -2788,72 +2775,32 @@ def lsp_shutdown_all(ctx: click.Context) -> None:
 @click.pass_context
 def gc(ctx: click.Context, dry_run: bool) -> None:
     """
-    Garbage collect orphaned versioned collections and stale file caches.
+    Delete orphaned versioned collections ({project}_vN) that no project alias points to.
 
-    Scans all Qdrant collections for orphaned {project}_v{N} versions
-    that no alias points to, and removes stale .quickcontext/file_cache.json
-    files for projects that no longer exist.
-
-    ctx: click.Context — CLI context with config.
-    dry_run: bool — If True, only report what would be deleted.
+    Interrupted full indexes leave such shadow collections behind; running gc
+    while an index is in progress will discard its resumable shadow.
     """
     config = ctx.obj["config"]
-
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config.[/red]")
-        sys.exit(1)
+    _require_store(config)
 
     try:
         with QuickContext(config) as qc:
-            from engine.src.collection import CollectionManager
-            client = qc.connection.client
+            from engine.src.collection import orphaned_versions
 
-            all_aliases = client.get_aliases()
-            alias_targets: set[str] = set()
-            alias_names: set[str] = set()
-            for alias in all_aliases.aliases:
-                alias_targets.add(alias.collection_name)
-                alias_names.add(alias.alias_name)
-
-            collections = client.get_collections().collections
-            orphaned = []
-            for col in collections:
-                if col.name in alias_targets:
-                    continue
-                if col.name in alias_names:
-                    continue
-                import re
-                if re.match(r"^.+_v\d+$", col.name):
-                    orphaned.append(col.name)
-
+            orphaned = orphaned_versions(qc.store)
             if orphaned:
                 table = Table(title="Orphaned Collections")
                 table.add_column("Collection", style="red")
                 table.add_column("Action", style="yellow")
                 for name in sorted(orphaned):
-                    action = "would delete" if dry_run else "deleted"
-                    table.add_row(name, action)
+                    table.add_row(name, "would delete" if dry_run else "deleted")
                     if not dry_run:
-                        client.delete_collection(name)
+                        qc.store.delete_collection(name)
                 console.print(table)
             else:
                 console.print("[green]No orphaned collections found.[/green]")
 
-            cache_dir_cleaned = 0
-            if not dry_run:
-                for project_name in list(alias_names):
-                    mgr = CollectionManager(
-                        client=client,
-                        config=config,
-                        collection_name=project_name,
-                    )
-                    deleted = mgr.cleanup_old_versions(keep_current=True)
-                    if deleted:
-                        for d in deleted:
-                            console.print(f"  [yellow]deleted:[/yellow] {d} (stale version of {project_name})")
-                        cache_dir_cleaned += len(deleted)
-
-            console.print(f"\n[green]GC complete.[/green] Orphaned: {len(orphaned)}, Stale versions: {cache_dir_cleaned}")
+            console.print(f"\n[green]GC complete.[/green] Orphaned: {len(orphaned)}")
             if dry_run:
                 console.print("[yellow]Dry run -- nothing was actually deleted.[/yellow]")
 
@@ -2863,76 +2810,23 @@ def gc(ctx: click.Context, dry_run: bool) -> None:
 
 
 @cli.command()
-@click.option("--project", default=None, help="Target a specific project. If omitted, compacts all projects.")
+@click.option("--vacuum", is_flag=True, help="Also VACUUM the database file to reclaim disk space (slower, needs free disk equal to the DB size).")
 @click.pass_context
-def compact(ctx: click.Context, project: str | None) -> None:
+def compact(ctx: click.Context, vacuum: bool) -> None:
     """
-    Trigger Qdrant optimizer to merge segments for a project or all projects.
-
-    Lowers the indexing_threshold temporarily to force segment merging,
-    then restores it. This reduces segment count and improves query performance.
-
-    ctx: click.Context — CLI context with config.
-    project: str | None — Specific project name, or None for all.
+    Optimize the vector store: merge full-text segments, refresh query planner
+    statistics, checkpoint the write-ahead log, and optionally VACUUM.
     """
     config = ctx.obj["config"]
-
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config.[/red]")
-        sys.exit(1)
+    _require_store(config)
 
     try:
         with QuickContext(config) as qc:
-            from qdrant_client import models
-            from engine.src.collection import CollectionManager
-            client = qc.connection.client
-
-            if project:
-                targets = [project]
-            else:
-                mgr = CollectionManager(
-                    client=client,
-                    config=config,
-                    collection_name="_dummy",
-                )
-                projects = mgr.list_all_projects()
-                targets = [p["name"] for p in projects]
-
-            if not targets:
-                console.print("[yellow]No projects to compact.[/yellow]")
-                return
-
-            for name in targets:
-                console.print(f"Compacting [cyan]{name}[/cyan]...")
-                try:
-                    info = client.get_collection(name)
-                    segments_before = info.segments_count
-
-                    client.update_collection(
-                        collection_name=name,
-                        optimizer_config=models.OptimizersConfigDiff(
-                            indexing_threshold=0,
-                        ),
-                    )
-
-                    import time
-                    time.sleep(2)
-
-                    client.update_collection(
-                        collection_name=name,
-                        optimizer_config=models.OptimizersConfigDiff(
-                            indexing_threshold=20000,
-                        ),
-                    )
-
-                    info_after = client.get_collection(name)
-                    segments_after = info_after.segments_count
-                    console.print(
-                        f"  [green]Done.[/green] Segments: {segments_before} -> {segments_after}"
-                    )
-                except Exception as exc:
-                    console.print(f"  [red]Failed:[/red] {exc}")
-
+            result = qc.store.optimize(vacuum=vacuum)
+            console.print(
+                f"[green]Compacted[/green] {qc.store.path}: "
+                f"{_human_bytes(result['size_before'])} -> {_human_bytes(result['size_after'])}"
+            )
     except Exception as exc:
         console.print(f"[red]Compact failed:[/red] {exc}")
         sys.exit(1)
@@ -2942,131 +2836,65 @@ def compact(ctx: click.Context, project: str | None) -> None:
 @click.pass_context
 def audit(ctx: click.Context) -> None:
     """
-    Health check across all indexed projects.
-
-    Reports collection status, optimizer state, segment count,
-    indexed vs total vectors, and flags potential issues.
-
-    ctx: click.Context — CLI context with config.
+    Health check across the vector store: integrity, collections, vector
+    dimensions versus the active embedding config, and orphaned versions.
     """
     config = ctx.obj["config"]
-
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config.[/red]")
-        sys.exit(1)
+    _require_store(config)
 
     try:
         with QuickContext(config) as qc:
-            from engine.src.collection import CollectionManager
-            client = qc.connection.client
+            from engine.src.collection import orphaned_versions
 
-            mgr = CollectionManager(
-                client=client,
-                config=config,
-                collection_name="_dummy",
-            )
-            projects = mgr.list_all_projects()
+            store = qc.store
+            warnings: list[str] = []
+            problems = store.integrity_check()
+            if problems:
+                warnings.extend(f"integrity: {item}" for item in problems)
 
-            if not projects:
-                console.print("[yellow]No projects indexed.[/yellow]")
-                return
+            aliases = store.list_aliases()
+            alias_by_target: dict[str, list[str]] = {}
+            for alias, target in aliases.items():
+                alias_by_target.setdefault(target, []).append(alias)
+            expected_code = {vec.name: vec.dimension for vec in config.vectors}
+            expected_text = config.desc_embedding.dimension if config.desc_embedding is not None else None
 
-            warnings = []
-
-            table = Table(title="Project Health Audit")
-            table.add_column("Project", style="cyan")
-            table.add_column("Collection", style="dim")
-            table.add_column("Status", style="white")
-            table.add_column("Optimizer", style="white")
-            table.add_column("Segments", style="green")
+            table = Table(title=f"Vector Store Audit ({_human_bytes(store.size_bytes())})")
+            table.add_column("Collection", style="cyan")
+            table.add_column("Kind", style="white")
+            table.add_column("Aliases", style="dim")
             table.add_column("Points", style="green")
-            table.add_column("Indexed Vecs", style="green")
+            table.add_column("Vectors", style="magenta")
             table.add_column("Warnings", style="yellow")
 
-            for proj in projects:
-                name = proj["name"]
+            for info in store.list_collections():
                 row_warnings = []
-
-                try:
-                    info = client.get_collection(name)
-                    status = info.status.value
-                    opt_raw = info.optimizer_status
-                    if hasattr(opt_raw, "value"):
-                        optimizer_status = str(opt_raw.value)
-                    elif hasattr(opt_raw, "status"):
-                        optimizer_status = str(opt_raw.status.value)
-                    else:
-                        optimizer_status = str(opt_raw) if opt_raw else "unknown"
-                    segments = info.segments_count or 0
-                    points = info.points_count or 0
-                    indexed_vecs = info.indexed_vectors_count or 0
-
-                    if status != "green":
-                        row_warnings.append(f"status={status}")
-                    if optimizer_status != "ok":
-                        row_warnings.append(f"optimizer={optimizer_status}")
-                    if segments > 10:
-                        row_warnings.append(f"high segments ({segments})")
-                    if points > 0 and indexed_vecs == 0:
-                        row_warnings.append("no indexed vectors")
-
-                    status_style = "green" if status == "green" else "red"
-                    opt_style = "green" if optimizer_status == "ok" else "yellow"
-
-                    table.add_row(
-                        name,
-                        proj["real_collection"],
-                        f"[{status_style}]{status}[/{status_style}]",
-                        f"[{opt_style}]{optimizer_status}[/{opt_style}]",
-                        str(segments),
-                        str(points),
-                        str(indexed_vecs),
-                        ", ".join(row_warnings) if row_warnings else "-",
-                    )
-
-                    if row_warnings:
-                        for w in row_warnings:
-                            warnings.append(f"{name}: {w}")
-
-                except Exception as exc:
-                    table.add_row(
-                        name,
-                        proj["real_collection"],
-                        "[red]error[/red]",
-                        "-",
-                        "-",
-                        "-",
-                        "-",
-                        str(exc),
-                    )
-                    warnings.append(f"{name}: unreachable ({exc})")
-
+                vectors = {spec.name: spec.dimension for spec in info.vectors}
+                if info.kind == "code" and vectors != expected_code:
+                    row_warnings.append(f"dims {vectors} != config {expected_code}; re-index")
+                if info.kind == "documents" and info.vectors and vectors.get("text") != expected_text:
+                    row_warnings.append(f"text dim {vectors.get('text')} != config {expected_text}")
+                warnings.extend(f"{info.name}: {item}" for item in row_warnings)
+                table.add_row(
+                    info.name,
+                    info.kind,
+                    ", ".join(alias_by_target.get(info.name, [])) or "-",
+                    str(info.points_count),
+                    ", ".join(f"{name}({dim}d)" for name, dim in vectors.items()) or "keyword-only",
+                    ", ".join(row_warnings) or "-",
+                )
             console.print(table)
 
-            all_collections = client.get_collections().collections
-            all_aliases = client.get_aliases()
-            alias_targets = {a.collection_name for a in all_aliases.aliases}
-            alias_names = {a.alias_name for a in all_aliases.aliases}
-
-            import re
-            orphaned = [
-                c.name for c in all_collections
-                if c.name not in alias_targets
-                and c.name not in alias_names
-                and re.match(r"^.+_v\d+$", c.name)
-            ]
+            orphaned = orphaned_versions(store)
             if orphaned:
-                warnings.append(f"orphaned collections: {', '.join(orphaned)}")
-
-            console.print(f"\n[green]Total projects:[/green] {len(projects)}")
-            console.print(f"[green]Total collections:[/green] {len(all_collections)}")
+                warnings.append(f"orphaned collections (run gc): {', '.join(orphaned)}")
 
             if warnings:
                 console.print(f"\n[yellow]Warnings ({len(warnings)}):[/yellow]")
-                for w in warnings:
-                    console.print(f"  [yellow]- {w}[/yellow]")
+                for item in warnings:
+                    console.print(f"  [yellow]- {item}[/yellow]")
             else:
-                console.print("\n[green]All projects healthy.[/green]")
+                console.print("\n[green]All collections healthy.[/green]")
 
     except Exception as exc:
         console.print(f"[red]Audit failed:[/red] {exc}")
@@ -3078,86 +2906,219 @@ def audit(ctx: click.Context) -> None:
 @click.pass_context
 def repair(ctx: click.Context, dry_run: bool) -> None:
     """
-    Repair collection state: migrate legacy collections to alias scheme,
-    clean up orphaned versions, and ensure all projects have valid aliases.
-
-    ctx: click.Context — CLI context with config.
-    dry_run: bool — If True, only report what would be repaired.
+    Repair project aliases: re-point aliases that lost their collection to the
+    newest surviving version, then delete stale versions behind valid aliases.
     """
     config = ctx.obj["config"]
-
-    if config.qdrant is None:
-        console.print("[red]Qdrant is disabled in config.[/red]")
-        sys.exit(1)
+    _require_store(config)
 
     try:
         with QuickContext(config) as qc:
             from engine.src.collection import CollectionManager
-            client = qc.connection.client
 
-            import re
-            collections = client.get_collections().collections
-            all_aliases = client.get_aliases()
-            alias_names = {a.alias_name for a in all_aliases.aliases}
-            alias_targets = {a.collection_name for a in all_aliases.aliases}
-
-            legacy = []
-            for col in collections:
-                if col.name in alias_names:
-                    continue
-                if col.name in alias_targets:
-                    continue
-                if re.match(r"^.+_v\d+$", col.name):
-                    continue
-                legacy.append(col.name)
-
+            store = qc.store
+            aliases = store.list_aliases()
             repaired = 0
-            if legacy:
-                console.print(f"[yellow]Found {len(legacy)} legacy collection(s) without aliases:[/yellow]")
-                for name in sorted(legacy):
-                    if dry_run:
-                        console.print(f"  [yellow]would migrate:[/yellow] {name} -> {name}_v1 + alias")
-                    else:
-                        console.print(f"  [cyan]Migrating:[/cyan] {name}...")
-                        mgr = CollectionManager(
-                            client=client,
-                            config=config,
-                            collection_name=name,
-                        )
-                        mgr.ensure()
-                        console.print(f"  [green]Migrated:[/green] {name} -> alias scheme")
+            cleaned = 0
+            projects = set(aliases)
+            for info in store.list_collections():
+                if info.kind == "code" and "_v" in info.name:
+                    base, _, suffix = info.name.rpartition("_v")
+                    if suffix.isdigit():
+                        projects.add(base)
+
+            for project in sorted(projects):
+                manager = CollectionManager(store=store, config=config, collection_name=project)
+                if manager.resolve_alias() is None:
+                    action = "would re-alias" if dry_run else "re-aliased"
+                    if not dry_run:
+                        manager.ensure()
+                    console.print(f"  [cyan]{action}:[/cyan] {project} -> {manager.resolve_alias() or 'newest version'}")
                     repaired += 1
-            else:
-                console.print("[green]No legacy collections found.[/green]")
-
-            orphaned_cleaned = 0
-            for alias_name in sorted(alias_names):
-                mgr = CollectionManager(
-                    client=client,
-                    config=config,
-                    collection_name=alias_name,
-                )
                 if dry_run:
-                    prefix = alias_name + "_v"
-                    for col in collections:
-                        if col.name.startswith(prefix) and col.name not in alias_targets:
-                            suffix = col.name[len(prefix):]
-                            if suffix.isdigit():
-                                console.print(f"  [yellow]would delete orphan:[/yellow] {col.name}")
-                                orphaned_cleaned += 1
+                    current = manager.resolve_alias()
+                    stale = [name for _, name in manager._versions() if name != current]
+                    for name in stale:
+                        console.print(f"  [yellow]would delete stale version:[/yellow] {name}")
+                    cleaned += len(stale)
                 else:
-                    deleted = mgr.cleanup_old_versions(keep_current=True)
-                    orphaned_cleaned += len(deleted)
-                    for d in deleted:
-                        console.print(f"  [green]Deleted orphan:[/green] {d}")
+                    deleted = manager.cleanup_old_versions(keep_current=True)
+                    for name in deleted:
+                        console.print(f"  [green]deleted stale version:[/green] {name}")
+                    cleaned += len(deleted)
 
-            console.print(f"\n[green]Repair complete.[/green] Legacy migrated: {repaired}, Orphans cleaned: {orphaned_cleaned}")
+            console.print(f"\n[green]Repair complete.[/green] Aliases repaired: {repaired}, stale versions: {cleaned}")
             if dry_run:
                 console.print("[yellow]Dry run -- nothing was actually changed.[/yellow]")
 
     except Exception as exc:
         console.print(f"[red]Repair failed:[/red] {exc}")
         sys.exit(1)
+
+
+@cli.command()
+@click.argument("texts", nargs=-1)
+@click.option("--collection", "-c", required=True, help="Document collection name (created on first use).")
+@click.option("--tag", "tags", multiple=True, help="Tag to attach (repeatable).")
+@click.option("--source", default=None, help="Where the content came from (URL, file, tool...).")
+@click.option("--kind", default=None, help="Content type (note, finding, snippet...).")
+@click.option("--file", "files", multiple=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Collect a file's contents as one document (repeatable).")
+@click.option("--stdin", "from_stdin", is_flag=True, help="Read one document from standard input.")
+@click.option("--dedupe", "dedupe_threshold", default=None, type=float, help="Merge into an existing near-identical document (cosine >= value, e.g. 0.95).")
+@click.pass_context
+def collect(
+    ctx: click.Context,
+    texts: tuple[str, ...],
+    collection: str,
+    tags: tuple[str, ...],
+    source: str | None,
+    kind: str | None,
+    files: tuple[Path, ...],
+    from_stdin: bool,
+    dedupe_threshold: float | None,
+) -> None:
+    """
+    Store text documents in a collection for later recall.
+    """
+    config = ctx.obj["config"]
+    _require_store(config)
+
+    items: list[dict] = [{"text": text} for text in texts]
+    for file_path in files:
+        items.append({"text": file_path.read_text(encoding="utf-8", errors="replace"), "source": source or str(file_path.resolve())})
+    if from_stdin:
+        items.append({"text": sys.stdin.read()})
+    if not items:
+        console.print("[red]Nothing to collect: pass TEXT arguments, --file, or --stdin[/red]")
+        sys.exit(1)
+
+    try:
+        with QuickContext(config) as qc:
+            ids = qc.collect(collection, items, tags=list(tags), source=source, kind=kind, dedupe_threshold=dedupe_threshold)
+        console.print_json(json.dumps({"collection": collection, "ids": ids}))
+    except Exception as exc:
+        console.print(f"[red]Collect failed:[/red] {exc}")
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("query")
+@click.option("--collection", "-c", required=True, help="Document collection to search.")
+@click.option("--limit", default=10, type=int, help="Maximum number of results.")
+@click.option("--mode", default="hybrid", type=click.Choice(["hybrid", "semantic", "keyword"]), help="Retrieval mode.")
+@click.option("--tag", "tags", multiple=True, help="Only documents with any of these tags (repeatable).")
+@click.option("--source", default=None, help="Only documents from this source.")
+@click.option("--kind", default=None, help="Only documents of this kind.")
+@click.option("--diversity", default=0.0, type=float, help="MMR diversity in [0, 1]; ~0.3 drops near-duplicate hits.")
+@click.option("--half-life-days", default=None, type=float, help="Favor recent documents: scores halve every N days.")
+@click.option("--json-output", is_flag=True, help="Print results as JSON.")
+@click.pass_context
+def recall(
+    ctx: click.Context,
+    query: str,
+    collection: str,
+    limit: int,
+    mode: str,
+    tags: tuple[str, ...],
+    source: str | None,
+    kind: str | None,
+    diversity: float,
+    half_life_days: float | None,
+    json_output: bool,
+) -> None:
+    """
+    Recall the documents most relevant to a query.
+    """
+    config = ctx.obj["config"]
+    _require_store(config)
+
+    try:
+        with QuickContext(config) as qc:
+            results = qc.recall(
+                collection,
+                query,
+                limit=limit,
+                mode=mode,
+                tags=list(tags) or None,
+                source=source,
+                kind=kind,
+                diversity=diversity,
+                half_life_days=half_life_days,
+            )
+    except Exception as exc:
+        console.print(f"[red]Recall failed:[/red] {exc}")
+        sys.exit(1)
+
+    if json_output:
+        console.print_json(json.dumps([item.to_dict() for item in results]))
+        return
+    if not results:
+        console.print("[yellow]No results found[/yellow]")
+        return
+    for idx, item in enumerate(results, 1):
+        meta = ", ".join(part for part in (item.kind, item.source, " ".join(f"#{tag}" for tag in item.tags)) if part)
+        console.print(f"[bold cyan]{idx}.[/bold cyan] [green]{item.score:.4f}[/green] [dim]{item.id[:12]}[/dim] {meta}")
+        console.print(f"   {item.text[:400]}{'...' if len(item.text) > 400 else ''}\n")
+
+
+@cli.command()
+@click.argument("ids", nargs=-1)
+@click.option("--collection", "-c", required=True, help="Document collection.")
+@click.option("--tag", "tags", multiple=True, help="Delete documents with any of these tags (repeatable).")
+@click.option("--source", default=None, help="Delete documents from this source.")
+@click.option("--kind", default=None, help="Delete documents of this kind.")
+@click.option("--drop", is_flag=True, help="Delete the entire collection.")
+@click.pass_context
+def forget(
+    ctx: click.Context,
+    ids: tuple[str, ...],
+    collection: str,
+    tags: tuple[str, ...],
+    source: str | None,
+    kind: str | None,
+    drop: bool,
+) -> None:
+    """
+    Delete documents by ID or filter, or drop a whole document collection.
+    """
+    config = ctx.obj["config"]
+    _require_store(config)
+
+    try:
+        with QuickContext(config) as qc:
+            if drop:
+                dropped = qc.documents.drop(collection)
+                console.print(f"[green]Dropped[/green] {collection}" if dropped else f"[yellow]No collection {collection}[/yellow]")
+                return
+            removed = qc.forget(collection, list(ids) or None, tags=list(tags) or None, source=source, kind=kind)
+            console.print(f"[green]Removed {removed} document(s)[/green] from {collection}")
+    except Exception as exc:
+        console.print(f"[red]Forget failed:[/red] {exc}")
+        sys.exit(1)
+
+
+@cli.command("collections")
+@click.pass_context
+def collections_cmd(ctx: click.Context) -> None:
+    """
+    List document collections.
+    """
+    config = ctx.obj["config"]
+    _require_store(config)
+
+    with QuickContext(config) as qc:
+        rows = qc.documents.collections()
+    if not rows:
+        console.print("[yellow]No document collections[/yellow]")
+        return
+    table = Table(title="Document Collections")
+    table.add_column("Collection", style="cyan")
+    table.add_column("Documents", style="green")
+    table.add_column("Search", style="magenta")
+    for row in rows:
+        mode = "hybrid" if row["vectors"] else "keyword"
+        table.add_row(row["name"], str(row["points_count"]), mode)
+    console.print(table)
 
 
 @cli.command("file-read")

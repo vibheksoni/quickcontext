@@ -59,6 +59,12 @@ class LiteLLMProvider(EmbeddingProvider):
         if self._config.api_base:
             kwargs["api_base"] = self._config.api_base
 
+        if self._config.request_timeout_seconds is not None:
+            kwargs["timeout"] = float(self._config.request_timeout_seconds)
+
+        if self._config.openrouter_provider:
+            kwargs["extra_body"] = {"provider": {"order": [self._config.openrouter_provider]}}
+
         response = _get_litellm_embedding()(**kwargs)
 
         vectors = []

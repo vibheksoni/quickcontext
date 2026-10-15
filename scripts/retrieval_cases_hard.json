@@ -28,8 +28,8 @@
     "expected_paths": ["service/src/structural_boost.rs", "service/src/text_search.rs"]
   },
   {
-    "query": "How does the Qdrant phase benchmark separate client-side latency from Qdrant server time?",
-    "expected_paths": ["scripts/search_phase_benchmark.py", "engine/src/qdrant_search.py"]
+    "query": "How does the search phase benchmark time each searcher and vector store call separately?",
+    "expected_paths": ["scripts/search_phase_benchmark.py", "engine/src/vector_store.py"]
   },
   {
     "query": "How are file path prefixes generated during indexing and then used during retrieval filtering?",

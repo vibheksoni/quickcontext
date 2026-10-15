@@ -1,9 +1,9 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Instant;
 
 use ignore::WalkBuilder;
@@ -29,16 +29,22 @@ pub fn grep_path(
 
     let start = Instant::now();
     let effective_limit = limit.max(1);
+    let match_count = AtomicUsize::new(0);
+    let context = ContextWindow {
+        before: before_context,
+        after: after_context,
+    };
 
     if root.is_file() {
         let mut matches = Vec::new();
-        search_file(root, query, effective_limit, before_context, after_context, &mut matches);
-        let elapsed_ms = start.elapsed().as_millis();
+        search_file(root, query, context, &match_count, effective_limit, &mut |m| {
+            matches.push(m)
+        });
         return Ok(GrepResult {
             matches,
             searched_files: 1,
-            duration_ms: elapsed_ms,
-            truncated: false,
+            duration_ms: start.elapsed().as_millis(),
+            truncated: match_count.load(Ordering::Relaxed) > effective_limit,
         });
     }
 
@@ -53,17 +59,12 @@ pub fn grep_path(
     }
 
     let (tx, rx) = mpsc::channel::<GrepMatch>();
-    let query = Arc::new(query.to_string());
-    let match_count = Arc::new(AtomicUsize::new(0));
-    let searched_files = Arc::new(AtomicUsize::new(0));
+    let searched_files = AtomicUsize::new(0);
 
     builder.build_parallel().run(|| {
         let tx = tx.clone();
-        let query = Arc::clone(&query);
-        let match_count = Arc::clone(&match_count);
-        let searched_files = Arc::clone(&searched_files);
-        let before_ctx = before_context;
-        let after_ctx = after_context;
+        let match_count = &match_count;
+        let searched_files = &searched_files;
 
         Box::new(move |entry| {
             if match_count.load(Ordering::Relaxed) >= effective_limit {
@@ -75,151 +76,34 @@ pub fn grep_path(
                 Err(_) => return ignore::WalkState::Continue,
             };
 
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
 
             searched_files.fetch_add(1, Ordering::Relaxed);
 
-            let file_path = entry.path();
-            let file = match File::open(file_path) {
-                Ok(f) => f,
-                Err(_) => return ignore::WalkState::Continue,
-            };
+            let limit_reached = search_file(
+                entry.path(),
+                query,
+                context,
+                match_count,
+                effective_limit,
+                &mut |m| {
+                    let _ = tx.send(m);
+                },
+            );
 
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-            let mut line_number = 0usize;
-            let mut before_lines: Vec<(usize, String)> = Vec::new();
-            let mut after_count = 0usize;
-            let mut in_after_context = false;
-            let mut pending_match: Option<GrepMatch> = None;
-
-            loop {
-                if match_count.load(Ordering::Relaxed) >= effective_limit && !in_after_context {
-                    return ignore::WalkState::Quit;
-                }
-
-                line.clear();
-                let read = match reader.read_line(&mut line) {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if read == 0 {
-                    break;
-                }
-
-                line_number += 1;
-
-                if line.contains('\0') {
-                    break;
-                }
-
-                let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-
-                if in_after_context {
-                    if after_count > 0 {
-                        if let Some(ref mut m) = pending_match {
-                            m.context_after.push(trimmed.clone());
-                        }
-                        after_count -= 1;
-                    } else {
-                        if let Some(m) = pending_match.take() {
-                            let _ = tx.send(m);
-                        }
-                        in_after_context = false;
-                    }
-
-                    if let Some(byte_idx) = line.find(query.as_str()) {
-                        if match_count.load(Ordering::Relaxed) < effective_limit {
-                            let col_start = line[..byte_idx].chars().count() + 1;
-                            let col_end = col_start + query.chars().count() - 1;
-
-                            before_lines = before_lines.iter()
-                                .skip(before_lines.len().saturating_sub(before_ctx))
-                                .cloned()
-                                .collect();
-
-                            if let Some(m) = pending_match.take() {
-                                let _ = tx.send(m);
-                            }
-
-                            pending_match = Some(GrepMatch {
-                                file_path: file_path.to_string_lossy().to_string(),
-                                line_number,
-                                column_start: col_start,
-                                column_end: col_end,
-                                line: trimmed.clone(),
-                                context_before: before_lines.iter().map(|(_, l)| l.clone()).collect(),
-                                context_after: Vec::new(),
-                            });
-
-                            let prev = match_count.fetch_add(1, Ordering::Relaxed);
-                            if prev >= effective_limit {
-                                if let Some(m) = pending_match.take() {
-                                    let _ = tx.send(m);
-                                }
-                                return ignore::WalkState::Quit;
-                            }
-
-                            after_count = after_ctx;
-                            in_after_context = after_count > 0;
-                        }
-                    }
-                } else {
-                    if let Some(byte_idx) = line.find(query.as_str()) {
-                        let prev = match_count.fetch_add(1, Ordering::Relaxed);
-                        if prev < effective_limit {
-                            let col_start = line[..byte_idx].chars().count() + 1;
-                            let col_end = col_start + query.chars().count() - 1;
-
-                            before_lines = before_lines.iter()
-                                .skip(before_lines.len().saturating_sub(before_ctx))
-                                .cloned()
-                                .collect();
-
-                            pending_match = Some(GrepMatch {
-                                file_path: file_path.to_string_lossy().to_string(),
-                                line_number,
-                                column_start: col_start,
-                                column_end: col_end,
-                                line: trimmed.clone(),
-                                context_before: before_lines.iter().map(|(_, l)| l.clone()).collect(),
-                                context_after: Vec::new(),
-                            });
-
-                            after_count = after_ctx;
-                            in_after_context = after_count > 0;
-
-                            if after_count == 0 {
-                                if let Some(m) = pending_match.take() {
-                                    let _ = tx.send(m);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                before_lines.push((line_number, trimmed));
-                if before_lines.len() > before_ctx + 1 {
-                    before_lines.remove(0);
-                }
+            if limit_reached {
+                ignore::WalkState::Quit
+            } else {
+                ignore::WalkState::Continue
             }
-
-            if let Some(m) = pending_match.take() {
-                let _ = tx.send(m);
-            }
-
-            ignore::WalkState::Continue
         })
     });
 
     drop(tx);
 
-    let mut matches = Vec::new();
-    for m in rx {
-        matches.push(m);
-    }
+    let mut matches: Vec<GrepMatch> = rx.into_iter().collect();
 
     matches.sort_by(|a, b| {
         a.file_path
@@ -227,150 +111,166 @@ pub fn grep_path(
             .then(a.line_number.cmp(&b.line_number))
             .then(a.column_start.cmp(&b.column_start))
     });
+    matches.truncate(effective_limit);
 
-    if matches.len() > effective_limit {
-        matches.truncate(effective_limit);
-    }
-
-    let elapsed_ms = start.elapsed().as_millis();
     Ok(GrepResult {
         matches,
         searched_files: searched_files.load(Ordering::Relaxed),
-        duration_ms: elapsed_ms,
+        duration_ms: start.elapsed().as_millis(),
         truncated: match_count.load(Ordering::Relaxed) > effective_limit,
     })
 }
 
+#[derive(Clone, Copy)]
+struct ContextWindow {
+    before: usize,
+    after: usize,
+}
+
+/// Scan one file for literal matches, claiming result slots from the shared counter.
+///
+/// Returns true when scanning stopped because the global match limit was reached.
 fn search_file(
     path: &Path,
     query: &str,
+    context: ContextWindow,
+    match_count: &AtomicUsize,
     limit: usize,
-    before_context: usize,
-    after_context: usize,
-    out: &mut Vec<GrepMatch>,
-) {
+    emit: &mut dyn FnMut(GrepMatch),
+) -> bool {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut line_number = 0usize;
-    let mut before_lines: Vec<(usize, String)> = Vec::new();
-    let mut after_count = 0usize;
-    let mut in_after_context = false;
-    let mut pending_match: Option<GrepMatch> = None;
+    let mut before_lines: VecDeque<String> = VecDeque::with_capacity(context.before);
+    let mut pending: Option<(GrepMatch, usize)> = None;
+    let mut file_path: Option<String> = None;
+    let query_chars = query.chars().count();
 
-    while out.len() < limit || in_after_context {
-        line.clear();
-        let read = match reader.read_line(&mut line) {
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        if read == 0 {
-            break;
+    loop {
+        if pending.is_none() && match_count.load(Ordering::Relaxed) >= limit {
+            return true;
         }
 
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
         line_number += 1;
 
-        if line.contains('\0') {
+        if buf.contains(&0) {
             break;
         }
 
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        let line = String::from_utf8_lossy(&buf);
+        let text = line.trim_end_matches(['\r', '\n']);
 
-        if in_after_context {
-            if after_count > 0 {
-                if let Some(ref mut m) = pending_match {
-                    m.context_after.push(trimmed.clone());
-                }
-                after_count -= 1;
-            } else {
-                if let Some(m) = pending_match.take() {
-                    out.push(m);
-                }
-                in_after_context = false;
-            }
-
-            if out.len() >= limit {
-                break;
-            }
-
-            if let Some(byte_idx) = line.find(query) {
-                let col_start = line[..byte_idx].chars().count() + 1;
-                let col_end = col_start + query.chars().count() - 1;
-
-                before_lines = before_lines.iter()
-                    .skip(before_lines.len().saturating_sub(before_context))
-                    .cloned()
-                    .collect();
-
-                if let Some(m) = pending_match.take() {
-                    out.push(m);
-                }
-
-                pending_match = Some(GrepMatch {
-                    file_path: path.to_string_lossy().to_string(),
-                    line_number,
-                    column_start: col_start,
-                    column_end: col_end,
-                    line: trimmed.clone(),
-                    context_before: before_lines.iter().map(|(_, l)| l.clone()).collect(),
-                    context_after: Vec::new(),
-                });
-
-                after_count = after_context;
-                in_after_context = after_count > 0;
-
-                if after_count == 0 {
-                    if let Some(m) = pending_match.take() {
-                        out.push(m);
-                    }
-                }
-            }
-        } else {
-            if let Some(byte_idx) = line.find(query) {
-                let col_start = line[..byte_idx].chars().count() + 1;
-                let col_end = col_start + query.chars().count() - 1;
-
-                before_lines = before_lines.iter()
-                    .skip(before_lines.len().saturating_sub(before_context))
-                    .cloned()
-                    .collect();
-
-                if let Some(m) = pending_match.take() {
-                    out.push(m);
-                }
-
-                pending_match = Some(GrepMatch {
-                    file_path: path.to_string_lossy().to_string(),
-                    line_number,
-                    column_start: col_start,
-                    column_end: col_end,
-                    line: trimmed.clone(),
-                    context_before: before_lines.iter().map(|(_, l)| l.clone()).collect(),
-                    context_after: Vec::new(),
-                });
-
-                after_count = after_context;
-                in_after_context = after_count > 0;
-
-                if after_count == 0 {
-                    if let Some(m) = pending_match.take() {
-                        out.push(m);
-                    }
+        if let Some((m, remaining)) = pending.as_mut() {
+            m.context_after.push(text.to_string());
+            *remaining -= 1;
+            if *remaining == 0 {
+                if let Some((m, _)) = pending.take() {
+                    emit(m);
                 }
             }
         }
 
-        before_lines.push((line_number, trimmed.clone()));
-        if before_lines.len() > before_context + 1 {
-            before_lines.remove(0);
+        if let Some(byte_idx) = line.find(query) {
+            if match_count.fetch_add(1, Ordering::Relaxed) < limit {
+                if let Some((m, _)) = pending.take() {
+                    emit(m);
+                }
+
+                let column_start = line[..byte_idx].chars().count() + 1;
+                let m = GrepMatch {
+                    file_path: file_path
+                        .get_or_insert_with(|| path.to_string_lossy().into_owned())
+                        .clone(),
+                    line_number,
+                    column_start,
+                    column_end: column_start + query_chars - 1,
+                    line: text.to_string(),
+                    context_before: before_lines.iter().cloned().collect(),
+                    context_after: Vec::new(),
+                };
+
+                if context.after == 0 {
+                    emit(m);
+                } else {
+                    pending = Some((m, context.after));
+                }
+            }
+        }
+
+        if context.before > 0 {
+            if before_lines.len() == context.before {
+                before_lines.pop_front();
+            }
+            before_lines.push_back(text.to_string());
         }
     }
 
-    if let Some(m) = pending_match.take() {
-        out.push(m);
+    if let Some((m, _)) = pending.take() {
+        emit(m);
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("qc_grep_{}_{name}", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn single_file_respects_limit_with_after_context() {
+        let path = temp_file("limit.txt", b"foo 1\nfoo 2\nfoo 3\nbar\n");
+        let result = grep_path("foo", &path, true, 1, 0, 2);
+        let _ = std::fs::remove_file(&path);
+
+        let result = result.unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].line_number, 1);
+        assert_eq!(result.matches[0].context_after, vec!["foo 2", "foo 3"]);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn single_file_collects_context_lines() {
+        let path = temp_file("context.txt", b"a\nb\nneedle here\nc\nd\n");
+        let result = grep_path("needle", &path, true, 10, 1, 1);
+        let _ = std::fs::remove_file(&path);
+
+        let result = result.unwrap();
+        assert_eq!(result.matches.len(), 1);
+        let m = &result.matches[0];
+        assert_eq!(m.line_number, 3);
+        assert_eq!(m.column_start, 1);
+        assert_eq!(m.column_end, 6);
+        assert_eq!(m.line, "needle here");
+        assert_eq!(m.context_before, vec!["b"]);
+        assert_eq!(m.context_after, vec!["c"]);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn single_file_keeps_scanning_past_invalid_utf8() {
+        let path = temp_file("latin1.txt", b"caf\xe9\nneedle\n");
+        let result = grep_path("needle", &path, true, 10, 0, 0);
+        let _ = std::fs::remove_file(&path);
+
+        let result = result.unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].line_number, 2);
     }
 }

@@ -96,7 +96,7 @@ class ChunkDiffer:
         """
         Compare old and new chunks to detect changes.
 
-        old_chunks: list[CodeChunk] — Existing chunks from Qdrant.
+        old_chunks: list[CodeChunk] — Existing chunks from the vector store.
         new_chunks: list[CodeChunk] — Newly extracted chunks from file.
         Returns: ChunkDiff — Categorized changes.
         """

@@ -32,6 +32,22 @@ class EmbeddingProvider(ABC):
         """
         return self._config.dimension
 
+    @property
+    def query_prefix(self) -> str:
+        """
+        Returns: str — Instruction prepended to search queries ("" when unset).
+        """
+        return self._config.query_prefix or ""
+
+    def embed_query(self, text: str) -> np.ndarray:
+        """
+        Embed a search query, applying the configured query instruction.
+
+        text: str — Query text.
+        Returns: np.ndarray — Query vector.
+        """
+        return self.embed_single(self.query_prefix + text)
+
     @abstractmethod
     def embed(self, texts: Sequence[str]) -> list[np.ndarray]:
         """

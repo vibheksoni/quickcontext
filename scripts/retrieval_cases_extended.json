@@ -12,7 +12,7 @@
     "expected_paths": ["engine/src/searcher.py"]
   },
   {
-    "query": "How does this codebase make parser-only Python commands work without requiring Qdrant imports at startup?",
+    "query": "How does this codebase make parser-only Python commands work without importing the vector store at startup?",
     "expected_paths": ["engine/src/parsing.py", "engine/src/parser_cli.py", "engine/__main__.py", "engine/sdk.py"]
   },
   {
@@ -64,12 +64,12 @@
     "expected_paths": ["service/src/symbol_index.rs"]
   },
   {
-    "query": "How are path prefixes stored in Qdrant payloads for server-side path filtering?",
+    "query": "How are path scopes normalized and matched for store-side path filtering?",
     "expected_paths": ["engine/src/indexer.py", "engine/src/searcher.py"]
   },
   {
-    "query": "How does the code lazily create Qdrant and embedding providers inside QuickContext?",
-    "expected_paths": ["engine/sdk.py", "engine/src/qdrant.py", "engine/src/providers/factory.py"]
+    "query": "How does the code lazily open the vector store and create embedding providers inside QuickContext?",
+    "expected_paths": ["engine/sdk.py", "engine/src/vector_store.py", "engine/src/providers/factory.py"]
   },
   {
     "query": "How are duplicate chunks collapsed before embedding so repeated code does not get embedded twice?",

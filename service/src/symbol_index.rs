@@ -26,8 +26,8 @@ use crate::types::{
 
 const STATE_KEY: &str = "state";
 const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot");
-const REFRESH_DEBOUNCE_MS: u128 = 5000;
-const SYMBOL_INDEX_SCHEMA_VERSION: u32 = 2;
+const REFRESH_DEBOUNCE_MS: u128 = 1000;
+const SYMBOL_INDEX_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SymbolRecord {
@@ -135,12 +135,13 @@ pub fn symbol_lookup(
         HashSet::new()
     };
     let qualified_query = parse_qualified_symbol_query(query);
+    let query_lower = query.to_ascii_lowercase();
 
     let mut score_by_symbol_id: HashMap<usize, f64> = HashMap::new();
 
     if query_tokens.is_empty() {
         for symbol in &project_index.symbols {
-            if symbol.name_lower.contains(&query.to_ascii_lowercase()) {
+            if symbol.name_lower.contains(&query_lower) {
                 score_by_symbol_id.insert(symbol.id, 1.0);
             }
         }
@@ -154,7 +155,7 @@ pub fn symbol_lookup(
         }
     }
 
-    if let Some(ids) = project_index.name_to_symbol_ids.get(&query.to_ascii_lowercase()) {
+    if let Some(ids) = project_index.name_to_symbol_ids.get(&query_lower) {
         for id in ids {
             *score_by_symbol_id.entry(*id).or_insert(0.0) += query_tokens.len().max(1) as f64 + 2.0;
         }
@@ -162,10 +163,14 @@ pub fn symbol_lookup(
 
     if let Some((parent_query, name_query)) = qualified_query.as_ref() {
         for symbol in &project_index.symbols {
-            let parent = symbol.parent.as_deref().unwrap_or_default().to_ascii_lowercase();
-            if parent == *parent_query && symbol.name_lower == *name_query {
+            let parent_matches = symbol
+                .parent
+                .as_deref()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(parent_query);
+            if parent_matches && symbol.name_lower == *name_query {
                 *score_by_symbol_id.entry(symbol.id).or_insert(0.0) += query_tokens.len().max(1) as f64 + 4.5;
-            } else if parent == *parent_query {
+            } else if parent_matches {
                 *score_by_symbol_id.entry(symbol.id).or_insert(0.0) += 1.25;
             }
         }
@@ -188,7 +193,7 @@ pub fn symbol_lookup(
     if !query_tokens.is_empty() {
         for (symbol_id, score) in &mut score_by_symbol_id {
             if let Some(symbol) = project_index.symbols.get(*symbol_id) {
-                let exact_name_match = symbol.name_lower == query.to_ascii_lowercase();
+                let exact_name_match = symbol.name_lower == query_lower;
                 let symbol_tokens = tokenize(&symbol.name);
                 let coverage = symbol_query_coverage(&query_tokens, &symbol_tokens, exact_name_match);
                 *score *= symbol_lookup_coverage_multiplier(query_tokens.len(), coverage, exact_name_match);
@@ -354,17 +359,15 @@ pub fn find_callers(
 }
 
 fn build_callers_from_index(index: &ProjectIndex, symbol_lower: &str, limit: usize) -> Vec<CallerItem> {
-    let edges = index
-        .callers_by_callee
-        .get(symbol_lower)
-        .cloned()
-        .unwrap_or_default();
+    let Some(edges) = index.callers_by_callee.get(symbol_lower) else {
+        return Vec::new();
+    };
 
     let mut callers = Vec::new();
-    for edge in edges.into_iter().take(limit) {
+    for edge in edges.iter().take(limit) {
         if let Some(caller) = index.symbols.get(edge.caller_symbol_id) {
             callers.push(CallerItem {
-                callee_name: edge.callee_name,
+                callee_name: edge.callee_name.clone(),
                 caller_name: caller.name.clone(),
                 caller_kind: caller.kind.clone(),
                 caller_language: caller.language.clone(),
@@ -542,6 +545,11 @@ fn refresh_symbol_index_if_needed(
             .read()
             .map_err(|_| "symbol index read lock poisoned".to_string())?;
         if index.file_signatures == current {
+            drop(index);
+            project_lock
+                .write()
+                .map_err(|_| "symbol index write lock poisoned".to_string())?
+                .last_refresh_check_ms = now_ms();
             return Ok(true);
         }
     }
@@ -586,15 +594,30 @@ fn ensure_call_edges(
     )?;
 
     let mut edges = Vec::new();
-    for file in &extracted {
-        let source = match fs::read_to_string(&file.file_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+    {
+        let id_by_span: HashMap<(&str, usize, usize), usize> = index
+            .symbols
+            .iter()
+            .map(|s| ((s.file_path.as_str(), s.byte_start, s.byte_end), s.id))
+            .collect();
 
-        let file_symbols: Vec<ExtractedSymbol> = file.symbols.clone();
-        let file_edges = extract_call_edges(&source, &file.language, &file_symbols, specs)?;
-        edges.extend(file_edges);
+        for file in &extracted {
+            let source = match fs::read_to_string(&file.file_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            for mut edge in extract_call_edges(&source, &file.language, &file.symbols, specs)? {
+                let Some(local) = file.symbols.get(edge.caller_symbol_id) else {
+                    continue;
+                };
+                let key = (local.file_path.as_str(), local.byte_start, local.byte_end);
+                if let Some(&global_id) = id_by_span.get(&key) {
+                    edge.caller_symbol_id = global_id;
+                    edges.push(edge);
+                }
+            }
+        }
     }
 
     index.callers_by_callee.clear();
@@ -811,6 +834,7 @@ fn build_project_index(
     let mut callees_by_caller: HashMap<usize, Vec<CallerEdge>> = HashMap::new();
 
     for file in &extracted {
+        let base_id = symbols.len();
         for s in &file.symbols {
             let id = symbols.len();
             let name_lower = s.name.to_ascii_lowercase();
@@ -843,7 +867,8 @@ fn build_project_index(
         };
 
         let file_edges = extract_call_edges(&source, &file.language, &file.symbols, specs)?;
-        for edge in file_edges {
+        for mut edge in file_edges {
+            edge.caller_symbol_id += base_id;
             callers_by_callee
                 .entry(edge.callee_name_lower.clone())
                 .or_default()
@@ -888,33 +913,33 @@ fn extract_call_edges(
         .parse(source, None)
         .ok_or_else(|| format!("failed to parse source for {language_name}"))?;
 
+    let src = source.as_bytes();
     let mut edges = Vec::new();
-    collect_call_edges_recursive(tree.root_node(), source.as_bytes(), language_name, symbols, &mut edges);
-    Ok(edges)
-}
+    let mut cursor = tree.walk();
 
-fn collect_call_edges_recursive(
-    node: Node,
-    src: &[u8],
-    language_name: &str,
-    symbols: &[ExtractedSymbol],
-    edges: &mut Vec<CallerEdge>,
-) {
-    if let Some(callee_name) = extract_callee_name(node, src, language_name) {
-        let call_byte = node.start_byte();
-        if let Some(caller_symbol) = find_enclosing_symbol(symbols, call_byte) {
-            edges.push(CallerEdge {
-                callee_name_lower: callee_name.to_ascii_lowercase(),
-                callee_name,
-                caller_symbol_id: caller_symbol,
-                caller_line: node.start_position().row + 1,
-            });
+    loop {
+        let node = cursor.node();
+        if let Some(callee_name) = extract_callee_name(node, src, language_name) {
+            if let Some(caller_symbol) = find_enclosing_symbol(symbols, node.start_byte()) {
+                edges.push(CallerEdge {
+                    callee_name_lower: callee_name.to_ascii_lowercase(),
+                    callee_name,
+                    caller_symbol_id: caller_symbol,
+                    caller_line: node.start_position().row + 1,
+                });
+            }
         }
-    }
 
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            collect_call_edges_recursive(child, src, language_name, symbols, edges);
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(edges);
+            }
         }
     }
 }
@@ -965,11 +990,8 @@ fn extract_last_identifier(node: Node, src: &[u8]) -> Option<String> {
             }
         }
 
-        for i in 0..curr.child_count() {
-            if let Some(child) = curr.child(i as u32) {
-                stack.push(child);
-            }
-        }
+        let mut cursor = curr.walk();
+        stack.extend(curr.children(&mut cursor));
     }
 
     last
@@ -1415,6 +1437,24 @@ mod tests {
             Some(("crate::module".to_string(), "symbol_name".to_string()))
         );
         assert_eq!(parse_qualified_symbol_query("CollectionManager"), None);
+    }
+
+    #[test]
+    fn test_caller_edges_reference_global_symbol_ids() {
+        let dir = std::env::temp_dir().join(format!("qc_symidx_callers_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.py"), "def helper():\n    return 1\n\ndef other():\n    return 2\n").unwrap();
+        fs::write(dir.join("b.py"), "def unrelated():\n    return 0\n\ndef caller_one():\n    return helper()\n").unwrap();
+
+        let specs = crate::lang::registry();
+        let index = build_project_index(&dir, specs, false).unwrap();
+        let callers = build_callers_from_index(&index, "helper", 10);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].caller_name, "caller_one");
+        assert!(callers[0].caller_file_path.ends_with("b.py"));
     }
 
     #[test]

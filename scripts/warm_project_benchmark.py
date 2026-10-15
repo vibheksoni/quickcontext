@@ -12,7 +12,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from engine.sdk import QuickContext
-from engine.src.cli import _optimize_search_config
 from engine.src.config import EngineConfig
 
 
@@ -72,7 +71,7 @@ def _measure_background_query(
 
 def main() -> None:
     args = _parse_args()
-    config = _optimize_search_config(_load_config(args.config))
+    config = _load_config(args.config)
 
     cold_latencies: list[float] = []
     warm_latencies: list[float] = []

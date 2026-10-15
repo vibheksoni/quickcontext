@@ -16,7 +16,7 @@ The project is still in progress. There is room to improve architecture, speed, 
 
 - The primary product target is a long-lived Rust service plus a Python SDK wrapper.
 - Rust should keep handling parsing, symbol and text search, graph operations, and other hot paths where performance matters.
-- Python should keep handling embeddings, Qdrant orchestration, higher-level retrieval logic, and the SDK surface used by other tools.
+- Python should keep handling embeddings, the embedded vector store, higher-level retrieval logic, agent document collections, and the SDK surface used by other tools.
 - The Python CLI is mainly a development and validation surface. It is useful, but it is not the main product target.
 - MCP is intentionally a later thin layer over the SDK. It is low priority until speed and retrieval quality are strong.
 - When evaluating performance work, prioritize persistent service and SDK workflows over one-shot CLI startup optics.
@@ -32,13 +32,13 @@ Flow:
 1. Keep the Rust service process running.
 2. Python talks to Rust through local IPC.
 3. Rust handles parser, search, and other heavy operations.
-4. Python handles indexing, embeddings, Qdrant collections, retrieval composition, and SDK ergonomics.
+4. Python handles indexing, embeddings, vector store collections, retrieval composition, and SDK ergonomics.
 
 `QuickContext` keeps that split lazy in practice:
 
-- entering `with QuickContext(...)` does not force a Qdrant connection up front
+- entering `with QuickContext(...)` does not open the vector store up front
 - parser-only and text-first workflows can start without paying vector-store startup cost
-- Qdrant still connects lazily on first vector or collection operation
+- the SQLite store opens lazily on first vector or collection operation, and each collection's matrix loads on its first query
 - full shadow indexing now persists a local resume manifest under `.quickcontext/` so an interrupted full index can reuse the in-progress shadow collection instead of discarding already-upserted files
 
 ## IPC Transport
@@ -65,16 +65,21 @@ Legacy `QC_*` environment variables still exist as a fallback, but the intended 
 
 Important config ideas:
 
-- parser-only commands do not require Qdrant or embeddings
-- indexing and semantic search require Qdrant plus embedding configuration
+- parser-only commands do not require the vector store or embeddings
+- indexing and semantic search require embedding configuration; vectors live in an embedded SQLite store (`store.path`, default under %LOCALAPPDATA% or ~/.local/share), no server or Docker
 - local example config uses `fastembed`
 - cloud example config uses `litellm`
+- `profiles` holds named config overrides (selected by `--profile`, `QC_PROFILE`, or top-level `profile`); an embedding section that sets `model`/`provider` replaces the base section, and each profile defaults to its own `store-<profile>.db`
+- local fastembed models are shared per process through `engine/src/providers/local_models.py` (`device` auto/cpu/cuda/directml with CPU fallback, `max_input_tokens` truncation); remote litellm embedding runs a continuous request queue with token-budget packing (`plan_remote_batches`), default concurrency 16
+- `query_prefix` is prepended to queries only (instruction-tuned models such as Qwen3-Embedding); always embed queries through `searcher.embed_query(provider, text)`
+- measured trade-offs live in `docs/embeddings.md`
 - runtime settings such as the Rust service path, Unix socket override, and MCP transport options now belong in `quickcontext.json` under `service`, `transport`, and `mcp`
-- embedding dimensions must match the Qdrant collection vector dimensions
+- code-collection vector dimensions are derived from the embedding configs; indexing detects a dimension change and rebuilds every file into a fresh shadow collection
 - the Rust symbol index snapshot lives in `.quickcontext/symbol_index.redb` and uses a compact binary payload format for faster cold loads
 - the persisted Rust text index also stores file-category and path-field metadata so text search can blend content and path signals while downweighting low-priority file classes
 - Rust extraction also reuses compiled tree-sitter queries across parses to reduce repeated extractor overhead
 - fast indexing now downgrades obvious large minified JavaScript bundle artifacts to a small number of coarse file chunks before deep extraction so generated trees do not pay full parser cost for low-value bundles
+- code chunks are embedded with a short deterministic header (trailing file path plus `kind: Parent.symbol`), a zero-cost form of contextual retrieval; disable with `code_embedding.contextual_header: false`
 - generated artifact chunks now prepend a deterministic semantic projection of extracted services, methods, types, fields, and relevant strings so semantic retrieval has better signal on dist-heavy JavaScript bundles even when fast mode skips full symbol extraction
 - generated artifact chunk sampling now prefers structurally interesting hotspots from extracted service/type/method/field/string signals before filling the remaining windows with broad file coverage, so large generated bundles are more likely to expose the relevant region to semantic retrieval
 - large generated bundle files now also emit one distributed summary packet that aggregates signals from multiple structural hotspots across the file, giving semantic retrieval one cheaper file-level anchor in addition to the per-window artifact chunks
@@ -82,7 +87,7 @@ Important config ideas:
 - AI-facing retrieval now tries to replace top generated-bundle summary hits with a tighter file-local grep-backed focus snippet before returning results, so agents see the most relevant local evidence inside a generated file instead of only a broad artifact packet
 - when Rust extraction returns no symbols for a file and a ready language server exists for that language, the SDK now opportunistically enriches that file with LSP document symbols before chunking so indexing can still use AST-backed structure instead of falling back straight to whole-file chunks
 - on Windows, LSP readiness checks and Rust LSP spawning now resolve npm-global binaries directly, so installing npm-based language servers does not require restarting the shell just to make them discoverable
-- `index_directory(...)` and `refresh_files(...)` now expose real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and Qdrant upsert
+- `index_directory(...)` and `refresh_files(...)` now expose real phase timings for scan, artifact profiling, extraction, chunk building, filtering, dedup, description generation, embedding, point building, and store writes
 
 Indexing profile guidance:
 
@@ -102,7 +107,9 @@ Indexing profile guidance:
 
 - `engine/src/cli.py`: CLI surface
 - `engine/src/config.py`: config schema and defaults
-- `engine/src/collection.py`: Qdrant collection lifecycle and aliases
+- `engine/src/vector_store.py`: embedded SQLite + numpy vector store (exact search, incremental snapshots, FTS5)
+- `engine/src/collection.py`: versioned code collections and project aliases
+- `engine/src/documents.py`: agent document collections (collect / recall / forget)
 - `engine/src/indexer.py`: upsert and payload handling
 - `engine/src/searcher.py`: semantic and structured retrieval
 - `engine/src/query_dsl.py`: typed query parser
@@ -116,13 +123,14 @@ Indexing profile guidance:
 
 Useful SDK retrieval primitives:
 
-- `QuickContext.retrieve_context_auto(...)`: default AI entrypoint; routes exact symbol questions to symbol lookup, expands behavior-oriented exact-symbol questions with helper symbols from the same implementation file using file-scoped Rust symbol-index metadata plus targeted source hydration, can use Rust text search as the primary path for strong non-symbol technical queries, enriches broad text-primary results with import-aware and module-local related files, attaches scoped graph-lexical companions for import/dependency-style graph questions, accepts explicit `path=` scoping when the target repo is outside the current process cwd, and falls back to Rust text retrieval when an external repo has not been vector-indexed yet
-- `QuickContext.project_info(...)`: stable project discovery payload for wrappers; reports detected project name, cache state, parser connectivity, Qdrant availability, current collection metadata, and optional folder scopes
+- `QuickContext.retrieve_context_auto(...)`: default AI entrypoint; routes exact symbol questions to symbol lookup, expands behavior-oriented exact-symbol questions with helper symbols from the same implementation file using file-scoped Rust symbol-index metadata plus targeted source hydration, can use Rust text search as the primary path for strong non-symbol technical queries (each whole-file text match is focused onto the best-matching symbol in that file with a small in-file BM25 over name, signature/docstring, and body terms, and when the project has a vector index the lexical file ranking is fused with semantic search at file level using weighted reciprocal rank fusion, semantic weight 2.0), enriches broad text-primary results with import-aware and module-local related files, attaches scoped graph-lexical companions for import/dependency-style graph questions, accepts explicit `path=` scoping when the target repo is outside the current process cwd, and falls back to Rust text retrieval when an external repo has not been vector-indexed yet
+- `QuickContext.project_info(...)`: stable project discovery payload for wrappers; reports detected project name, cache state, parser connectivity, vector store availability, current collection metadata, and optional folder scopes
 - `QuickContext.list_projects(...)`: typed indexed-project discovery without importing internal collection helpers
-- `QuickContext.qdrant_available(...)`: explicit vector-backend health probe so wrappers can distinguish empty state from an unreachable Qdrant backend
+- `QuickContext.vector_store_available(...)`: explicit vector-store health probe so wrappers can distinguish empty state from an unusable store
+- `QuickContext.collect(...)` / `recall(...)` / `forget(...)`: agent document memory with hybrid weighted-RRF recall, optional MMR diversity, recency decay, and near-duplicate merging
 - `QuickContext.start_index_directory(...)`: starts SDK-owned background indexing and returns a pollable operation snapshot
 - `QuickContext.start_refresh_files(...)`: starts SDK-owned background refresh work with the same snapshot model
-- `QuickContext.get_operation_status(...)` / `QuickContext.list_operation_statuses(...)`: poll live operation snapshots with stage, files remaining, chunk counts, description progress, embedding progress, and Qdrant upsert progress
+- `QuickContext.get_operation_status(...)` / `QuickContext.list_operation_statuses(...)`: poll live operation snapshots with stage, files remaining, chunk counts, description progress, embedding progress, and store write progress
 - `QuickContext.warm_project(...)`: preload persisted Rust symbol and text indices for a project root before the first real query
 - `QuickContext.start_background_warm(...)`: schedule the same Rust warmup to run once the SDK session goes idle instead of blocking startup
 - `QuickContext.lsp_sessions(...)`: list the active language-server sessions currently tracked by the Rust service, including pid, project root, and live state
@@ -140,6 +148,9 @@ The tracked MCP wrapper stays thin over those same SDK primitives:
 - `search`: main AI-facing retrieval surface with `auto`, `text`, `semantic`, and `bundle` modes
 - `grep`: exact literal retrieval through the Rust service
 - `symbol_lookup`: exact or near-exact identifier lookup through the Rust symbol index
+- `collect` / `recall` / `forget` / `collections`: agent document memory over the same store
+
+The MCP server keeps one long-lived `QuickContext` per process so embedding models, the Rust pipe, and in-memory vector matrices stay warm across tool calls.
 
 For path-scoped MCP tools, always pass an explicit target path. Do not rely on the MCP server process working directory.
 
@@ -199,7 +210,7 @@ Bootstrap:
 
 - `scripts/bootstrap_quickcontext.py` is the fastest intended first-run setup path
 - `scripts/setup_quickcontext.ps1` is the Windows wrapper around that bootstrap flow
-- the bootstrap defaults to the local profile, a debug Rust service build, JSON-backed runtime config, and HTTP-only local Qdrant for fewer first-run issues
+- the bootstrap defaults to the local profile, a debug Rust service build, and JSON-backed runtime config; it needs no Docker
 
 LSP setup:
 
@@ -210,6 +221,13 @@ LSP setup:
 - `scripts/setup_project_lsps.ps1` is the Windows PowerShell wrapper around that CLI command
 
 ## Validation And Benchmarking
+
+Retrieval quality on another repository:
+
+- `scripts/external_repo_benchmark.py --config <cfg> --project <name> --path <repo> --cases-file <cases.json>` reports file- and symbol-level Hit@1/MRR plus latency for the `auto`, `semantic`, and `text` routes; cases may list `expected_symbols`
+- `scripts/external_cases/stealth_browser_mcp.json` holds 36 cases for the public stealth-browser-mcp repository
+
+Rust index freshness: the text index, symbol index, and import graph re-check file signatures at most once per second (every check is recorded, so query bursts skip the repository walk); edits become visible within about one second. Text-search candidates reuse a per-file cache of lowercased content and structural role keyed by modification time and size.
 
 Validation commands:
 

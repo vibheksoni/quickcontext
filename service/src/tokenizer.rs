@@ -52,6 +52,12 @@ pub struct Tokenizer {
     preserved: HashSet<&'static str>,
 }
 
+impl Default for Tokenizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tokenizer {
     pub fn new() -> Self {
         Self {
@@ -79,7 +85,7 @@ impl Tokenizer {
                 continue;
             }
 
-            let parts = split_camel_case(&word);
+            let parts = split_camel_case(word);
             for part in parts {
                 if part.len() < 2 {
                     continue;
@@ -120,7 +126,7 @@ impl Tokenizer {
                 continue;
             }
 
-            let parts = split_camel_case(&word);
+            let parts = split_camel_case(word);
             for part in parts {
                 if part.len() < 2 {
                     continue;
@@ -144,25 +150,9 @@ impl Tokenizer {
     }
 }
 
-fn split_on_boundaries(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            current.push(ch);
-        } else {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        words.push(current);
-    }
-
-    words
+fn split_on_boundaries(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .filter(|word| !word.is_empty())
 }
 
 fn split_camel_case(input: &str) -> Vec<String> {
@@ -184,7 +174,7 @@ fn split_camel_case(input: &str) -> Vec<String> {
         return input
             .split('_')
             .filter(|s| !s.is_empty())
-            .flat_map(|s| split_camel_case(s))
+            .flat_map(split_camel_case)
             .collect();
     }
 
@@ -199,17 +189,10 @@ fn split_camel_case(input: &str) -> Vec<String> {
         let prev = chars[i - 1];
         let curr = chars[i];
 
-        let split = if prev.is_lowercase() && curr.is_uppercase() {
-            true
-        } else if prev.is_ascii_digit() && curr.is_alphabetic() {
-            true
-        } else if prev.is_alphabetic() && curr.is_ascii_digit() {
-            true
-        } else if i + 1 < len && prev.is_uppercase() && curr.is_uppercase() && chars[i + 1].is_lowercase() {
-            true
-        } else {
-            false
-        };
+        let split = (prev.is_lowercase() && curr.is_uppercase())
+            || (prev.is_ascii_digit() && curr.is_alphabetic())
+            || (prev.is_alphabetic() && curr.is_ascii_digit())
+            || (i + 1 < len && prev.is_uppercase() && curr.is_uppercase() && chars[i + 1].is_lowercase());
 
         if split {
             let part: String = chars[start..i].iter().collect();

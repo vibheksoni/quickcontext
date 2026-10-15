@@ -8,7 +8,7 @@
     "expected_helpers": ["_should_use_bundle_for_query", "semantic_search_bundle"]
   },
   {
-    "query": "How does QdrantIndexer._chunk_to_point build payload metadata before upsert?",
+    "query": "How does ChunkIndexer._chunk_to_point build payload metadata before upsert?",
     "expected_helpers": ["_build_path_context", "_build_path_prefixes"]
   },
   {

@@ -139,7 +139,11 @@ pub fn build_skeleton(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
 
-    let tree = build_tree(&root_name, &entries, options, 0);
+    let entry_refs: Vec<(&str, &FileEntry)> = entries
+        .iter()
+        .map(|entry| (entry.rel_path.as_str(), entry))
+        .collect();
+    let tree = build_tree(&root_name, &entry_refs, options, 0);
 
     let total_files = entries.len();
     let total_symbols: usize = entries.iter().map(|e| e.symbols.len()).sum();
@@ -241,74 +245,53 @@ fn clean_parent(parent: &Option<String>) -> Option<String> {
 
 fn build_tree(
     root_name: &str,
-    entries: &[FileEntry],
+    entries: &[(&str, &FileEntry)],
     options: &SkeletonOptions,
     depth: usize,
 ) -> SkeletonNode {
-    let mut dirs: BTreeMap<String, Vec<&FileEntry>> = BTreeMap::new();
-    let mut root_files: Vec<&FileEntry> = Vec::new();
+    let mut dirs: BTreeMap<&str, Vec<(&str, &FileEntry)>> = BTreeMap::new();
+    let mut root_files: Vec<(&str, &FileEntry)> = Vec::new();
 
-    for entry in entries {
-        if let Some(slash_pos) = entry.rel_path.find('/') {
-            let dir_name = &entry.rel_path[..slash_pos];
-            dirs.entry(dir_name.to_string()).or_default().push(entry);
+    for &(rel_path, entry) in entries {
+        if let Some((dir_name, rest)) = rel_path.split_once('/') {
+            dirs.entry(dir_name).or_default().push((rest, entry));
         } else {
-            root_files.push(entry);
+            root_files.push((rel_path, entry));
         }
     }
 
     let mut children: Vec<SkeletonNode> = Vec::new();
 
-    for (dir_name, dir_entries) in &dirs {
-        let sub_entries: Vec<FileEntry> = dir_entries
-            .iter()
-            .map(|e| {
-                let slash_pos = e.rel_path.find('/').unwrap();
-                FileEntry {
-                    rel_path: e.rel_path[slash_pos + 1..].to_string(),
-                    language: e.language.clone(),
-                    symbols: e.symbols.clone(),
-                }
-            })
-            .collect();
+    for (dir_name, sub_entries) in &dirs {
+        let file_count = sub_entries.len();
+        let symbol_count: usize = sub_entries.iter().map(|(_, e)| e.symbols.len()).sum();
 
-        let file_count = count_files_recursive(&sub_entries);
-        let symbol_count: usize = sub_entries.iter().map(|e| e.symbols.len()).sum();
-
-        if options.collapse_threshold > 0
+        let collapse = (options.collapse_threshold > 0
             && file_count <= options.collapse_threshold
-            && symbol_count == 0
-        {
+            && symbol_count == 0)
+            || depth + 1 >= options.max_depth;
+        if collapse {
             children.push(SkeletonNode::Collapsed {
-                name: dir_name.clone(),
+                name: dir_name.to_string(),
                 file_count,
                 symbol_count,
             });
             continue;
         }
 
-        if depth + 1 >= options.max_depth {
-            children.push(SkeletonNode::Collapsed {
-                name: dir_name.clone(),
-                file_count,
-                symbol_count,
-            });
-            continue;
-        }
-
-        children.push(build_tree(dir_name, &sub_entries, options, depth + 1));
+        children.push(build_tree(dir_name, sub_entries, options, depth + 1));
     }
 
-    for file in &root_files {
+    for (rel_path, file) in root_files {
         children.push(SkeletonNode::File {
-            name: file.rel_path.clone(),
+            name: rel_path.to_string(),
             language: file.language.clone(),
             symbols: file.symbols.clone(),
         });
     }
 
     let file_count = entries.len();
-    let symbol_count: usize = entries.iter().map(|e| e.symbols.len()).sum();
+    let symbol_count: usize = entries.iter().map(|(_, e)| e.symbols.len()).sum();
 
     SkeletonNode::Directory {
         name: root_name.to_string(),
@@ -316,11 +299,6 @@ fn build_tree(
         file_count,
         symbol_count,
     }
-}
-
-
-fn count_files_recursive(entries: &[FileEntry]) -> usize {
-    entries.len()
 }
 
 
@@ -491,20 +469,32 @@ fn clean_signature(sig: &str, kind: &str) -> String {
         .trim_end_matches(':')
         .trim_end();
 
-    match kind {
-        "function" | "method" => {
-            if cleaned.len() > 120 {
-                format!("{}...", &cleaned[..117])
-            } else {
-                cleaned.to_string()
-            }
+    let (max_len, keep) = match kind {
+        "function" | "method" => (120, 117),
+        _ => (100, 97),
+    };
+
+    if cleaned.len() > max_len {
+        let mut end = keep;
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
         }
-        _ => {
-            if cleaned.len() > 100 {
-                format!("{}...", &cleaned[..97])
-            } else {
-                cleaned.to_string()
-            }
-        }
+        format!("{}...", &cleaned[..end])
+    } else {
+        cleaned.to_string()
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::clean_signature;
+
+    #[test]
+    fn clean_signature_truncates_on_char_boundary() {
+        let sig = format!("def ff(x='{}'):", "\u{4e2d}".repeat(60));
+        let cleaned = clean_signature(&sig, "function");
+        assert!(cleaned.ends_with("..."));
+        assert!(cleaned.len() <= 120);
     }
 }

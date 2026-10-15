@@ -27,8 +27,8 @@ class ProjectInfo:
     path: str
     project_name: str
     indexed: bool
-    qdrant_enabled: bool
-    qdrant_available: bool
+    vector_store_enabled: bool
+    vector_store_available: bool
     parser_connected: bool
     cache_entries: int
     cache_disk_bytes: int

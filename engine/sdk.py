@@ -1,10 +1,13 @@
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+from functools import lru_cache
 import hashlib
+import math
+import os
 from pathlib import Path
 import re
 import time
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Any, Optional, TYPE_CHECKING
 
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
@@ -33,13 +36,13 @@ if TYPE_CHECKING:
     from engine.src.collection import CollectionManager
     from engine.src.describer import ChunkDescription, DescriptionGenerator
     from engine.src.embedder import DualEmbedder, EmbeddedChunk
-    from engine.src.indexer import IndexStats, IndexedFileState, QdrantIndexer
+    from engine.src.indexer import ChunkIndexer, IndexStats, IndexedFileState
     from engine.src.index_resume import ResumeFile, ResumeState
     from engine.src.providers import EmbeddingProvider
-    from engine.src.qdrant import QdrantConnection
     from engine.src.searcher import CodeSearcher, SearchResult
     from engine.src.watcher import FileWatcher
     from engine.src.reranker import ColBERTReranker
+    from engine.src.vector_store import VectorStore
 
 from engine.src.parsing import (
     CallGraphTraceResult,
@@ -202,6 +205,71 @@ _LSP_LANGUAGE_ALIASES = {
 }
 
 
+_FOCUS_SKIPPED_KINDS = {
+    "import",
+    "variable",
+    "constant",
+    "field",
+    "property",
+    "data_key",
+    "enum_member",
+    "comment",
+}
+_FOCUS_CONTAINER_KINDS = {"class", "struct", "interface", "trait", "impl", "module", "namespace", "enum"}
+_FOCUS_TERM_PREFIX = 6
+_TEXT_SEMANTIC_FUSION_WEIGHT = 2.0
+_FOCUS_BM25_K1 = 1.2
+_FOCUS_BM25_B = 0.75
+
+
+_TOKEN_ALIASES = {
+    "desc": ("description",),
+    "cfg": ("config", "configuration"),
+    "req": ("request",),
+    "resp": ("response",),
+    "rrf": ("fuse", "fusion", "merge"),
+}
+_FOCUS_CONTAINER_BODY_LINES = 60
+
+
+@lru_cache(maxsize=65536)
+def _identifier_tokens(raw: str) -> frozenset[str]:
+    """
+    Lowercased ranking tokens for one identifier: the whole identifier plus its
+    snake_case and camelCase parts (min 3 chars, stopwords dropped, with aliases).
+    Cached because identifiers repeat heavily across source text.
+    """
+    tokens: set[str] = set()
+
+    def add_token(value: str) -> None:
+        lowered_value = value.lower()
+        if len(lowered_value) < 3 or lowered_value in STOP_WORDS:
+            return
+        tokens.add(lowered_value)
+        tokens.update(_TOKEN_ALIASES.get(lowered_value, ()))
+
+    add_token(raw)
+    for part in _UNDERSCORE_SPLIT_PATTERN.split(raw.strip("_")):
+        if part:
+            add_token(part)
+    for part in _CAMEL_BOUNDARY_PATTERN.sub(r"\1 \2", raw.replace("_", " ")).split():
+        add_token(part)
+    return frozenset(tokens)
+
+
+@lru_cache(maxsize=65536)
+def _identifier_focus_terms(raw: str) -> tuple[str, ...]:
+    return tuple({token[:_FOCUS_TERM_PREFIX] for token in _identifier_tokens(raw)})
+
+
+def _focus_term(token: str) -> str:
+    """
+    Cheap stemming for symbol focusing: compare the first few characters so
+    "deleted"/"delete" or "directories"/"directory" match.
+    """
+    return token[:_FOCUS_TERM_PREFIX]
+
+
 def _human_readable_bytes(num_bytes: int) -> str:
     value = float(num_bytes)
     units = ("B", "KB", "MB", "GB")
@@ -215,11 +283,11 @@ def _human_readable_bytes(num_bytes: int) -> str:
 class QuickContext:
     """
     Main SDK entry point. All subsystems are lazy and optional.
-    Qdrant, embeddings, and LLM are only initialized when actually used.
+    The vector store, embeddings, and LLM are only initialized when actually used.
     Rust parser service works independently of all other subsystems.
 
     _config: EngineConfig — Full engine configuration.
-    _conn: QdrantConnection | None — Qdrant connection manager (lazy, None if qdrant disabled).
+    _store: VectorStore | None — Embedded SQLite vector store (lazy, None until first use).
     _collections: dict[str, CollectionManager] — Per-project collection managers.
     _code_provider: EmbeddingProvider | None — Code embedding provider (lazy).
     _desc_provider: EmbeddingProvider | None — Description embedding provider (lazy).
@@ -227,7 +295,7 @@ class QuickContext:
     _chunker: ChunkBuilder | None — Chunk builder for symbol-to-chunk conversion (lazy).
     _describer: DescriptionGenerator | None — LLM-based description generator (lazy).
     _embedder: DualEmbedder | None — Dual embedding generator (lazy).
-    _indexers: dict[str, QdrantIndexer] — Per-project Qdrant indexers.
+    _indexers: dict[str, ChunkIndexer] — Per-project chunk indexers.
     _searchers: dict[str, CodeSearcher] — Per-project semantic searchers.
     _reranker: ColBERTReranker | None — ColBERT reranker for post-retrieval reranking (lazy).
     """
@@ -237,7 +305,10 @@ class QuickContext:
         config: EngineConfig | None — Engine config. Defaults to EngineConfig() if None.
         """
         self._config = config or EngineConfig()
-        self._conn: "QdrantConnection | None" = None
+        self._store: "VectorStore | None" = None
+        self._store_lock = Lock()
+        self._init_lock = RLock()
+        self._documents = None
         self._collections: dict = {}
         self._code_provider: "EmbeddingProvider | None" = None
         self._desc_provider: "EmbeddingProvider | None" = None
@@ -250,6 +321,11 @@ class QuickContext:
         self._file_caches: dict[str, FileSignatureCache] = {}
         self._symbol_file_compact_cache: dict[str, tuple[int, int, list]] = {}
         self._symbol_file_extract_cache: dict[str, tuple[int, int, list]] = {}
+        self._symbol_focus_cache: dict[tuple[str, str, int, int], tuple] = {}
+        self._vector_ready_cache: dict[str, tuple[float, bool]] = {}
+        self._directory_listing_cache: dict[str, tuple[int, list[tuple[str, bool, bool]]]] = {}
+        self._symbol_focus_index_cache: dict[int, tuple[list, tuple]] = {}
+        self._background_warm_inputs: set[str] = set()
         self._lsp_ready_language_cache: dict[str, set[str]] = {}
         self._reranker: "ColBERTReranker | None" = None
         self._activity_lock = Lock()
@@ -269,32 +345,55 @@ class QuickContext:
         return self._config
 
     @property
-    def connection(self) -> "QdrantConnection":
+    def store(self) -> "VectorStore":
         """
-        Returns: QdrantConnection — Qdrant connection manager (lazy-created).
-        Raises: RuntimeError — If Qdrant is disabled in config.
+        Returns: VectorStore — Embedded vector store (opened on first access).
+        Raises: RuntimeError — If the store is disabled in config.
         """
-        if self._config.qdrant is None:
+        if self._config.store is None:
             raise RuntimeError(
-                "Qdrant is disabled (config.qdrant is None). "
+                "The vector store is disabled (config.store is None). "
                 "Enable it in your config to use vector search features."
             )
-        if self._conn is None:
-            from engine.src.qdrant import QdrantConnection
-            self._conn = QdrantConnection(self._config.qdrant)
-        return self._conn
+        if self._store is None:
+            with self._store_lock:
+                if self._store is None:
+                    from engine.src.vector_store import VectorStore
+                    self._store = VectorStore(self._config.store).open()
+        return self._store
 
     def connect(self, verify: bool = False) -> "QuickContext":
         """
-        Connect to Qdrant server. No-op if Qdrant is disabled.
+        Open the vector store. No-op if the store is disabled.
 
+        verify: bool — Also run a trivial query to prove the database is usable.
         Returns: QuickContext — Self for chaining.
-        Raises: ConnectionError — If Qdrant is unreachable.
+        Raises: ConnectionError — If the database cannot be opened.
         """
-        if self._config.qdrant is None:
+        if self._config.store is None:
             return self
-        self.connection.connect(verify=verify)
+        try:
+            store = self.store
+            if verify and not store.ping():
+                raise ConnectionError(f"Vector store at {store.path} is not usable")
+        except ConnectionError:
+            raise
+        except Exception as exc:
+            raise ConnectionError(f"Failed to open vector store at {self._config.store.resolved_path}: {exc}") from exc
         return self
+
+    @property
+    def documents(self):
+        """
+        Returns: DocumentStore — Agent-facing document collections (collect / recall / forget).
+        """
+        if self._documents is None:
+            with self._init_lock:
+                if self._documents is None:
+                    from engine.src.documents import DocumentStore
+
+                    self._documents = DocumentStore(self)
+        return self._documents
 
     @contextmanager
     def _activity_scope(self):
@@ -316,9 +415,14 @@ class QuickContext:
         """
         Start a best-effort background warm after the session goes idle.
         """
+        path_text = str(path)
+        with self._activity_lock:
+            if self._background_warm_started and path_text in self._background_warm_inputs:
+                return False
         resolved_path = str(Path(path).resolve())
         with self._activity_lock:
             if self._background_warm_started and self._background_warm_path == resolved_path:
+                self._background_warm_inputs.add(path_text)
                 return False
             if self._background_warm_thread is not None and self._background_warm_thread.is_alive():
                 return False
@@ -367,43 +471,42 @@ class QuickContext:
         """
         return Path(path).resolve() if path is not None else Path.cwd().resolve()
 
-    def _get_collection(self, project_name: str) -> "CollectionManager":
+    def _get_collection(self, project_name: str, create: bool = True) -> "CollectionManager":
         """
-        Get or create CollectionManager for a project.
+        Get the CollectionManager for a project.
 
-        project_name: str — Project name (used as collection name).
+        project_name: str — Project name (used as the collection alias).
+        create: bool — Create the project's first collection when missing.
         Returns: CollectionManager — Collection manager for the project.
-        Raises: RuntimeError — If Qdrant is disabled.
+        Raises: RuntimeError — If the vector store is disabled.
         """
-        if project_name not in self._collections:
+        manager = self._collections.get(project_name)
+        if manager is None:
             from engine.src.collection import CollectionManager
-            conn = self.connection
-            client = conn.client
-
-            self._collections[project_name] = CollectionManager(
-                client=client,
+            manager = CollectionManager(
+                store=self.store,
                 config=self._config,
                 collection_name=project_name,
             )
-            self._collections[project_name].ensure()
+            self._collections[project_name] = manager
+        if create:
+            manager.ensure()
+        return manager
 
-        return self._collections[project_name]
-
-    def _get_indexer(self, project_name: str) -> "QdrantIndexer":
+    def _get_indexer(self, project_name: str) -> "ChunkIndexer":
         """
-        Get or create QdrantIndexer for a project.
+        Get or create the ChunkIndexer for a project.
 
         project_name: str — Project name.
-        Returns: QdrantIndexer — Indexer for the project.
+        Returns: ChunkIndexer — Indexer writing through the project alias.
         """
         if project_name not in self._indexers:
-            from engine.src.indexer import QdrantIndexer
-            collection = self._get_collection(project_name)
-            self._indexers[project_name] = QdrantIndexer(
-                client=collection.client,
+            from engine.src.indexer import ChunkIndexer
+            self._get_collection(project_name)
+            self._indexers[project_name] = ChunkIndexer(
+                store=self.store,
                 collection_name=project_name,
-                batch_size=self._config.qdrant.upsert_batch_size,
-                upsert_concurrency=self._config.qdrant.upsert_concurrency,
+                batch_size=self._config.store.upsert_batch_size,
             )
 
         return self._indexers[project_name]
@@ -415,8 +518,10 @@ class QuickContext:
         Returns: ColBERTReranker — Initialized reranker instance.
         """
         if self._reranker is None:
-            from engine.src.reranker import ColBERTReranker
-            self._reranker = ColBERTReranker()
+            with self._init_lock:
+                if self._reranker is None:
+                    from engine.src.reranker import ColBERTReranker
+                    self._reranker = ColBERTReranker()
         return self._reranker
 
     def _get_searcher(self, project_name: str, rerank: bool = False) -> "CodeSearcher":
@@ -430,20 +535,21 @@ class QuickContext:
         reranker = self._get_reranker() if rerank else None
         cache_key = f"{project_name}:rerank={rerank}"
 
-        if cache_key not in self._searchers:
-            if self._config.qdrant is None:
-                raise RuntimeError("Qdrant is disabled (config.qdrant is None).")
-            from engine.src.qdrant_search import RestQdrantSearchClient
-            from engine.src.searcher import CodeSearcher
-            self._searchers[cache_key] = CodeSearcher(
-                client=RestQdrantSearchClient(self._config.qdrant),
-                collection_name=project_name,
-                code_provider=self.code_provider,
-                desc_provider=self.desc_provider,
-                reranker=reranker,
-            )
-
-        return self._searchers[cache_key]
+        searcher = self._searchers.get(cache_key)
+        if searcher is None:
+            with self._init_lock:
+                searcher = self._searchers.get(cache_key)
+                if searcher is None:
+                    from engine.src.searcher import CodeSearcher
+                    searcher = CodeSearcher(
+                        store=self.store,
+                        collection_name=project_name,
+                        code_provider=self.code_provider,
+                        desc_provider=self.desc_provider,
+                        reranker=reranker,
+                    )
+                    self._searchers[cache_key] = searcher
+        return searcher
 
     def _get_file_cache(self, directory: str | Path) -> FileSignatureCache:
         """
@@ -462,12 +568,12 @@ class QuickContext:
         """
         Returns: CollectionManager — Collection manager (deprecated, use project-specific access).
         Raises: ValueError — If no project specified.
-        Raises: RuntimeError — If Qdrant is disabled.
+        Raises: RuntimeError — If the vector store is disabled.
         """
-        if self._config.qdrant is None:
-            raise RuntimeError("Qdrant is disabled (config.qdrant is None).")
-        if self._config.qdrant.collection:
-            return self._get_collection(self._config.qdrant.collection)
+        if self._config.store is None:
+            raise RuntimeError("The vector store is disabled (config.store is None).")
+        if self._config.store.collection:
+            return self._get_collection(self._config.store.collection)
 
         raise ValueError(
             "No default collection configured. Use project-based indexing instead."
@@ -485,8 +591,10 @@ class QuickContext:
                 "Enable it in your config to use embedding features."
             )
         if self._code_provider is None:
-            from engine.src.providers import create_provider
-            self._code_provider = create_provider(self._config.code_embedding)
+            with self._init_lock:
+                if self._code_provider is None:
+                    from engine.src.providers import create_provider
+                    self._code_provider = create_provider(self._config.code_embedding)
         return self._code_provider
 
     @property
@@ -501,8 +609,10 @@ class QuickContext:
                 "Enable it in your config to use embedding features."
             )
         if self._desc_provider is None:
-            from engine.src.providers import create_provider
-            self._desc_provider = create_provider(self._config.desc_embedding)
+            with self._init_lock:
+                if self._desc_provider is None:
+                    from engine.src.providers import create_provider
+                    self._desc_provider = create_provider(self._config.desc_embedding)
         return self._desc_provider
 
     @property
@@ -511,7 +621,9 @@ class QuickContext:
         Returns: RustParserService — Lazy-initialized Rust pipe parser wrapper.
         """
         if self._parser_service is None:
-            self._parser_service = RustParserService(config=self._config)
+            with self._init_lock:
+                if self._parser_service is None:
+                    self._parser_service = RustParserService(config=self._config)
         return self._parser_service
 
     @property
@@ -595,6 +707,11 @@ class QuickContext:
                 desc_request_timeout_seconds=desc_cfg.request_timeout_seconds,
                 code_openrouter_provider=code_cfg.openrouter_provider,
                 desc_openrouter_provider=desc_cfg.openrouter_provider,
+                code_contextual_header=code_cfg.contextual_header,
+                code_device=code_cfg.device,
+                desc_device=desc_cfg.device,
+                code_max_input_tokens=code_cfg.max_input_tokens,
+                desc_max_input_tokens=desc_cfg.max_input_tokens,
             )
         return self._embedder
 
@@ -1773,7 +1890,7 @@ class QuickContext:
                 except Exception:
                     text_result = None
                 if text_result and self._should_use_text_primary_for_query(query, text_result):
-                    return self._text_primary_payload(
+                    payload = self._text_primary_payload(
                         query=query,
                         project_name=project,
                         text_result=text_result,
@@ -1781,6 +1898,33 @@ class QuickContext:
                         related_file_limit=related_file_limit,
                         path=retrieval_root,
                     )
+                    if self._project_vector_index_ready(project):
+                        try:
+                            semantic_results = self.semantic_search(
+                                query=query,
+                                mode=mode,
+                                limit=max(limit * 2, 8),
+                                language=language,
+                                path_prefix=path_prefix,
+                                project_name=project,
+                                use_keywords=use_keywords,
+                                keyword_weight=keyword_weight,
+                                rerank=rerank,
+                                include_source=False,
+                                path=retrieval_root,
+                            )
+                        except Exception:
+                            semantic_results = []
+                        if semantic_results:
+                            payload["results"] = self._hydrate_search_result_sources(
+                                self._fuse_ranked_results(
+                                    [payload["results"], semantic_results],
+                                    limit,
+                                    weights=[1.0, _TEXT_SEMANTIC_FUSION_WEIGHT],
+                                )
+                            )
+                            payload["mode"] = "text_semantic"
+                    return payload
             else:
                 text_result = None
 
@@ -2012,8 +2156,10 @@ class QuickContext:
         Returns: str — Human-readable instructions based on current index status.
         """
         project = project_name if project_name else detect_project_name(Path.cwd(), manual_override=None)
-        collection = self._get_collection(project)
-        info = collection.info()
+        try:
+            info = self._get_collection(project, create=False).info()
+        except KeyError:
+            info = {}
         points = int(info.get("points_count", 0))
 
         lines = [
@@ -2074,6 +2220,7 @@ class QuickContext:
         )
         primary_results = self._text_matches_to_search_results(primary_matches)
         primary_results = self._focus_generated_file_match_results(query, primary_results, path=path)
+        primary_results = self._focus_file_matches_on_symbols(query, primary_results)
         import_related = self._text_import_related_files_for_results(
             query=query,
             results=primary_results,
@@ -2106,6 +2253,203 @@ class QuickContext:
             ),
             "related_callers": [],
         }
+
+    def _project_vector_index_ready(self, project_name: str) -> bool:
+        """
+        Cheap, cached check that a project has a non-empty vector index and the
+        embedding providers needed to query it.
+        """
+        if self._config.store is None or self._config.code_embedding is None or self._config.desc_embedding is None:
+            return False
+        now = time.monotonic()
+        cached = self._vector_ready_cache.get(project_name)
+        if cached is not None and now - cached[0] < 30.0:
+            return cached[1]
+        try:
+            ready = bool(self.store.scroll(project_name, limit=1, with_payload=False))
+        except Exception:
+            ready = False
+        self._vector_ready_cache[project_name] = (now, ready)
+        return ready
+
+    def _fuse_ranked_results(
+        self,
+        ranked_lists: list[list],
+        limit: int,
+        weights: Optional[list[float]] = None,
+        k: int = 60,
+    ) -> list:
+        """
+        Reciprocal rank fusion of SearchResult lists at file granularity.
+
+        Each list votes for files by the rank at which a file first appears, so a
+        retriever that returns many chunks of one file cannot outvote another
+        retriever's single precise hit. Each fused file is represented by its
+        first row in the earliest list that contains it (the focused text symbol
+        when lexical search found the file).
+        """
+        scores: dict[str, float] = {}
+        representatives: dict[str, object] = {}
+        for list_index, ranked in enumerate(ranked_lists):
+            weight = weights[list_index] if weights and list_index < len(weights) else 1.0
+            file_rank = 0
+            seen: set[str] = set()
+            for item in ranked:
+                file_key = self._normalize_symbol_file_path(str(getattr(item, "file_path", ""))).replace("\\", "/").lower()
+                if file_key in seen:
+                    continue
+                seen.add(file_key)
+                scores[file_key] = scores.get(file_key, 0.0) + weight / (k + file_rank + 1)
+                representatives.setdefault(file_key, item)
+                file_rank += 1
+        ordered = sorted(scores, key=lambda key: scores[key], reverse=True)
+        return [replace(representatives[key], score=scores[key]) for key in ordered[:max(1, limit)]]
+
+    def _focus_file_matches_on_symbols(self, query: str, results: list) -> list:
+        """
+        Replace whole-file text matches with the symbol inside each file that best
+        answers the query.
+
+        Rust text search ranks files well but returns a snippet around the first
+        term hit. Each file's symbols (cached Rust extraction) are scored with a
+        small BM25 over the query terms, weighting the symbol name above its
+        signature and docstring above its body, so agents get the function that
+        answers the question instead of the top of the file. No embedding call is
+        made, keeping this path fast with remote embedding providers.
+        """
+        terms = {_focus_term(token) for token in self._split_symbol_text_tokens(query)}
+        if not terms:
+            return results
+
+        focused: list = []
+        for item in results:
+            if str(getattr(item, "symbol_kind", "")) != "file_match":
+                focused.append(item)
+                continue
+            try:
+                symbols = self._load_file_symbols(str(item.file_path))
+            except Exception:
+                symbols = []
+            best = self._best_symbol_for_terms(terms, symbols)
+            focused.append(self._symbol_to_search_result(best, score=float(item.score)) if best is not None else item)
+        return focused
+
+    def _symbol_focus_profile(self, symbol: object) -> tuple[set[str], set[str], dict[str, int], int]:
+        """
+        Token profile of a symbol for focusing: (name terms, signature/docstring terms,
+        body term frequencies, body length).
+        """
+        cache_key = (
+            str(getattr(symbol, "file_path", "")),
+            str(getattr(symbol, "name", "")),
+            int(getattr(symbol, "byte_start", 0)),
+            int(getattr(symbol, "byte_end", 0)),
+        )
+        cached = self._symbol_focus_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        name_terms = {_focus_term(token) for token in self._split_symbol_text_tokens(str(getattr(symbol, "name", "")))}
+        header = " ".join(str(getattr(symbol, key, None) or "") for key in ("signature", "docstring"))
+        header_terms = {_focus_term(token) for token in self._split_symbol_text_tokens(header)}
+        source = str(getattr(symbol, "source", "") or "")
+        if str(getattr(symbol, "kind", "")).lower() in _FOCUS_CONTAINER_KINDS:
+            source = "\n".join(source.splitlines()[:_FOCUS_CONTAINER_BODY_LINES])
+        body_counts: dict[str, int] = {}
+        body_length = 0
+        for raw in _IDENTIFIER_PATTERN.findall(source):
+            for term in _identifier_focus_terms(raw):
+                body_counts[term] = body_counts.get(term, 0) + 1
+                body_length += 1
+        profile = (name_terms, header_terms, body_counts, body_length)
+        if len(self._symbol_focus_cache) > 50000:
+            self._symbol_focus_cache.clear()
+        self._symbol_focus_cache[cache_key] = profile
+        return profile
+
+    def _symbol_focus_index(self, symbols: list) -> tuple:
+        """
+        Per-file focusing index, built once per extracted symbol list:
+        (candidates, profiles, average body length, term -> candidate indexes).
+        """
+        cached = self._symbol_focus_index_cache.get(id(symbols))
+        if cached is not None and cached[0] is symbols:
+            return cached[1]
+        candidates = [
+            symbol for symbol in symbols
+            if str(getattr(symbol, "kind", "")).lower() not in _FOCUS_SKIPPED_KINDS
+        ]
+        profiles = [self._symbol_focus_profile(symbol) for symbol in candidates]
+        average_length = max(1.0, sum(profile[3] for profile in profiles) / max(1, len(candidates)))
+        postings: dict[str, list[int]] = {}
+        for idx, (name_terms, header_terms, body_counts, _) in enumerate(profiles):
+            for term in name_terms | header_terms | body_counts.keys():
+                postings.setdefault(term, []).append(idx)
+        built = (candidates, profiles, average_length, postings)
+        if len(self._symbol_focus_index_cache) > 2048:
+            self._symbol_focus_index_cache.clear()
+        self._symbol_focus_index_cache[id(symbols)] = (symbols, built)
+        return built
+
+    def _best_symbol_for_terms(self, terms: set[str], symbols: list) -> object | None:
+        """
+        Pick the symbol in one file that best matches the query terms, or None.
+
+        Only symbols sharing at least one query term can score above zero, so the
+        inverted index limits scoring to those.
+        """
+        candidates, profiles, average_length, postings = self._symbol_focus_index(symbols)
+        if not candidates:
+            return None
+        count = len(candidates)
+        document_frequency = {term: len(postings.get(term, ())) for term in terms}
+        relevant = sorted({idx for term in terms for idx in postings.get(term, ())})
+
+        best_symbol = None
+        best_score = 0.0
+        for idx in relevant:
+            symbol = candidates[idx]
+            name_terms, header_terms, body_counts, body_length = profiles[idx]
+            container = str(getattr(symbol, "kind", "")).lower() in _FOCUS_CONTAINER_KINDS
+            norm = _FOCUS_BM25_K1 * (1 - _FOCUS_BM25_B + _FOCUS_BM25_B * body_length / average_length)
+            score = 0.0
+            for term in terms:
+                df = document_frequency[term]
+                if df == 0:
+                    continue
+                idf = math.log(1.0 + (count - df + 0.5) / (df + 0.5))
+                tf = body_counts.get(term, 0)
+                body = tf * (_FOCUS_BM25_K1 + 1) / (tf + norm) if tf else 0.0
+                weight = 3.0 * (term in name_terms) + 1.5 * (term in header_terms) + body * (0.25 if container else 1.0)
+                score += idf * weight
+            if score > best_score:
+                best_score = score
+                best_symbol = symbol
+        return best_symbol
+
+    def _symbol_to_search_result(self, symbol: object, score: float):
+        """
+        Build a SearchResult row from an extracted symbol (source already in hand).
+        """
+        from engine.src.searcher import SearchResult
+
+        file_path = self._normalize_symbol_file_path(str(getattr(symbol, "file_path", "")))
+        signature = getattr(symbol, "signature", None)
+        docstring = getattr(symbol, "docstring", None)
+        return SearchResult(
+            score=score,
+            file_path=file_path,
+            symbol_name=str(getattr(symbol, "name", "")),
+            symbol_kind=str(getattr(symbol, "kind", "")),
+            line_start=int(getattr(symbol, "line_start", 0)),
+            line_end=int(getattr(symbol, "line_end", 0)),
+            source=str(getattr(symbol, "source", "") or ""),
+            description=self._build_symbol_description(symbol, docstring, signature),
+            signature=signature,
+            docstring=docstring,
+            parent=getattr(symbol, "parent", None),
+            language=getattr(symbol, "language", None),
+            path_context=self._build_symbol_path_context(file_path),
+        )
 
     def _focus_generated_file_match_results(
         self,
@@ -2290,49 +2634,58 @@ class QuickContext:
             item.pop("_priority", None)
         return related[:related_file_limit]
 
+    def _scan_directory_cached(self, directory: str) -> list[tuple[str, bool, bool]]:
+        """
+        List a directory as (path, is_file, is_dir) tuples, cached until the
+        directory's own modification time changes (entries added or removed).
+        """
+        try:
+            mtime = os.stat(directory).st_mtime_ns
+        except OSError:
+            return []
+        cached = self._directory_listing_cache.get(directory)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        try:
+            with os.scandir(directory) as iterator:
+                entries = [(entry.path, entry.is_file(), entry.is_dir()) for entry in iterator]
+        except OSError:
+            return []
+        if len(self._directory_listing_cache) > 4096:
+            self._directory_listing_cache.clear()
+        self._directory_listing_cache[directory] = (mtime, entries)
+        return entries
+
     def _iter_module_local_candidate_paths(self, seed_path: Path) -> list[tuple[Path, int]]:
         """
         Yield nearby candidate files from the seed directory, its immediate children, and its parent directory.
         """
         candidates: list[tuple[Path, int]] = []
-        seen: set[Path] = set()
-        resolved_seed = seed_path.resolve()
+        seed_key = os.path.normcase(os.path.abspath(str(seed_path)))
+        seen: set[str] = {seed_key}
+
+        def consider(path_text: str, distance: int) -> None:
+            key = os.path.normcase(path_text)
+            if key in seen:
+                return
+            candidate = Path(path_text)
+            if not self._is_supported_module_local_candidate(candidate, seed_path):
+                return
+            seen.add(key)
+            candidates.append((candidate, distance))
 
         def add_directory(directory: Path, distance: int, include_children: bool = False) -> None:
-            if not directory.exists() or not directory.is_dir():
-                return
-            try:
-                entries = list(directory.iterdir())
-            except OSError:
-                return
-            for entry in entries:
-                if entry.is_file():
-                    resolved = entry.resolve()
-                    if resolved == resolved_seed or resolved in seen:
-                        continue
-                    if not self._is_supported_module_local_candidate(entry, seed_path):
-                        continue
-                    seen.add(resolved)
-                    candidates.append((resolved, distance))
-                elif include_children and entry.is_dir():
-                    try:
-                        child_entries = list(entry.iterdir())
-                    except OSError:
-                        continue
-                    for child in child_entries:
-                        if not child.is_file():
-                            continue
-                        resolved = child.resolve()
-                        if resolved == resolved_seed or resolved in seen:
-                            continue
-                        if not self._is_supported_module_local_candidate(child, seed_path):
-                            continue
-                        seen.add(resolved)
-                        candidates.append((resolved, distance + 1))
+            for path_text, is_file, is_dir in self._scan_directory_cached(str(directory)):
+                if is_file:
+                    consider(path_text, distance)
+                elif include_children and is_dir:
+                    for child_text, child_is_file, _ in self._scan_directory_cached(path_text):
+                        if child_is_file:
+                            consider(child_text, distance + 1)
 
-        add_directory(seed_path.parent, 1, include_children=True)
-        parent_directory = seed_path.parent.parent
-        if parent_directory != seed_path.parent:
+        add_directory(Path(seed_key).parent, 1, include_children=True)
+        parent_directory = Path(seed_key).parent.parent
+        if parent_directory != Path(seed_key).parent:
             add_directory(parent_directory, 2, include_children=False)
         return candidates
 
@@ -3492,32 +3845,8 @@ class QuickContext:
 
     def _split_symbol_text_tokens(self, text: str) -> set[str]:
         tokens: set[str] = set()
-
-        def add_token(value: str) -> None:
-            lowered_value = value.lower()
-            if len(lowered_value) < 3 or lowered_value in STOP_WORDS:
-                return
-            tokens.add(lowered_value)
-            aliases = {
-                "desc": ("description",),
-                "cfg": ("config", "configuration"),
-                "req": ("request",),
-                "resp": ("response",),
-                "rrf": ("fuse", "fusion", "merge"),
-            }
-            for alias in aliases.get(lowered_value, ()):
-                tokens.add(alias)
-
         for raw in _IDENTIFIER_PATTERN.findall(text):
-            add_token(raw)
-
-            underscore_parts = [part for part in _UNDERSCORE_SPLIT_PATTERN.split(raw.strip("_")) if part]
-            for part in underscore_parts:
-                add_token(part)
-
-            camel_text = _CAMEL_BOUNDARY_PATTERN.sub(r"\1 \2", raw.replace("_", " "))
-            for part in camel_text.split():
-                add_token(part)
+            tokens.update(_identifier_tokens(raw))
         return tokens
 
     def _merge_symbol_context_results(
@@ -3915,9 +4244,8 @@ class QuickContext:
         normalized_path = self._normalize_symbol_file_path(file_path)
         path = Path(normalized_path)
         try:
-            resolved = str(path.resolve())
             stat = path.stat()
-            cache_key = resolved
+            cache_key = os.path.normcase(os.path.abspath(normalized_path))
             cached = self._symbol_file_compact_cache.get(cache_key)
             if cached and cached[0] == int(stat.st_mtime_ns) and cached[1] == int(stat.st_size):
                 return cached[2]
@@ -3947,9 +4275,8 @@ class QuickContext:
         normalized_path = self._normalize_symbol_file_path(file_path)
         path = Path(normalized_path)
         try:
-            resolved = str(path.resolve())
             stat = path.stat()
-            cache_key = resolved
+            cache_key = os.path.normcase(os.path.abspath(normalized_path))
             cached = self._symbol_file_extract_cache.get(cache_key)
             if cached and cached[0] == int(stat.st_mtime_ns) and cached[1] == int(stat.st_size):
                 return cached[2]
@@ -4391,6 +4718,122 @@ class QuickContext:
 
         return completed, pending
 
+    def _describe_and_embed(
+        self,
+        *,
+        dedup_result: DeduplicationResult,
+        all_chunks: list[CodeChunk],
+        generate_descriptions: bool,
+        compress_for_embedding: Optional[str],
+        show_progress: bool,
+        embedding_concurrency: Optional[int],
+        embedding_max_retries: Optional[int],
+        embedding_batch_size: Optional[int],
+        embedding_adaptive_batching: Optional[bool],
+        progress_reporter: OperationProgressReporter | None,
+    ) -> tuple[list["EmbeddedChunk"], float, float, float, Any]:
+        """
+        Shared indexing stage: optional compression, descriptions (LLM or fallback),
+        and dual embeddings for the unique chunks, expanded back to all chunks.
+
+        Returns: (embedded_chunks, llm_cost, embedding_cost, description_seconds, embed_stats)
+        """
+        if compress_for_embedding:
+            for idx, chunk in enumerate(dedup_result.unique_chunks):
+                compressed_source, _ = compress_source(chunk.source, level=compress_for_embedding, language=chunk.language)
+                if compressed_source and compressed_source != chunk.source:
+                    dedup_result.unique_chunks[idx] = replace(chunk, source=compressed_source)
+
+        if show_progress and dedup_result.duplicate_count > 0:
+            print(
+                f"Deduplicated: {dedup_result.total_chunks} chunks -> "
+                f"{dedup_result.unique_count} unique, "
+                f"{dedup_result.duplicate_count} duplicates skipped"
+            )
+
+        if generate_descriptions:
+            if show_progress:
+                print(f"Generating descriptions for {dedup_result.unique_count} unique chunks...")
+
+            if progress_reporter is not None:
+                progress_reporter.set_stage("describe", "Generating descriptions")
+            description_started = time.time()
+            unique_descriptions = self.describer.generate_batch(
+                dedup_result.unique_chunks,
+                progress_callback=(
+                    (lambda completed, total: progress_reporter.update(
+                        description_chunks_completed=completed,
+                        message=f"Generated descriptions for {completed}/{total} chunks",
+                    ))
+                    if progress_reporter is not None else None
+                ),
+            )
+            descriptions = expand_descriptions(unique_descriptions, dedup_result)
+            llm_cost = sum(d.cost_usd for d in unique_descriptions)
+            description_stage_duration_seconds = time.time() - description_started
+
+            if show_progress:
+                total_tokens = sum(d.token_count for d in unique_descriptions)
+                print(f"Generated descriptions ({total_tokens} tokens, ${llm_cost:.4f})")
+        else:
+            from engine.src.describer import build_fallback_descriptions
+
+            if progress_reporter is not None:
+                progress_reporter.set_stage("describe", "Building fallback descriptions")
+            description_started = time.time()
+            unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
+            unique_descriptions = self._maybe_generate_lightweight_artifact_metadata(
+                dedup_result.unique_chunks,
+                unique_descriptions,
+                progress_callback=(
+                    (lambda completed, total: progress_reporter.update(
+                        description_chunks_completed=completed,
+                        message=f"Generated lightweight metadata for {completed}/{total} artifact chunks",
+                    ))
+                    if progress_reporter is not None else None
+                ),
+            )
+            descriptions = expand_descriptions(unique_descriptions, dedup_result)
+            llm_cost = sum(item.cost_usd for item in unique_descriptions)
+            description_stage_duration_seconds = time.time() - description_started
+            if progress_reporter is not None:
+                progress_reporter.update(
+                    description_chunks_completed=dedup_result.unique_count,
+                    message=f"Built fallback descriptions for {dedup_result.unique_count} chunks",
+                )
+            if show_progress:
+                print("Skipping description generation (fast/no-descriptions mode)")
+
+        if show_progress:
+            print("Generating embeddings...")
+
+        if progress_reporter is not None:
+            progress_reporter.set_stage("embed", "Generating embeddings")
+        unique_embedded, embedding_cost = self.embedder.embed_batch(
+            dedup_result.unique_chunks,
+            unique_descriptions,
+            concurrency_override=embedding_concurrency,
+            max_retries_override=embedding_max_retries,
+            batch_size_override=embedding_batch_size,
+            adaptive_batching_override=embedding_adaptive_batching,
+            progress_callback=(
+                (lambda completed, total: progress_reporter.update(
+                    embedding_chunks_completed=completed,
+                    message=f"Embedded {completed}/{total} chunks",
+                ))
+                if progress_reporter is not None else None
+            ),
+        )
+        embed_stats = self.embedder.last_run_stats
+        embedded_chunks = expand_embeddings(unique_embedded, all_chunks, descriptions, dedup_result)
+        return (
+            embedded_chunks,
+            llm_cost,
+            embedding_cost,
+            description_stage_duration_seconds,
+            embed_stats,
+        )
+
     def _merge_index_stats(self, left: "IndexStats", right: "IndexStats") -> "IndexStats":
         """
         Merge two indexing stats objects.
@@ -4537,7 +4980,7 @@ class QuickContext:
 
         if old_collection is not None:
             try:
-                collection.client.delete_collection(old_collection)
+                collection.delete_collection(old_collection)
                 if show_progress:
                     print(f"Deleted old collection: {old_collection}")
             except Exception:
@@ -4552,8 +4995,8 @@ class QuickContext:
         generate_descriptions: bool,
     ) -> None:
         missing = []
-        if self._config.qdrant is None:
-            missing.append("qdrant")
+        if self._config.store is None:
+            missing.append("store")
         if self._config.code_embedding is None:
             missing.append("code_embedding")
         if self._config.desc_embedding is None:
@@ -4563,17 +5006,13 @@ class QuickContext:
         if missing:
             raise RuntimeError(
                 f"Cannot {operation_name}: disabled subsystems: {', '.join(missing)}. "
-                "Indexing requires qdrant, code_embedding, desc_embedding, and llm when descriptions are enabled."
+                "Indexing requires store, code_embedding, desc_embedding, and llm when descriptions are enabled."
             )
 
         try:
             self.connect(verify=True)
         except ConnectionError as exc:
-            assert self._config.qdrant is not None
-            raise RuntimeError(
-                f"Cannot {operation_name}: Qdrant is unreachable at {self._config.qdrant.url}. "
-                "Start Qdrant or update the active config before indexing."
-            ) from exc
+            raise RuntimeError(f"Cannot {operation_name}: {exc}") from exc
 
     def _apply_fast_embedding_defaults(
         self,
@@ -4614,7 +5053,7 @@ class QuickContext:
 
         if embedding_concurrency is None:
             embedding_concurrency = max(
-                16,
+                32,
                 max(
                     (cfg.concurrency for cfg in (self._config.code_embedding, self._config.desc_embedding) if cfg is not None),
                     default=4,
@@ -4660,7 +5099,7 @@ class QuickContext:
         _progress_reporter: OperationProgressReporter | None = None,
     ) -> "IndexStats":
         """
-        Index a directory: extract symbols, chunk, optionally describe, embed, and upsert to Qdrant.
+        Index a directory: extract symbols, chunk, optionally describe, embed, and store vectors.
 
         directory: str | Path — Directory to index.
         force_refresh: bool — Force re-indexing even if files haven't changed.
@@ -4701,6 +5140,10 @@ class QuickContext:
             active_collection_empty = (collection.info().get("points_count", 0) or 0) == 0
         except Exception:
             active_collection_empty = False
+        if not force_refresh and not collection.vectors_match_config():
+            if show_progress:
+                print("Embedding dimensions changed since the last index; rebuilding every file")
+            force_refresh = True
 
         if show_progress:
             print(f"Indexing project: {detected_project}")
@@ -5041,7 +5484,7 @@ class QuickContext:
             load_state,
             save_state,
         )
-        from engine.src.indexer import IndexStats, QdrantIndexer
+        from engine.src.indexer import ChunkIndexer
 
         resume_files, delete_only_files = self._build_resume_files(changed_results, chunks)
         changed_paths = sorted({result.file_path for result in changed_results})
@@ -5075,11 +5518,7 @@ class QuickContext:
         shadow_name: str | None = None
 
         def shadow_exists(name: str) -> bool:
-            try:
-                collection.client.get_collection(name)
-                return True
-            except Exception:
-                return False
+            return collection.collection_exists(name) and collection.vectors_match_config(name)
 
         if resume_state is not None:
             expected_manifest = {
@@ -5104,9 +5543,12 @@ class QuickContext:
                 if show_progress:
                     print(f"Resuming shadow collection: {shadow_name}")
             else:
-                if shadow_exists(resume_state.shadow_collection) and active_collection != resume_state.shadow_collection:
+                if (
+                    collection.collection_exists(resume_state.shadow_collection)
+                    and active_collection != resume_state.shadow_collection
+                ):
                     try:
-                        collection.client.delete_collection(resume_state.shadow_collection)
+                        collection.delete_collection(resume_state.shadow_collection)
                     except Exception:
                         pass
                 clear_state(directory, detected_project)
@@ -5130,18 +5572,16 @@ class QuickContext:
             if show_progress:
                 print(f"Created shadow collection: {shadow_name}")
 
-        shadow_indexer = QdrantIndexer(
-            client=collection.client,
+        shadow_indexer = ChunkIndexer(
+            store=collection.store,
             collection_name=shadow_name,
-            batch_size=self._config.qdrant.upsert_batch_size,
-            upsert_concurrency=self._config.qdrant.upsert_concurrency,
+            batch_size=self._config.store.upsert_batch_size,
         )
 
         if resume_state.source_collection is not None and not force_refresh and not resume_state.copied_points:
             copied_points = collection.copy_points(
                 source_collection=resume_state.source_collection,
                 target_collection=shadow_name,
-                batch_size=self._config.qdrant.upsert_batch_size,
             )
             resume_state = replace(resume_state, copied_points=True)
             save_state(directory, resume_state)
@@ -5204,94 +5644,24 @@ class QuickContext:
                 message=f"Deduplicated {dedup_result.total_chunks} chunks to {dedup_result.unique_count} unique chunks",
             )
 
-        if compress_for_embedding:
-            for idx, chunk in enumerate(dedup_result.unique_chunks):
-                compressed_source, _ = compress_source(chunk.source, level=compress_for_embedding, language=chunk.language)
-                if compressed_source and compressed_source != chunk.source:
-                    dedup_result.unique_chunks[idx] = replace(chunk, source=compressed_source)
-
-        if show_progress and dedup_result.duplicate_count > 0:
-            print(
-                f"Deduplicated: {dedup_result.total_chunks} chunks -> "
-                f"{dedup_result.unique_count} unique, "
-                f"{dedup_result.duplicate_count} duplicates skipped"
-            )
-
-        if generate_descriptions:
-            if show_progress:
-                print(f"Generating descriptions for {dedup_result.unique_count} unique chunks...")
-
-            if _progress_reporter is not None:
-                _progress_reporter.set_stage("describe", "Generating descriptions")
-            description_started = time.time()
-            unique_descriptions = self.describer.generate_batch(
-                dedup_result.unique_chunks,
-                progress_callback=(
-                    (lambda completed, total: _progress_reporter.update(
-                        description_chunks_completed=completed,
-                        message=f"Generated descriptions for {completed}/{total} chunks",
-                    ))
-                    if _progress_reporter is not None else None
-                ),
-            )
-            descriptions = expand_descriptions(unique_descriptions, dedup_result)
-            llm_cost = sum(d.cost_usd for d in unique_descriptions)
-            description_stage_duration_seconds = time.time() - description_started
-
-            if show_progress:
-                total_tokens = sum(d.token_count for d in unique_descriptions)
-                print(f"Generated descriptions ({total_tokens} tokens, ${llm_cost:.4f})")
-        else:
-            from engine.src.describer import build_fallback_descriptions
-
-            if _progress_reporter is not None:
-                _progress_reporter.set_stage("describe", "Building fallback descriptions")
-            description_started = time.time()
-            unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
-            unique_descriptions = self._maybe_generate_lightweight_artifact_metadata(
-                dedup_result.unique_chunks,
-                unique_descriptions,
-                progress_callback=(
-                    (lambda completed, total: _progress_reporter.update(
-                        description_chunks_completed=completed,
-                        message=f"Generated lightweight metadata for {completed}/{total} artifact chunks",
-                    ))
-                    if _progress_reporter is not None else None
-                ),
-            )
-            descriptions = expand_descriptions(unique_descriptions, dedup_result)
-            llm_cost = sum(item.cost_usd for item in unique_descriptions)
-            description_stage_duration_seconds = time.time() - description_started
-            if _progress_reporter is not None:
-                _progress_reporter.update(
-                    description_chunks_completed=dedup_result.unique_count,
-                    message=f"Built fallback descriptions for {dedup_result.unique_count} chunks",
-                )
-            if show_progress:
-                print("Skipping description generation (fast/no-descriptions mode)")
-
-        if show_progress:
-            print("Generating embeddings...")
-
-        if _progress_reporter is not None:
-            _progress_reporter.set_stage("embed", "Generating embeddings")
-        unique_embedded, embedding_cost = self.embedder.embed_batch(
-            dedup_result.unique_chunks,
-            unique_descriptions,
-            concurrency_override=embedding_concurrency,
-            max_retries_override=embedding_max_retries,
-            batch_size_override=embedding_batch_size,
-            adaptive_batching_override=embedding_adaptive_batching,
-            progress_callback=(
-                (lambda completed, total: _progress_reporter.update(
-                    embedding_chunks_completed=completed,
-                    message=f"Embedded {completed}/{total} chunks",
-                ))
-                if _progress_reporter is not None else None
-            ),
+        (
+            embedded_chunks,
+            llm_cost,
+            embedding_cost,
+            description_stage_duration_seconds,
+            embed_stats,
+        ) = self._describe_and_embed(
+            dedup_result=dedup_result,
+            all_chunks=pending_chunks,
+            generate_descriptions=generate_descriptions,
+            compress_for_embedding=compress_for_embedding,
+            show_progress=show_progress,
+            embedding_concurrency=embedding_concurrency,
+            embedding_max_retries=embedding_max_retries,
+            embedding_batch_size=embedding_batch_size,
+            embedding_adaptive_batching=embedding_adaptive_batching,
+            progress_reporter=_progress_reporter,
         )
-        embed_stats = self.embedder.last_run_stats
-        embedded_chunks = expand_embeddings(unique_embedded, pending_chunks, descriptions, dedup_result)
         embedded_by_file: dict[str, list] = {}
         for chunk in embedded_chunks:
             embedded_by_file.setdefault(chunk.chunk.file_path, []).append(chunk)
@@ -5760,99 +6130,27 @@ class QuickContext:
                 message=f"Deduplicated {dedup_result.total_chunks} chunks to {dedup_result.unique_count} unique chunks",
             )
 
-        if compress_for_embedding:
-            for idx, chunk in enumerate(dedup_result.unique_chunks):
-                compressed_source, _ = compress_source(chunk.source, level=compress_for_embedding, language=chunk.language)
-                if compressed_source and compressed_source != chunk.source:
-                    dedup_result.unique_chunks[idx] = replace(chunk, source=compressed_source)
-
-        if show_progress and dedup_result.duplicate_count > 0:
-            print(
-                f"Deduplicated: {dedup_result.total_chunks} chunks -> "
-                f"{dedup_result.unique_count} unique, "
-                f"{dedup_result.duplicate_count} duplicates skipped"
-            )
-
-        if generate_descriptions:
-            if show_progress:
-                print(f"Generating descriptions for {dedup_result.unique_count} unique chunks...")
-
-            if _progress_reporter is not None:
-                _progress_reporter.set_stage("describe", "Generating descriptions")
-            description_started = time.time()
-            unique_descriptions = self.describer.generate_batch(
-                dedup_result.unique_chunks,
-                progress_callback=(
-                    (lambda completed, total: _progress_reporter.update(
-                        description_chunks_completed=completed,
-                        message=f"Generated descriptions for {completed}/{total} chunks",
-                    ))
-                    if _progress_reporter is not None else None
-                ),
-            )
-            descriptions = expand_descriptions(unique_descriptions, dedup_result)
-            llm_cost = sum(d.cost_usd for d in unique_descriptions)
-            description_stage_duration_seconds = time.time() - description_started
-
-            if show_progress:
-                total_tokens = sum(d.token_count for d in unique_descriptions)
-                print(f"Generated descriptions ({total_tokens} tokens, ${llm_cost:.4f})")
-        else:
-            from engine.src.describer import build_fallback_descriptions
-
-            if _progress_reporter is not None:
-                _progress_reporter.set_stage("describe", "Building fallback descriptions")
-            description_started = time.time()
-            unique_descriptions = build_fallback_descriptions(dedup_result.unique_chunks)
-            unique_descriptions = self._maybe_generate_lightweight_artifact_metadata(
-                dedup_result.unique_chunks,
-                unique_descriptions,
-                progress_callback=(
-                    (lambda completed, total: _progress_reporter.update(
-                        description_chunks_completed=completed,
-                        message=f"Generated lightweight metadata for {completed}/{total} artifact chunks",
-                    ))
-                    if _progress_reporter is not None else None
-                ),
-            )
-            descriptions = expand_descriptions(unique_descriptions, dedup_result)
-            llm_cost = sum(item.cost_usd for item in unique_descriptions)
-            description_stage_duration_seconds = time.time() - description_started
-            if _progress_reporter is not None:
-                _progress_reporter.update(
-                    description_chunks_completed=dedup_result.unique_count,
-                    message=f"Built fallback descriptions for {dedup_result.unique_count} chunks",
-                )
-            if show_progress:
-                print("Skipping description generation (fast/no-descriptions mode)")
-
-        if show_progress:
-            print("Generating embeddings...")
-
-        if _progress_reporter is not None:
-            _progress_reporter.set_stage("embed", "Generating embeddings")
-        unique_embedded, embedding_cost = self.embedder.embed_batch(
-            dedup_result.unique_chunks,
-            unique_descriptions,
-            concurrency_override=embedding_concurrency,
-            max_retries_override=embedding_max_retries,
-            batch_size_override=embedding_batch_size,
-            adaptive_batching_override=embedding_adaptive_batching,
-            progress_callback=(
-                (lambda completed, total: _progress_reporter.update(
-                    embedding_chunks_completed=completed,
-                    message=f"Embedded {completed}/{total} chunks",
-                ))
-                if _progress_reporter is not None else None
-            ),
-        )
-        embed_stats = self.embedder.last_run_stats
-        embedded_chunks = expand_embeddings(
-            unique_embedded, all_chunks_to_reindex, descriptions, dedup_result,
+        (
+            embedded_chunks,
+            llm_cost,
+            embedding_cost,
+            description_stage_duration_seconds,
+            embed_stats,
+        ) = self._describe_and_embed(
+            dedup_result=dedup_result,
+            all_chunks=all_chunks_to_reindex,
+            generate_descriptions=generate_descriptions,
+            compress_for_embedding=compress_for_embedding,
+            show_progress=show_progress,
+            embedding_concurrency=embedding_concurrency,
+            embedding_max_retries=embedding_max_retries,
+            embedding_batch_size=embedding_batch_size,
+            embedding_adaptive_batching=embedding_adaptive_batching,
+            progress_reporter=_progress_reporter,
         )
 
         if show_progress:
-            print(f"Upserting {len(embedded_chunks)} chunks to Qdrant...")
+            print(f"Writing {len(embedded_chunks)} chunks to the vector store...")
 
         if _progress_reporter is not None:
             _progress_reporter.set_stage("upsert", "Upserting chunks")
@@ -5941,18 +6239,103 @@ class QuickContext:
 
         return stats
 
-    def qdrant_available(self, verify: bool = True) -> bool:
+    def collect(
+        self,
+        collection: str,
+        items: Any,
+        *,
+        tags: Any = None,
+        source: Optional[str] = None,
+        kind: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        dedupe_threshold: Optional[float] = None,
+    ) -> list[str]:
         """
-        Return True when the configured Qdrant backend is reachable.
+        Store text for later recall (notes, findings, snippets, tool output, docs...).
 
-        verify: bool — When True, actively probe Qdrant instead of only checking an
-        existing cached client state.
+        collection: str — Document collection name; created on first use.
+        items: str | dict | list — Text, or dicts with "text" plus optional "id",
+            "tags", "source", "kind", and custom metadata keys.
+        dedupe_threshold: Optional[float] — Merge into an existing document whose cosine
+            similarity is at least this value (e.g. 0.95) instead of adding a near-duplicate.
+        Returns: list[str] — Document IDs (content-addressed unless "id" is given).
         """
-        if self._config.qdrant is None:
+        return self.documents.add(
+            collection,
+            items,
+            tags=tags,
+            source=source,
+            kind=kind,
+            metadata=metadata,
+            dedupe_threshold=dedupe_threshold,
+        )
+
+    def recall(
+        self,
+        collection: str,
+        query: str,
+        *,
+        limit: int = 10,
+        mode: str = "hybrid",
+        tags: Any = None,
+        source: Optional[str] = None,
+        kind: Optional[str] = None,
+        where: Optional[dict] = None,
+        min_score: Optional[float] = None,
+        semantic_weight: float = 0.7,
+        diversity: float = 0.0,
+        half_life_days: Optional[float] = None,
+    ) -> list:
+        """
+        Retrieve the documents most relevant to a query (hybrid vector + BM25 by default).
+
+        semantic_weight: Vector share of the weighted RRF fusion (rest is BM25).
+        diversity: MMR trade-off in [0, 1]; ~0.3 suppresses near-duplicate hits.
+        half_life_days: Exponential recency decay applied to scores.
+        Returns: list[Document]
+        """
+        return self.documents.search(
+            collection,
+            query,
+            limit=limit,
+            mode=mode,
+            tags=tags,
+            source=source,
+            kind=kind,
+            where=where,
+            min_score=min_score,
+            semantic_weight=semantic_weight,
+            diversity=diversity,
+            half_life_days=half_life_days,
+        )
+
+    def forget(
+        self,
+        collection: str,
+        ids: Any = None,
+        *,
+        tags: Any = None,
+        source: Optional[str] = None,
+        kind: Optional[str] = None,
+        where: Optional[dict] = None,
+    ) -> int:
+        """
+        Delete documents by ID or filter. Returns the number removed.
+        """
+        return self.documents.delete(collection, ids, tags=tags, source=source, kind=kind, where=where)
+
+    def vector_store_available(self, verify: bool = True) -> bool:
+        """
+        Return True when the embedded vector store can be opened and queried.
+
+        verify: bool — When True, open and probe the database; otherwise only report
+        whether it is already open.
+        """
+        if self._config.store is None:
             return False
 
         if not verify:
-            return self._conn.is_alive() if self._conn is not None else False
+            return self._store is not None and self._store.is_open()
 
         try:
             self.connect(verify=True)
@@ -5984,11 +6367,11 @@ class QuickContext:
         """
         Return collection metadata for one logical project.
         """
-        if self._config.qdrant is None or not self.qdrant_available(verify=True):
+        if self._config.store is None or not self.vector_store_available(verify=True):
             return ProjectCollectionInfo(project_name=project_name, indexed=False)
 
         try:
-            info = self._get_collection(project_name).info()
+            info = self._get_collection(project_name, create=False).info()
         except Exception:
             return ProjectCollectionInfo(project_name=project_name, indexed=False)
 
@@ -6001,20 +6384,15 @@ class QuickContext:
 
     def list_projects(self) -> list[ProjectCollectionInfo]:
         """
-        List indexed projects visible through the configured Qdrant backend.
+        List indexed code projects in the vector store.
         """
-        if self._config.qdrant is None or not self.qdrant_available(verify=True):
+        if self._config.store is None or not self.vector_store_available(verify=True):
             return []
 
-        from engine.src.collection import CollectionManager
+        from engine.src.collection import list_projects
 
-        manager = CollectionManager(
-            client=self.connection.client,
-            config=self._config,
-            collection_name="_sdk_projects",
-        )
         projects = []
-        for item in manager.list_all_projects():
+        for item in list_projects(self.store):
             points_count = int(item.get("points_count", 0) or 0)
             projects.append(
                 self._project_collection_from_info(
@@ -6072,8 +6450,8 @@ class QuickContext:
         scope = Path(path).resolve()
         anchor = scope.parent if scope.is_file() else scope
         resolved_project = detect_project_name(anchor, manual_override=project_name)
-        qdrant_enabled = self._config.qdrant is not None
-        qdrant_available = self.qdrant_available(verify=True) if qdrant_enabled else False
+        store_enabled = self._config.store is not None
+        store_available = self.vector_store_available(verify=True) if store_enabled else False
 
         cache = self.cache_status(anchor)
         collection = self.project_collection_info(resolved_project)
@@ -6086,8 +6464,8 @@ class QuickContext:
             path=str(anchor),
             project_name=resolved_project,
             indexed=collection.indexed,
-            qdrant_enabled=qdrant_enabled,
-            qdrant_available=qdrant_available,
+            vector_store_enabled=store_enabled,
+            vector_store_available=store_available,
             parser_connected=self.parser_service.connected,
             cache_entries=int(cache.get("entries", 0)),
             cache_disk_bytes=int(cache.get("disk_bytes", 0)),
@@ -6325,23 +6703,26 @@ class QuickContext:
             project_name=resolved_project,
         )
 
-    def status(self, verify_qdrant: bool = True) -> dict:
+    def status(self, verify_store: bool = True) -> dict:
         """
-        Get engine status: connection health, collection info, provider details.
+        Get engine status: vector store health, collection info, provider details.
 
         Returns: dict — Status report.
         """
         result = {}
 
-        if self._config.qdrant is not None:
-            alive = self.qdrant_available(verify=verify_qdrant)
-            result["qdrant"] = {
-                "url": self._config.qdrant.url,
+        if self._config.store is not None:
+            alive = self.vector_store_available(verify=verify_store)
+            store_status = {
+                "path": self._config.store.resolved_path,
                 "configured": True,
                 "alive": alive,
             }
+            if alive:
+                store_status["size_bytes"] = self.store.size_bytes()
+            result["store"] = store_status
         else:
-            result["qdrant"] = {"status": "disabled"}
+            result["store"] = {"status": "disabled"}
 
         if self._config.code_embedding is not None:
             result["code_embedding"] = {
@@ -6374,7 +6755,7 @@ class QuickContext:
             "connected": self.parser_service.connected,
         }
 
-        alive = result.get("qdrant", {}).get("alive", False)
+        alive = result.get("store", {}).get("alive", False)
         if alive and self._collections:
             result["collections"] = {}
             for project_name, collection in self._collections.items():
@@ -6480,8 +6861,6 @@ class QuickContext:
         self._file_caches.clear()
         if self._parser_service is not None:
             self._parser_service.close()
-        if self._conn is not None:
-            self._conn.close()
         self._collections.clear()
         self._indexers.clear()
         for searcher in self._searchers.values():
@@ -6489,6 +6868,10 @@ class QuickContext:
             if callable(close):
                 close()
         self._searchers.clear()
+        self._documents = None
+        if self._store is not None:
+            self._store.close()
+            self._store = None
 
     def __enter__(self) -> "QuickContext":
         return self
@@ -6497,5 +6880,5 @@ class QuickContext:
         self.close()
 
     def __repr__(self) -> str:
-        qdrant_info = "disabled" if self._config.qdrant is None else self._config.qdrant.url
-        return f"QuickContext(qdrant={qdrant_info!r})"
+        store_info = "disabled" if self._config.store is None else self._config.store.resolved_path
+        return f"QuickContext(store={store_info!r})"

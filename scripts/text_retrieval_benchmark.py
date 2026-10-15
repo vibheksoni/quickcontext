@@ -12,7 +12,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from engine.sdk import QuickContext
-from engine.src.cli import _optimize_search_config
 from engine.src.config import EngineConfig
 
 
@@ -58,7 +57,7 @@ def main() -> None:
     args = _parse_args()
     repo_root = Path.cwd().resolve()
     cases = json.loads(Path(args.cases_file).read_text(encoding="utf-8"))
-    config = _optimize_search_config(_load_config(args.config))
+    config = _load_config(args.config)
 
     hit_ranks: list[int | None] = []
     latencies: list[float] = []

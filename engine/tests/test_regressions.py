@@ -15,17 +15,16 @@ from engine.src.artifact_semantics import extract_artifact_semantic_signals, fin
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder, CodeChunk
 from engine.src.collection import CollectionManager
-from engine.src.config import CollectionVectorConfig, EngineConfig, LLMConfig, QdrantConfig, ServiceConfig, TransportConfig
+from engine.src.config import CollectionVectorConfig, EngineConfig, LLMConfig, ServiceConfig, StoreConfig, TransportConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import ChunkDescription, DescriptionGenerator, build_fallback_description
 from engine.src.embedder import DualEmbedder, EmbeddingProviderStats
 from engine.src.filecache import FileSignatureCache
 from engine.src.index_resume import ResumeFile, ResumeState, build_settings_fingerprint, clear_state, load_state, save_state
-from engine.src.cli import _optimize_search_config
 from engine.src.indexer import IndexedFileState
 from engine.src.parsing import CompactExtractionResult, ExtractStats, ExtractionResult, ImportEdge, RustParserService, SymbolLookupItem, SymbolLookupResult
-from engine.src.qdrant import QdrantConnection
 from engine.src.searcher import CodeSearcher, LIGHT_RESULT_PAYLOAD_FIELDS, SearchResult
+from engine.src.vector_store import SearchFilter, VectorStore
 
 
 @dataclass(frozen=True)
@@ -73,100 +72,32 @@ class _FakePoint:
         self.id = point_id
 
 
-class _FakeQueryResponse:
-    def __init__(self, points: list[_FakePoint]):
-        self.points = points
+class _FakeStore:
+    """Minimal stand-in for VectorStore's search API."""
 
-
-class _FakeClient:
     def __init__(self, points: list[_FakePoint], records: list | None = None):
         self._points = points
         self._records = records or []
         self.last_query_with_payload = None
+        self.last_query_filter = None
         self.last_retrieve_with_payload = None
         self.retrieve_calls = 0
 
-    def query_points(self, **kwargs):
-        self.last_query_with_payload = kwargs.get("with_payload")
-        return _FakeQueryResponse(self._points)
+    def search(self, collection, request):
+        self.last_query_with_payload = request.with_payload
+        self.last_query_filter = request.filter
+        return list(self._points)
 
-    def query_batch_points(self, collection_name, requests):
-        return [_FakeQueryResponse(self._points) for _ in requests]
+    def search_batch(self, collection, requests):
+        if requests:
+            self.last_query_with_payload = requests[0].with_payload
+            self.last_query_filter = requests[0].filter
+        return [list(self._points) for _ in requests]
 
-    def retrieve(self, **kwargs):
-        self.last_retrieve_with_payload = kwargs.get("with_payload")
+    def retrieve(self, collection, ids, with_payload=True):
+        self.last_retrieve_with_payload = with_payload
         self.retrieve_calls += 1
         return self._records
-
-
-class _FakeCollectionSummary:
-    def __init__(self, name: str):
-        self.name = name
-
-
-class _FakeAliasSummary:
-    def __init__(self, alias_name: str, collection_name: str):
-        self.alias_name = alias_name
-        self.collection_name = collection_name
-
-
-class _FakeCollectionList:
-    def __init__(self, collections: list[str]):
-        self.collections = [_FakeCollectionSummary(name) for name in collections]
-
-
-class _FakeAliasList:
-    def __init__(self, aliases: dict[str, str]):
-        self.aliases = [
-            _FakeAliasSummary(alias_name=name, collection_name=target)
-            for name, target in aliases.items()
-        ]
-
-
-class _FakeCollectionClient:
-    def __init__(self, collections: list[str], aliases: dict[str, str] | None = None):
-        self.collections = set(collections)
-        self.aliases = dict(aliases or {})
-        self.payload_index_calls: list[tuple[str, str]] = []
-
-    def get_collections(self):
-        return _FakeCollectionList(sorted(self.collections))
-
-    def get_collection(self, name: str):
-        resolved = self.aliases.get(name, name)
-        if resolved not in self.collections:
-            raise RuntimeError(f"missing collection: {name}")
-        return object()
-
-    def get_collection_aliases(self, collection_name: str):
-        aliases = {
-            alias_name: target
-            for alias_name, target in self.aliases.items()
-            if alias_name == collection_name
-        }
-        return _FakeAliasList(aliases)
-
-    def get_aliases(self):
-        return _FakeAliasList(self.aliases)
-
-    def create_collection(self, collection_name: str, vectors_config):
-        self.collections.add(collection_name)
-
-    def create_payload_index(self, collection_name: str, field_name: str, field_schema):
-        self.payload_index_calls.append((collection_name, field_name))
-
-    def update_collection_aliases(self, change_aliases_operations):
-        for op in change_aliases_operations:
-            create_alias = getattr(op, "create_alias", None)
-            if create_alias is not None:
-                self.aliases[create_alias.alias_name] = create_alias.collection_name
-                continue
-            delete_alias = getattr(op, "delete_alias", None)
-            if delete_alias is not None:
-                self.aliases.pop(delete_alias.alias_name, None)
-
-    def delete_collection(self, name: str):
-        self.collections.discard(name)
 
 
 class _BlockedImport:
@@ -598,34 +529,38 @@ class RegressionTests(unittest.TestCase):
             self.assertIsNone(changed)
 
     def test_collection_shadow_swap_and_cleanup_keeps_new_active_version(self) -> None:
-        client = _FakeCollectionClient(
-            collections=["demo_v1", "demo_v2"],
-            aliases={"demo": "demo_v2"},
-        )
         config = EngineConfig(
-            qdrant=QdrantConfig(),
+            store=StoreConfig(path=":memory:"),
             code_embedding=None,
             desc_embedding=None,
             llm=None,
             vectors=[CollectionVectorConfig(name="code", dimension=8, distance="cosine")],
         )
-        manager = CollectionManager(client=client, config=config, collection_name="demo")
+        store = VectorStore(config.store).open()
+        try:
+            store.create_collection("demo_v1", config.vectors)
+            store.create_collection("demo_v2", config.vectors)
+            store.set_alias("demo", "demo_v2")
+            manager = CollectionManager(store=store, config=config, collection_name="demo")
 
-        shadow_name = manager.create_shadow()
-        old_collection = manager.swap_alias(shadow_name)
-        deleted = manager.cleanup_old_versions()
+            shadow_name = manager.create_shadow()
+            old_collection = manager.swap_alias(shadow_name)
+            deleted = manager.cleanup_old_versions()
 
-        self.assertEqual(shadow_name, "demo_v3")
-        self.assertEqual(old_collection, "demo_v2")
-        self.assertEqual(manager.resolve_alias(), "demo_v3")
-        self.assertEqual(set(deleted), {"demo_v1", "demo_v2"})
-        self.assertIn("demo_v3", client.collections)
-        self.assertNotIn("demo_v2", client.collections)
+            self.assertEqual(shadow_name, "demo_v3")
+            self.assertEqual(old_collection, "demo_v2")
+            self.assertEqual(manager.resolve_alias(), "demo_v3")
+            self.assertEqual(set(deleted), {"demo_v1", "demo_v2"})
+            self.assertTrue(store.collection_exists("demo_v3"))
+            self.assertFalse(store.collection_exists("demo_v2"))
+            self.assertEqual(manager.info()["real_collection"], "demo_v3")
+        finally:
+            store.close()
 
     def test_searcher_can_share_query_embedding_when_providers_match(self) -> None:
         provider = _FakeProvider("shared-model", 2)
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=provider,
             desc_provider=provider,
@@ -643,9 +578,9 @@ class RegressionTests(unittest.TestCase):
             "keywords": ["query", "embedding", "cache"],
             "path_context": "engine / src / searcher.py",
         }
-        client = _FakeClient([_FakePoint(0.8, payload, point_id="point-1")])
+        client = _FakeStore([_FakePoint(0.8, payload, point_id="point-1")])
         searcher = CodeSearcher(
-            client=client,
+            store=client,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -665,7 +600,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_diversify_results_prefers_distinct_files_for_broad_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -680,7 +615,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_hybrid_request_limit_uses_lower_candidate_floor(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -698,7 +633,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_path_prefix_filter_builds_server_side_constraint(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -714,13 +649,13 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertEqual(normalized_prefix, "engine/src")
         self.assertGreaterEqual(fetch_limit, 50)
-        self.assertIsNotNone(query_filter)
-        must_conditions = query_filter.get("must", [])
-        self.assertTrue(any(isinstance(cond, dict) and cond.get("key") == "path_prefixes" for cond in must_conditions))
+        self.assertIsInstance(query_filter, SearchFilter)
+        self.assertEqual(query_filter.path_prefix, "engine/src")
+        self.assertIn(("language", "python"), query_filter.equals)
 
     def test_batch_query_filter_does_not_reapply_keyword_overfetch(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -739,7 +674,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_symbol_tokens_split_snake_case_identifiers(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -752,7 +687,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_query_keyword_expansion_adds_delete_synonym_for_removed(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -763,7 +698,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_query_keyword_expansion_adds_dedup_synonym_for_duplicates(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -773,7 +708,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_query_keyword_expansion_bridges_assignment_and_payload_flow_terms(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -784,7 +719,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_symbol_tokens_add_dedup_for_deduplicate(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -794,7 +729,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_action_query_penalizes_result_container_symbols(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -814,7 +749,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_strong_basename_match_gets_bonus(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -827,7 +762,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_provider_path_bonus_prefers_provider_modules_for_loading_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -845,7 +780,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_startup_boundary_bonus_prefers_parser_startup_files(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -868,7 +803,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_implementation_path_bonus_prefers_searcher_and_indexer(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -891,7 +826,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_graph_path_bonus_prefers_service_graph_files_for_import_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -910,7 +845,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_graph_wrapper_penalty_downranks_sdk_and_cli_for_graph_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -933,7 +868,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_startup_symbol_bonus_prefers_rust_parser_service_for_startup_query(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -953,7 +888,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_role_bonus_prefers_logic_and_penalizes_configuration_for_action_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -967,7 +902,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_wrapper_symbol_penalty_downranks_sdk_wrappers_for_internal_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -987,7 +922,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_wrapper_symbol_penalty_downranks_cli_init_for_parser_startup_query(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1008,7 +943,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_wrapper_symbol_penalty_downranks_sdk_provider_property_for_parser_startup_query(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1029,7 +964,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_constructor_penalty_downranks_init_for_non_constructor_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1047,7 +982,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_startup_import_symbol_penalty_downranks_import_rows(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1065,7 +1000,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_result_key_collapses_file_artifact_results_by_file(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1076,7 +1011,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_rrf_fuse_boosts_top_description_artifact_anchor(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1088,7 +1023,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_ranking_helper_penalty_downranks_bonus_helpers_for_non_ranking_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1106,7 +1041,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_ranking_subsystem_penalty_downranks_search_modules_for_non_search_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1124,7 +1059,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_filecache_bonus_prefers_cache_module_for_unchanged_detection(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1144,7 +1079,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_subsystem_conflict_penalty_downranks_provider_modules_for_parser_startup_query(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1161,7 +1096,7 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(neutral, 1.0)
 
         qdrant_penalty = searcher._subsystem_conflict_penalty(
-            str(Path("engine/src/qdrant.py").resolve()),
+            str(Path("engine/src/vector_store.py").resolve()),
             ["parser", "commands", "qdrant", "imports", "startup"],
         )
         self.assertLess(qdrant_penalty, 1.0)
@@ -1174,7 +1109,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_action_query_boosts_matching_symbol_action(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1192,7 +1127,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_action_query_boosts_classify_for_role_assignment_queries(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1205,7 +1140,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_non_test_query_penalizes_test_paths(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1223,7 +1158,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_non_benchmark_query_penalizes_scripts_paths(self) -> None:
         searcher = CodeSearcher(
-            client=None,
+            store=None,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1264,14 +1199,14 @@ class RegressionTests(unittest.TestCase):
             "signature": "_embed_query_with_provider_cached(query, provider, cache_key)",
         }
 
-        client = _FakeClient(
+        client = _FakeStore(
             [
                 _FakePoint(0.71, general_payload),
                 _FakePoint(0.62, relevant_payload),
             ]
         )
         searcher = CodeSearcher(
-            client=client,
+            store=client,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -1349,7 +1284,7 @@ class RegressionTests(unittest.TestCase):
     def test_maybe_generate_lightweight_artifact_metadata_replaces_only_artifact_chunks(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=LLMConfig(artifact_metadata_enabled=True),
@@ -1422,7 +1357,7 @@ class RegressionTests(unittest.TestCase):
     def test_maybe_generate_lightweight_artifact_metadata_limits_chunks_per_file(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=LLMConfig(artifact_metadata_enabled=True, artifact_metadata_chunks_per_file=2),
@@ -1512,7 +1447,7 @@ class RegressionTests(unittest.TestCase):
     def test_focus_artifact_results_uses_file_local_grep_snippet(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1559,7 +1494,7 @@ class RegressionTests(unittest.TestCase):
     def test_focus_generated_file_match_results_uses_file_local_grep_snippet(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1606,7 +1541,7 @@ class RegressionTests(unittest.TestCase):
     def test_focus_artifact_result_can_upgrade_description_with_lightweight_metadata(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=LLMConfig(artifact_metadata_enabled=True, artifact_metadata_max_tokens=128),
@@ -1655,7 +1590,7 @@ class RegressionTests(unittest.TestCase):
     def test_focus_generated_file_match_results_penalizes_generic_start_only_snippet(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1715,7 +1650,7 @@ class RegressionTests(unittest.TestCase):
     def test_focus_generated_file_match_results_penalizes_project_name_only_match(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1766,7 +1701,7 @@ class RegressionTests(unittest.TestCase):
     def test_focus_generated_file_match_results_penalizes_non_structural_ui_snippet(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1817,7 +1752,7 @@ class RegressionTests(unittest.TestCase):
     def test_lsp_symbols_to_extracted_symbols_maps_document_symbols(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1879,7 +1814,7 @@ class RegressionTests(unittest.TestCase):
     def test_lsp_symbols_to_extracted_symbols_prefers_high_signal_kinds_when_outline_is_large(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1942,7 +1877,7 @@ class RegressionTests(unittest.TestCase):
     def test_enrich_extraction_results_with_lsp_symbols_uses_ready_language(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -1996,7 +1931,7 @@ class RegressionTests(unittest.TestCase):
     def test_enrich_extraction_results_with_lsp_symbols_skips_unready_languages(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2028,7 +1963,7 @@ class RegressionTests(unittest.TestCase):
     def test_merge_related_edges_deduplicates_related_files(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2070,7 +2005,7 @@ class RegressionTests(unittest.TestCase):
     def test_related_files_for_results_collects_import_graph_neighbors(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2117,7 +2052,7 @@ class RegressionTests(unittest.TestCase):
     def test_related_callers_for_results_collects_callers_for_top_callable(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2162,7 +2097,7 @@ class RegressionTests(unittest.TestCase):
     def test_split_semantic_bundle_results_moves_extra_distinct_files_to_related(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2187,7 +2122,7 @@ class RegressionTests(unittest.TestCase):
     def test_tooling_related_semantic_neighbors_filters_to_scripts(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2215,7 +2150,7 @@ class RegressionTests(unittest.TestCase):
     def test_looks_like_tooling_query_detects_benchmark_terms(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2231,7 +2166,7 @@ class RegressionTests(unittest.TestCase):
     def test_should_use_bundle_for_broad_cross_file_query(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2261,7 +2196,7 @@ class RegressionTests(unittest.TestCase):
     def test_should_use_graph_related_for_dependency_queries(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2277,7 +2212,7 @@ class RegressionTests(unittest.TestCase):
     def test_semantic_search_auto_routes_between_search_and_bundle(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2307,7 +2242,7 @@ class RegressionTests(unittest.TestCase):
     def test_extract_symbol_query_candidate_prefers_identifier_targets(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2334,7 +2269,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_routes_symbol_queries_to_symbol_lookup(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2372,7 +2307,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_falls_back_to_semantic_auto_when_symbol_results_are_empty(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2401,7 +2336,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_falls_back_to_text_when_vector_index_is_missing(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2461,7 +2396,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_adds_lexical_related_files_for_search_mode(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2527,7 +2462,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_adds_graph_lexical_related_files_for_graph_query(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2605,7 +2540,7 @@ class RegressionTests(unittest.TestCase):
     def test_promote_graph_related_results_dedupes_wrappers_and_backfills_impl_files(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2672,7 +2607,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_routes_non_symbol_query_to_text_primary(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2731,7 +2666,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_routes_non_graph_bundle_query_to_text_primary(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2792,7 +2727,7 @@ class RegressionTests(unittest.TestCase):
     def test_text_primary_payload_adds_import_and_module_related_files(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2882,7 +2817,7 @@ class RegressionTests(unittest.TestCase):
     def test_text_import_related_files_prioritize_module_neighbors_over_shared_utilities(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -2949,7 +2884,7 @@ class RegressionTests(unittest.TestCase):
     def test_retrieve_context_auto_uses_symbol_bundle_for_broad_symbol_queries(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3001,7 +2936,7 @@ class RegressionTests(unittest.TestCase):
     def test_expand_symbol_context_results_adds_referenced_helper_symbols(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3097,7 +3032,7 @@ class RegressionTests(unittest.TestCase):
     def test_expand_symbol_context_results_skips_definition_only_queries(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3148,7 +3083,7 @@ class RegressionTests(unittest.TestCase):
     def test_expand_symbol_context_results_penalizes_postprocess_helpers_for_fuse_query(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3248,7 +3183,7 @@ class RegressionTests(unittest.TestCase):
     def test_semantic_search_bundle_can_skip_graph_related_expansion(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3286,7 +3221,7 @@ class RegressionTests(unittest.TestCase):
     def test_semantic_search_bundle_hydrates_final_anchors_only(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3338,12 +3273,12 @@ class RegressionTests(unittest.TestCase):
         full_payload["source"] = "def _embed_query_cached(query, using): ..."
 
         record = type("Record", (), {"id": "point-1", "payload": full_payload})()
-        client = _FakeClient(
+        client = _FakeStore(
             [_FakePoint(0.8, payload, point_id="point-1")],
             records=[record],
         )
         searcher = CodeSearcher(
-            client=client,
+            store=client,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -3370,9 +3305,9 @@ class RegressionTests(unittest.TestCase):
             "keywords": ["query", "embedding", "cache"],
             "path_context": "engine / src / searcher.py",
         }
-        client = _FakeClient([_FakePoint(0.8, payload, point_id="point-1")])
+        client = _FakeStore([_FakePoint(0.8, payload, point_id="point-1")])
         searcher = CodeSearcher(
-            client=client,
+            store=client,
             collection_name="x",
             code_provider=_FakeProvider("code", 2),
             desc_provider=_FakeProvider("desc", 2),
@@ -3388,28 +3323,36 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(client.retrieve_calls, 0)
         self.assertEqual(results[0].source, "")
 
-    def test_qdrant_connect_skips_eager_verification_by_default(self) -> None:
-        fake_client = mock.Mock()
+    def test_vector_store_opens_lazily(self) -> None:
+        qc = QuickContext(EngineConfig(store=StoreConfig(path=":memory:"), code_embedding=None, desc_embedding=None, llm=None))
+        try:
+            self.assertIsNone(qc._store)
+            self.assertTrue(qc.vector_store_available(verify=True))
+            self.assertIsNotNone(qc._store)
+        finally:
+            qc.close()
+        self.assertIsNone(qc._store)
 
-        with mock.patch("engine.src.qdrant.QdrantClient", return_value=fake_client) as ctor:
-            conn = QdrantConnection(QdrantConfig())
-            conn.connect()
+    def test_legacy_qdrant_config_section_maps_to_store(self) -> None:
+        config = EngineConfig.from_dict({"qdrant": {"host": "localhost", "collection": "legacy", "upsert_batch_size": 64}})
+        self.assertIsNotNone(config.store)
+        self.assertEqual(config.store.collection, "legacy")
+        self.assertEqual(config.store.upsert_batch_size, 64)
+        self.assertIsNone(EngineConfig.from_dict({"qdrant": None}).store)
 
-        ctor.assert_called_once()
-        fake_client.get_collections.assert_not_called()
+    def test_vectors_default_to_embedding_dimensions(self) -> None:
+        config = EngineConfig.from_dict({
+            "code_embedding": {"provider": "litellm", "model": "x", "dimension": 4096},
+            "desc_embedding": {"provider": "litellm", "model": "x", "dimension": 1024},
+        })
+        self.assertEqual({vec.name: vec.dimension for vec in config.vectors}, {"code": 4096, "description": 1024})
 
-    def test_qdrant_connect_verifies_when_requested(self) -> None:
-        fake_client = mock.Mock()
-
-        with mock.patch("engine.src.qdrant.QdrantClient", return_value=fake_client):
-            conn = QdrantConnection(QdrantConfig())
-            conn.connect(verify=True)
-
-        fake_client.get_collections.assert_called_once()
-
-    def test_optimize_search_config_prefers_rest_for_local_qdrant(self) -> None:
-        optimized = _optimize_search_config(EngineConfig(qdrant=QdrantConfig(prefer_grpc=True)))
-        self.assertFalse(optimized.qdrant.prefer_grpc)
+    def test_relative_store_path_is_anchored_to_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "quickcontext.json"
+            config_path.write_text('{"store": {"path": "data/store.db"}}', encoding="utf-8")
+            config = EngineConfig.from_json(str(config_path))
+        self.assertEqual(Path(config.store.path), (Path(tmp) / "data" / "store.db").resolve())
 
     def test_extract_compact_accepts_file_style_list_payload(self) -> None:
         service = RustParserService()
@@ -3468,7 +3411,7 @@ class RegressionTests(unittest.TestCase):
     def test_background_warm_starts_only_once(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3493,7 +3436,7 @@ class RegressionTests(unittest.TestCase):
     def test_background_warm_waits_for_activity_to_finish(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3515,7 +3458,7 @@ class RegressionTests(unittest.TestCase):
     def test_symbol_lookup_uses_requested_path_for_background_warm(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3539,7 +3482,7 @@ class RegressionTests(unittest.TestCase):
     def test_context_manager_does_not_start_background_warm_implicitly(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3554,7 +3497,7 @@ class RegressionTests(unittest.TestCase):
     def test_context_manager_does_not_connect_eagerly(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=QdrantConfig(),
+                store=StoreConfig(path=":memory:"),
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3569,7 +3512,7 @@ class RegressionTests(unittest.TestCase):
     def test_background_warm_uses_dedicated_parser_service(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3587,7 +3530,7 @@ class RegressionTests(unittest.TestCase):
     def test_collect_symbol_helper_results_keeps_helper_source(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3650,7 +3593,7 @@ class RegressionTests(unittest.TestCase):
     def test_collect_symbol_helper_results_uses_reference_window_keywords(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3716,7 +3659,7 @@ class RegressionTests(unittest.TestCase):
     def test_collect_symbol_helper_results_can_use_index_file_symbols(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3781,7 +3724,7 @@ class RegressionTests(unittest.TestCase):
     def test_load_file_symbol_candidates_falls_back_to_extract(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3813,7 +3756,7 @@ class RegressionTests(unittest.TestCase):
     def test_resume_pending_files_detects_completed_vs_partial_shadow_files(self) -> None:
         qc = QuickContext(
             EngineConfig(
-                qdrant=None,
+                store=None,
                 code_embedding=None,
                 desc_embedding=None,
                 llm=None,
@@ -3838,7 +3781,7 @@ class RegressionTests(unittest.TestCase):
 
     def test_rust_parser_service_uses_configured_runtime_paths(self) -> None:
         config = EngineConfig(
-            qdrant=None,
+            store=None,
             code_embedding=None,
             desc_embedding=None,
             llm=None,
@@ -3905,13 +3848,13 @@ class LazyImportBoundaryTests(unittest.TestCase):
         module = importlib.import_module(module_name)
         return importlib.reload(module)
 
-    def test_engine_package_import_does_not_require_qdrant_client(self) -> None:
-        with _BlockedImport({"qdrant_client"}):
+    def test_engine_package_import_does_not_require_vector_stack(self) -> None:
+        with _BlockedImport({"qdrant_client", "numpy"}):
             module = self._reload_module("engine")
             self.assertTrue(hasattr(module, "__getattr__"))
 
-    def test_parsing_import_does_not_require_qdrant_client(self) -> None:
-        with _BlockedImport({"qdrant_client"}):
+    def test_parsing_import_does_not_require_vector_stack(self) -> None:
+        with _BlockedImport({"qdrant_client", "numpy"}):
             module = self._reload_module("engine.src.parsing")
             self.assertTrue(hasattr(module, "RustParserService"))
 

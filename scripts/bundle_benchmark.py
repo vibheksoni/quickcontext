@@ -13,7 +13,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from engine.sdk import QuickContext
 from engine.src.config import EngineConfig
-from engine.src.cli import _optimize_search_config
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,7 +60,7 @@ def _coverage(paths: list[str], expected_paths: list[str], limit: int) -> float:
 
 def main() -> None:
     args = _parse_args()
-    config = _optimize_search_config(_load_config(args.config))
+    config = _load_config(args.config)
     cases = json.loads(Path(args.cases_file).read_text(encoding="utf-8"))
 
     latencies: list[float] = []

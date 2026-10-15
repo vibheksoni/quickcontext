@@ -28,13 +28,20 @@ python -m engine --config quickcontext.json <command>
 
 The same JSON config used by the SDK controls:
 
-- Qdrant connection
+- vector store location
 - embedding providers
 - optional LLM description generation
 - service binary path
 - IPC transport settings
 
 ## Core Commands
+
+Agent documents:
+
+- `collect`
+- `recall`
+- `forget`
+- `collections`
 
 State and maintenance:
 
@@ -166,6 +173,23 @@ The `search` command supports bias presets defined in `engine/src/search_modes.p
 - `planning`
 
 These presets tune vector-space choice, keyword weighting, reranking, and result expansion.
+
+## Agent Documents
+
+```text
+python -m engine collect -c research "Auth tokens are cached in Redis for 15 minutes" --tag auth
+python -m engine collect -c research --file notes.md --kind doc
+python -m engine recall -c research "how long do auth tokens live?" --limit 5
+python -m engine forget -c research --tag auth
+python -m engine collections
+```
+
+## Store Maintenance
+
+- `audit`: integrity check plus vector-dimension checks against the active config
+- `gc`: remove orphaned shadow versions from interrupted indexes
+- `compact [--vacuum]`: merge full-text segments, checkpoint the WAL, optionally reclaim disk
+- `repair`: re-point broken project aliases and delete stale versions
 
 ## LSP Commands
 

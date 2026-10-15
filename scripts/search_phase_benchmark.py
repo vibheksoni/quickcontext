@@ -11,7 +11,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from engine import QuickContext
-from engine.src.cli import _optimize_search_config
 from engine.src.config import EngineConfig
 
 
@@ -23,7 +22,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=5, help="Result limit.")
     parser.add_argument("--mode", choices=("code", "desc", "hybrid"), default="hybrid")
     parser.add_argument("--rerank", action="store_true")
-    parser.add_argument("--force-connect", action="store_true", help="Include explicit Qdrant connect timing.")
+    parser.add_argument("--force-connect", action="store_true", help="Include explicit vector store open timing.")
     parser.add_argument("--include-source", action="store_true", help="Hydrate full source content in final results.")
     return parser.parse_args()
 
@@ -51,7 +50,7 @@ def _wrap_method(obj, name: str, timings: dict[str, float], counts: dict[str, in
 
 def main() -> None:
     args = _parse_args()
-    config = _optimize_search_config(_load_config(args.config))
+    config = _load_config(args.config)
 
     timings: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
@@ -83,10 +82,10 @@ def main() -> None:
         if hasattr(searcher, method_name):
             originals.append((searcher, method_name, _wrap_method(searcher, method_name, timings, counts)))
 
-    client = searcher._client
-    for method_name in ("query_points", "query_batch_points", "retrieve"):
-        if hasattr(client, method_name):
-            originals.append((client, method_name, _wrap_method(client, method_name, timings, counts)))
+    store = searcher._store
+    for method_name in ("search", "search_batch", "retrieve"):
+        if hasattr(store, method_name):
+            originals.append((store, method_name, _wrap_method(store, method_name, timings, counts)))
 
     try:
         start = time.perf_counter()
@@ -118,12 +117,6 @@ def main() -> None:
     print("phases:")
     for name in sorted(timings):
         print(f"  {name}_ms={round(timings[name], 2)} calls={counts[name]}")
-    response_meta = getattr(client, "last_response_meta", None)
-    if response_meta is not None:
-        if response_meta.server_time_ms is not None:
-            print(f"query_server_time_ms={round(response_meta.server_time_ms, 2)}")
-        print(f"query_response_bytes={response_meta.response_bytes}")
-        print(f"query_status_code={response_meta.status_code}")
     if results:
         top = results[0]
         print(f"top_file={top.file_path}")

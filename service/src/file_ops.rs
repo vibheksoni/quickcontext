@@ -95,17 +95,19 @@ fn plan_line_edits(content: &str, edits: &[FileLineEdit], default_text: Option<&
             return Err("start_line must be >= 1".to_string());
         }
 
-        let (start, end) = if edit.end_line.is_none() {
-            let pos = line_to_byte_end_inclusive(content, &starts, edit.start_line);
-            (pos, pos)
-        } else {
-            let start = line_to_byte_start(content, &starts, edit.start_line);
-            let end_line = edit.end_line.unwrap();
-            if end_line < edit.start_line {
-                return Err("end_line must be >= start_line".to_string());
+        let (start, end) = match edit.end_line {
+            None => {
+                let pos = line_to_byte_end_inclusive(content, &starts, edit.start_line);
+                (pos, pos)
             }
-            let end = line_to_byte_end_inclusive(content, &starts, end_line);
-            (start, end)
+            Some(end_line) => {
+                if end_line < edit.start_line {
+                    return Err("end_line must be >= start_line".to_string());
+                }
+                let start = line_to_byte_start(content, &starts, edit.start_line);
+                let end = line_to_byte_end_inclusive(content, &starts, end_line);
+                (start, end)
+            }
         };
 
         let replacement = match (&edit.text, default_text) {
@@ -121,7 +123,7 @@ fn plan_line_edits(content: &str, edits: &[FileLineEdit], default_text: Option<&
         });
     }
 
-    planned.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+    planned.sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
 
     let mut last_start = content.len() + 1;
     for edit in &planned {
@@ -196,7 +198,11 @@ pub fn file_read(
     let mut truncated = false;
     if let Some(limit) = max_bytes {
         if content.len() > limit {
-            content.truncate(limit);
+            let mut end = limit;
+            while !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            content.truncate(end);
             truncated = true;
         }
     }
@@ -282,7 +288,7 @@ pub fn file_edit(
                     replacement,
                 });
             }
-            planned.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
+            planned.sort_by_key(|edit| std::cmp::Reverse(edit.start_byte));
             apply_planned_edits(&original, &planned)
         }
         "replace" => {
@@ -390,4 +396,24 @@ pub fn file_edit_revert(edit_id: &str, dry_run: bool, expected_hash: Option<&str
         duration_ms: start.elapsed().as_millis(),
         edit_id: edit_id.to_string(),
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_read_truncates_on_char_boundary() {
+        let path = std::env::temp_dir().join(format!("qc_file_read_{}.txt", std::process::id()));
+        fs::write(&path, "h\u{e9}llo\nw\u{f6}rld\n").unwrap();
+
+        let result = file_read(&path, None, None, Some(2));
+        let _ = fs::remove_file(&path);
+
+        let result = result.unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].text, "h");
+    }
 }

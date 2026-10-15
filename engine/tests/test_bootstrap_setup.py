@@ -23,7 +23,7 @@ class BootstrapSetupTests(unittest.TestCase):
             example_path.write_text(
                 json.dumps(
                     {
-                        "qdrant": {"host": "localhost", "port": 6333, "prefer_grpc": False},
+                        "store": {"path": None},
                         "service": {"path": None},
                         "transport": {"windows_pipe_name": r"\\.\pipe\quickcontext"},
                         "mcp": {"transport": "stdio", "host": "127.0.0.1", "port": 8000, "http_path": "/mcp/", "stateless_http": False},
@@ -34,7 +34,7 @@ class BootstrapSetupTests(unittest.TestCase):
             config_path.write_text(
                 json.dumps(
                     {
-                        "qdrant": {"host": "localhost", "port": 6333, "prefer_grpc": False},
+                        "qdrant": {"host": "localhost", "port": 6333, "collection": "legacy", "upsert_batch_size": 64},
                         "code_embedding": {"provider": "litellm", "api_key": "keep-me"},
                         "service": {"path": "C:/existing/quickcontext-service.exe"},
                     }
@@ -46,19 +46,20 @@ class BootstrapSetupTests(unittest.TestCase):
                 config_path=config_path,
                 example_path=example_path,
                 service_path=Path("C:/new/quickcontext-service.exe"),
-                qdrant_port=8803,
                 dry_run=False,
             )
 
             payload = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["qdrant"]["port"], 6333)
+            self.assertNotIn("qdrant", payload)
+            self.assertEqual(payload["store"]["collection"], "legacy")
+            self.assertEqual(payload["store"]["upsert_batch_size"], 64)
             self.assertEqual(payload["service"]["path"], "C:/existing/quickcontext-service.exe")
             self.assertEqual(payload["code_embedding"]["provider"], "litellm")
             self.assertEqual(payload["code_embedding"]["api_key"], "keep-me")
             self.assertIn("transport", payload)
             self.assertIn("mcp", payload)
 
-    def test_write_config_seeds_new_config_with_detected_qdrant_port(self) -> None:
+    def test_write_config_seeds_new_config_with_embedded_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "_ignore" / "bootstrap.local.json"
@@ -67,7 +68,7 @@ class BootstrapSetupTests(unittest.TestCase):
             example_path.write_text(
                 json.dumps(
                     {
-                        "qdrant": {"host": "localhost", "port": 6333, "prefer_grpc": True},
+                        "store": {"path": None},
                         "service": {"path": None},
                         "transport": {"windows_pipe_name": r"\\.\pipe\quickcontext", "unix_socket_path": None},
                         "mcp": {"transport": "stdio", "host": "127.0.0.1", "port": 8000, "http_path": "/mcp/", "stateless_http": False},
@@ -80,13 +81,12 @@ class BootstrapSetupTests(unittest.TestCase):
                 config_path=config_path,
                 example_path=example_path,
                 service_path=Path("C:/svc/quickcontext-service.exe"),
-                qdrant_port=8803,
                 dry_run=False,
             )
 
             payload = json.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["qdrant"]["port"], 8803)
-            self.assertFalse(payload["qdrant"]["prefer_grpc"])
+            self.assertNotIn("qdrant", payload)
+            self.assertIn("store", payload)
             self.assertEqual(Path(payload["service"]["path"]), Path("C:/svc/quickcontext-service.exe"))
 
 

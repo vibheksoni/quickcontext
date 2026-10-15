@@ -200,7 +200,7 @@ fn is_config_file(filename: &str) -> bool {
         "requirements.txt", "poetry.lock", "yarn.lock", "package-lock.json",
         "cargo.lock", "gemfile", "gemfile.lock", "composer.json",
     ];
-    if exact.iter().any(|e| filename == *e) {
+    if exact.contains(&filename) {
         return true;
     }
     filename.starts_with('.') && !filename.contains('/')
@@ -220,7 +220,7 @@ fn is_doc_file(path_lower: &str, filename: &str) -> bool {
         "readme.md", "changelog.md", "contributing.md", "license",
         "license.md", "license.txt", "authors", "authors.md",
     ];
-    names.iter().any(|n| filename == *n)
+    names.contains(&filename)
 }
 
 
@@ -256,10 +256,18 @@ pub fn compute_category_boost(category: FileCategory) -> f64 {
 /// query_terms: &[String] — Tokenized query terms.
 /// content: &str — File content to check against.
 pub fn compute_coverage_boost(query_terms: &[String], content: &str) -> f64 {
+    compute_coverage_boost_lower(query_terms, &content.to_lowercase())
+}
+
+
+/// Coverage boost for content that is already lowercased.
+///
+/// query_terms: &[String] — Lowercase query terms.
+/// content_lower: &str — Lowercased file content.
+pub fn compute_coverage_boost_lower(query_terms: &[String], content_lower: &str) -> f64 {
     if query_terms.is_empty() {
         return 1.0;
     }
-    let content_lower = content.to_lowercase();
     let matched = query_terms
         .iter()
         .filter(|t| content_lower.contains(t.as_str()))
@@ -297,7 +305,7 @@ pub fn count_references(content: &str) -> usize {
             continue;
         }
         for word in trimmed.split(|c: char| !c.is_alphanumeric() && c != '_') {
-            if word.len() >= 3 && word.chars().next().map_or(false, |c| c.is_alphabetic()) {
+            if word.len() >= 3 && word.chars().next().is_some_and(|c| c.is_alphabetic()) {
                 if seen.insert(word.to_lowercase()) {
                     count += 1;
                 }

@@ -16,8 +16,8 @@
     "expected_paths": ["engine/src/collection.py"]
   },
   {
-    "query": "QdrantConnection.connect",
-    "expected_paths": ["engine/src/qdrant.py"]
+    "query": "VectorStore.open",
+    "expected_paths": ["engine/src/vector_store.py"]
   },
   {
     "query": "RustParserService.scan_files",

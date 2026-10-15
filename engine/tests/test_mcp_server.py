@@ -26,6 +26,10 @@ class MCPServerTests(unittest.TestCase):
             self.assertIn("search", tool_map)
             self.assertIn("grep", tool_map)
             self.assertIn("symbol_lookup", tool_map)
+            for name in ("collect", "recall", "forget", "collections"):
+                self.assertIn(name, tool_map)
+            self.assertTrue(tool_map["recall"].annotations.readOnlyHint)
+            self.assertTrue(tool_map["forget"].annotations.destructiveHint)
             self.assertTrue(tool_map["search"].annotations.readOnlyHint)
             self.assertFalse(tool_map["index"].annotations.readOnlyHint)
 
@@ -76,13 +80,13 @@ class MCPServerTests(unittest.TestCase):
 
         _run(_test())
 
-    def test_project_info_survives_missing_qdrant(self) -> None:
+    def test_project_info_survives_unavailable_store(self) -> None:
         fake_response = {
             "path": "C:/repo",
             "project_name": "repo",
             "indexed": False,
-            "qdrant_enabled": True,
-            "qdrant_available": False,
+            "vector_store_enabled": True,
+            "vector_store_available": False,
             "parser_connected": True,
             "cache_entries": 0,
             "cache_disk_bytes": 0,
@@ -175,8 +179,12 @@ class MCPServerTests(unittest.TestCase):
                 stateless_http=True,
             )
         )
-        with patch("qc_mcp.server._load_config", return_value=config), patch("qc_mcp.server.mcp.run") as run:
+        with patch("qc_mcp.server._load_config", return_value=config), patch("qc_mcp.server.mcp.run") as run, patch(
+            "qc_mcp.server._start_background_warmup"
+        ) as warmup:
             main([])
+
+        warmup.assert_called_once()
 
         run.assert_called_once_with(
             transport="http",

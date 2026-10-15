@@ -47,7 +47,8 @@ impl LspClient {
         cmd.current_dir(project_root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -106,12 +107,19 @@ impl LspClient {
             map.insert(id, tx);
         }
 
-        transport::send_request(&self.stdin, &req).await?;
+        if let Err(e) = transport::send_request(&self.stdin, &req).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
 
-        let msg = timeout(REQUEST_TIMEOUT, rx)
-            .await
-            .map_err(|_| format!("request timed out: {method}"))?
-            .map_err(|_| "response channel dropped".to_string())?;
+        let msg = match timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(_)) => return Err("response channel dropped".to_string()),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(format!("request timed out: {method}"));
+            }
+        };
 
         if let Some(err) = msg.error {
             return Err(format!("{err}"));
@@ -285,10 +293,7 @@ impl LspClient {
 
     /// Check if the language server process is still running.
     pub fn is_alive(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(None) => true,
-            _ => false,
-        }
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     /// Get the language server spec.

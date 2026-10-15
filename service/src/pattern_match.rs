@@ -280,22 +280,22 @@ fn match_one(goal: &PatternNode, candidate: Node, source: &[u8], env: &mut Match
         }
 
         PatternNode::Internal { kind_id, children } => {
-            let mut cand_children = Vec::new();
-            let mut cursor = candidate.walk();
-            for child in candidate.children(&mut cursor) {
-                cand_children.push(child);
+            let same_kind = candidate.kind_id() == *kind_id;
+            if !same_kind && (!candidate.is_named() || children.is_empty()) {
+                return false;
             }
 
-            if candidate.kind_id() == *kind_id {
+            let mut cursor = candidate.walk();
+            let cand_children: Vec<Node> = candidate.children(&mut cursor).collect();
+
+            if same_kind {
                 return match_children(children, &cand_children, source, env);
             }
 
-            if candidate.is_named() && !children.is_empty() {
-                let mut flex_env = env.clone();
-                if match_children(children, &cand_children, source, &mut flex_env) {
-                    *env = flex_env;
-                    return true;
-                }
+            let mut flex_env = env.clone();
+            if match_children(children, &cand_children, source, &mut flex_env) {
+                *env = flex_env;
+                return true;
             }
 
             false
@@ -401,14 +401,25 @@ pub fn find_matches_in_tree<'a>(
     source: &[u8],
     results: &mut Vec<(Node<'a>, MatchEnv)>,
 ) {
-    let mut env = MatchEnv::default();
-    if match_one(pattern, node, source, &mut env) {
-        results.push((node, env));
-    }
-
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        find_matches_in_tree(pattern, child, source, results);
+    loop {
+        let current = cursor.node();
+        let mut env = MatchEnv::default();
+        if match_one(pattern, current, source, &mut env) {
+            results.push((current, env));
+        }
+
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 
@@ -560,7 +571,7 @@ pub fn pattern_search(
 /// respect_gitignore: bool — Honor .gitignore rules.
 /// lang_lower: &str — Lowercase language name to filter by.
 /// specs: &[LanguageSpec] — Language specs for file detection.
-fn collect_files(
+pub(crate) fn collect_files(
     root: &Path,
     respect_gitignore: bool,
     lang_lower: &str,
@@ -580,8 +591,7 @@ fn collect_files(
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
-        .add_custom_ignore_filename(QUICK_IGNORE_FILENAME)
-        .threads(std::thread::available_parallelism().map_or(4, usize::from));
+        .add_custom_ignore_filename(QUICK_IGNORE_FILENAME);
 
     if !respect_gitignore {
         builder.git_ignore(false).git_global(false).git_exclude(false);
@@ -595,11 +605,11 @@ fn collect_files(
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
-        if let Some(meta) = entry.metadata().ok() {
+        if let Ok(meta) = entry.metadata() {
             if meta.len() > MAX_FILE_SIZE {
                 continue;
             }

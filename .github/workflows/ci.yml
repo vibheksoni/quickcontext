@@ -35,7 +35,7 @@ jobs:
         run: python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py scripts/bootstrap_quickcontext.py
 
       - name: Python regression tests
-        run: python -m unittest engine.tests.test_regressions engine.tests.test_mcp_server engine.tests.test_bootstrap_setup
+        run: python -m unittest engine.tests.test_vector_store engine.tests.test_regressions engine.tests.test_mcp_server engine.tests.test_sdk_surface engine.tests.test_bootstrap_setup engine.tests.test_lsp_setup engine.tests.test_retrieval_focus
 
       - name: Windows bootstrap wrapper dry run
         if: matrix.os == 'windows-latest'
@@ -62,11 +62,6 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify Docker availability
-        run: |
-          docker --version
-          docker compose version
 
       - name: Bootstrap quickcontext
         run: python scripts/bootstrap_quickcontext.py --config bootstrap.quickcontext.json

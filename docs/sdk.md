@@ -7,7 +7,8 @@ The Python SDK is the main product surface for quickcontext.
 It is responsible for:
 
 - orchestrating the long-lived Rust service
-- indexing repositories into Qdrant
+- indexing repositories into the embedded vector store
+- giving agents persistent document collections (`collect` / `recall` / `forget`)
 - running embeddings and optional LLM description generation
 - composing retrieval strategies for agents and downstream tools
 - exposing a stable integration surface for wrappers such as the CLI and MCP server
@@ -19,12 +20,12 @@ The main entrypoint is `engine.sdk.QuickContext`.
 The SDK sits between the Rust service and downstream clients:
 
 1. Rust handles parsing, grep, symbol lookup, text search, import graphs, protocol extraction, pattern search, file operations, and LSP-backed navigation.
-2. The SDK handles chunking, deduplication, description generation, embeddings, Qdrant collection management, semantic retrieval, and higher-level orchestration.
+2. The SDK handles chunking, deduplication, description generation, embeddings, vector store collections, semantic retrieval, and higher-level orchestration.
 3. Wrappers call the SDK instead of reimplementing indexing or retrieval logic.
 
 `QuickContext` is lazy by design:
 
-- Qdrant is not connected until vector features are needed.
+- The SQLite vector store is not opened until vector features are needed, and collection matrices load on first query.
 - The Rust parser service is not started until parser or text operations are used.
 - Embedding providers and the LLM description generator are created only when required.
 
@@ -34,12 +35,14 @@ The SDK reads `quickcontext.json` or `.quickcontext.json`.
 
 Important sections:
 
-- `qdrant`
-  Connection details, HTTP port, optional API key, upsert batch sizing, and concurrency.
+- `store`
+  Embedded vector store location (`path`), write batch size, lock timeout, and how many collections stay resident in memory. See [store.md](store.md).
 - `code_embedding`
   Provider and model for code vectors.
 - `desc_embedding`
   Provider and model for description vectors.
+- `profiles`
+  Named overrides such as `local` and `remote`, picked with `EngineConfig.from_json(path, profile=...)`, `--profile`, or `QC_PROFILE`. Device (GPU), query prefixes, remote concurrency and truncation are covered in [embeddings.md](embeddings.md).
 - `llm`
   Optional LLM for description generation and artifact metadata generation.
 - `service`
@@ -105,12 +108,23 @@ Project discovery:
 - `project_info(...)`
 - `list_projects(...)`
 - `project_collection_info(...)`
-- `qdrant_available(...)`
+- `vector_store_available(...)`
 
 Warmup:
 
 - `warm_project(...)`
 - `start_background_warm(...)`
+
+## Agent Document APIs
+
+Agents can store and retrieve arbitrary text, independent of code indexing:
+
+- `collect(collection, items, tags=..., source=..., kind=..., metadata=...)`
+- `recall(collection, query, limit=..., mode="hybrid"|"semantic"|"keyword", tags=..., where=...)`
+- `forget(collection, ids=None, tags=..., source=..., kind=..., where=...)`
+- `documents.get / list / count / drop / collections`
+
+Recall fuses exact vector search with SQLite FTS5 BM25. See [store.md](store.md) for details.
 
 ## Indexing Profiles
 

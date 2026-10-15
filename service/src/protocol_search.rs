@@ -753,7 +753,11 @@ fn confidence_score(transport: &str, has_inputs: bool, has_outputs: bool) -> f64
 fn trim_line(line: &str) -> String {
     let trimmed = line.trim();
     if trimmed.len() > 220 {
-        format!("{}...", &trimmed[..220])
+        let mut end = 220;
+        while !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &trimmed[..end])
     } else {
         trimmed.to_string()
     }
@@ -761,7 +765,7 @@ fn trim_line(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_contracts, ProtocolSearchOptions, ResolvedOptions};
+    use super::{extract_contracts, trim_line, ProtocolSearchOptions, ResolvedOptions};
 
     fn cfg() -> ResolvedOptions {
         super::resolve_options(Some(&ProtocolSearchOptions::default()))
@@ -830,5 +834,13 @@ let payload = { "method": "ping" };
         );
 
         assert!(contracts.is_empty());
+    }
+
+    #[test]
+    fn trim_line_respects_char_boundaries() {
+        let line = format!("{}{}", "a".repeat(219), "\u{e9}".repeat(10));
+        let trimmed = trim_line(&line);
+        assert!(trimmed.ends_with("..."));
+        assert!(trimmed.len() <= 223);
     }
 }

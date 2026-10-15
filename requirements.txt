@@ -1,9 +1,9 @@
 # ============================================================================
 # quickcontext — Local Code Context Engine
 # ============================================================================
-
-# --- Vector Database Client ------------------------------------------------
-qdrant-client==1.16.2
+#
+# The vector store is embedded (SQLite from the Python standard library plus
+# numpy for exact in-memory search). No database server or Docker is needed.
 
 # --- Embedding Generation (local, no API keys) -----------------------------
 fastembed==0.7.4
@@ -21,11 +21,8 @@ watchdog==6.0.0
 click==8.3.1
 rich==14.3.2
 
-# --- Numerical Computing (embedding operations) ----------------------------
+# --- Numerical Computing (vector search + embedding operations) ------------
 numpy==2.4.2
-
-# --- HTTP Requests ---------------------------------------------------------
-requests==2.31.0
 
 # --- MCP Server ------------------------------------------------------------
 fastmcp[tasks]==3.1.1

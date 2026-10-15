@@ -13,25 +13,13 @@ pub enum QueryExpr {
     Or(Box<QueryExpr>, Box<QueryExpr>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchFilter {
     pub file_pattern: Option<String>,
     pub ext_filter: Option<String>,
     pub dir_filter: Option<String>,
     pub lang_filter: Option<String>,
     pub symbol_type: Option<String>,
-}
-
-impl Default for SearchFilter {
-    fn default() -> Self {
-        Self {
-            file_pattern: None,
-            ext_filter: None,
-            dir_filter: None,
-            lang_filter: None,
-            symbol_type: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +41,7 @@ enum QueryToken {
     RParen,
 }
 
+#[derive(Default)]
 pub struct QueryParser;
 
 impl QueryParser {

@@ -32,7 +32,7 @@ pub fn symbol_edit(
     }
 
     let specs = lang::registry();
-    let results = extract_path(file, &specs)?;
+    let results = extract_path(file, specs)?;
 
     let extraction = results.into_iter().next()
         .ok_or_else(|| "no extraction result".to_string())?;

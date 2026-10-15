@@ -2,7 +2,9 @@ import json
 import os
 import socket
 import struct
+import functools
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -13,6 +15,7 @@ from engine.src.config import EngineConfig
 IS_WINDOWS = os.name == "nt"
 WINDOWS_PIPE_NAME = r"\\.\pipe\quickcontext"
 SOCKET_PATH_ENV_VAR = "QC_SOCKET_PATH"
+PIPE_NAME_ENV_VAR = "QC_PIPE_NAME"
 MAX_FRAME_SIZE = 256 * 1024 * 1024
 _LAUNCHED_SERVER_PROCESSES: list[subprocess.Popen] = []
 CONNECT_RETRY_SLEEP_SECONDS = 0.005
@@ -146,10 +149,22 @@ def _reap_launched_server_processes(wait_seconds: float = LAUNCHED_SERVER_SHUTDO
     _LAUNCHED_SERVER_PROCESSES[:] = [proc for proc in alive if proc.poll() is None]
 
 
+def _locked(method):
+    """Serialize a PipeClient method on the instance lock so one transport is never interleaved."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class PipeClient:
     """Client for the quickcontext Rust service.
 
     Protocol: 4-byte LE u32 length prefix + JSON payload.
+    Thread-safe: request/response round trips are serialized per client.
 
     * pipe_name -- str, transport endpoint path
     * service_path -- Optional[str], path to quickcontext-service binary for auto-start
@@ -160,12 +175,14 @@ class PipeClient:
         self._service_path = service_path
         self._handle: Optional[int] = None
         self._socket: Optional[socket.socket] = None
+        self._lock = threading.RLock()
 
     @property
     def connected(self) -> bool:
         """Returns True if the transport handle is open."""
         return self._handle is not None if IS_WINDOWS else self._socket is not None
 
+    @_locked
     def connect(self, timeout_ms: int = 5000) -> None:
         """Open a connection to the service endpoint.
 
@@ -240,6 +257,7 @@ class PipeClient:
                     ) from exc
                 time.sleep(CONNECT_RETRY_SLEEP_SECONDS)
 
+    @_locked
     def close(self) -> None:
         """Close the transport handle."""
         if IS_WINDOWS:
@@ -357,6 +375,7 @@ class PipeClient:
             buf += chunk
         return buf
 
+    @_locked
     def request(self, payload: dict) -> dict:
         """Sends a JSON request and returns the JSON response.
 
@@ -1353,6 +1372,7 @@ class PipeClient:
             self.close()
             _reap_launched_server_processes()
 
+    @_locked
     def ensure_server(self, timeout_ms: int = 10000) -> None:
         """Connects to the server, starting it if necessary.
 
@@ -1389,7 +1409,9 @@ class PipeClient:
         else:
             popen_kwargs["start_new_session"] = True
 
-        proc = subprocess.Popen([str(svc), "serve"], **popen_kwargs)
+        env = dict(os.environ)
+        env[PIPE_NAME_ENV_VAR if IS_WINDOWS else SOCKET_PATH_ENV_VAR] = self._pipe_name
+        proc = subprocess.Popen([str(svc), "serve"], env=env, **popen_kwargs)
         _LAUNCHED_SERVER_PROCESSES[:] = [item for item in _LAUNCHED_SERVER_PROCESSES if item.poll() is None]
         _LAUNCHED_SERVER_PROCESSES.append(proc)
 
@@ -1403,4 +1425,5 @@ class PipeClient:
         self.close()
 
     def __del__(self):
-        self.close()
+        if hasattr(self, "_lock"):
+            self.close()

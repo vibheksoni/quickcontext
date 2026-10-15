@@ -84,34 +84,15 @@ pub fn extract_path_with_options(
 }
 
 fn extract_directory(dir: &Path, specs: &[LanguageSpec], options: ExtractOptions) -> Vec<ExtractionResult> {
-    let mut builder = ignore::WalkBuilder::new(dir);
-    builder.hidden(true).add_custom_ignore_filename(QUICK_IGNORE_FILENAME);
-
-    if options.respect_gitignore {
-        builder.git_ignore(true).git_global(true).git_exclude(true);
-    } else {
-        builder.git_ignore(false).git_global(false).git_exclude(false);
-    }
-
-    if let Ok(default_ignore_matcher) = build_default_ignore(dir) {
-        builder.filter_entry(move |entry| {
-            let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-            !default_ignore_matcher
-                .matched_path_or_any_parents(entry.path(), is_dir)
-                .is_ignore()
-        });
-    }
-
     let mut results = Vec::new();
-    let walker = builder.build();
 
-    for entry in walker {
+    for entry in build_walker(dir, options) {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -165,33 +146,13 @@ pub fn extract_compact_streaming<W: std::io::Write>(
         duration_ms: 0,
     };
 
-    let mut builder = ignore::WalkBuilder::new(dir);
-    builder.hidden(true).add_custom_ignore_filename(QUICK_IGNORE_FILENAME);
-
-    if options.respect_gitignore {
-        builder.git_ignore(true).git_global(true).git_exclude(true);
-    } else {
-        builder.git_ignore(false).git_global(false).git_exclude(false);
-    }
-
-    if let Ok(default_ignore_matcher) = build_default_ignore(dir) {
-        builder.filter_entry(move |entry| {
-            let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-            !default_ignore_matcher
-                .matched_path_or_any_parents(entry.path(), is_dir)
-                .is_ignore()
-        });
-    }
-
-    let walker = builder.build();
-
-    for entry in walker {
+    for entry in build_walker(dir, options) {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -238,6 +199,27 @@ pub fn extract_compact_streaming<W: std::io::Write>(
     stats
 }
 
+
+fn build_walker(root: &Path, options: ExtractOptions) -> ignore::Walk {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .add_custom_ignore_filename(QUICK_IGNORE_FILENAME)
+        .git_ignore(options.respect_gitignore)
+        .git_global(options.respect_gitignore)
+        .git_exclude(options.respect_gitignore);
+
+    if let Ok(default_ignore_matcher) = build_default_ignore(root) {
+        builder.filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            !default_ignore_matcher
+                .matched_path_or_any_parents(entry.path(), is_dir)
+                .is_ignore()
+        });
+    }
+
+    builder.build()
+}
 
 pub fn build_default_ignore(root: &Path) -> Result<Gitignore, ignore::Error> {
     let mut builder = GitignoreBuilder::new(root);
@@ -291,34 +273,15 @@ pub fn collect_supported_files(
         return Vec::new();
     }
 
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder.hidden(true).add_custom_ignore_filename(QUICK_IGNORE_FILENAME);
-
-    if options.respect_gitignore {
-        builder.git_ignore(true).git_global(true).git_exclude(true);
-    } else {
-        builder.git_ignore(false).git_global(false).git_exclude(false);
-    }
-
-    if let Ok(default_ignore_matcher) = build_default_ignore(root) {
-        builder.filter_entry(move |entry| {
-            let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
-            !default_ignore_matcher
-                .matched_path_or_any_parents(entry.path(), is_dir)
-                .is_ignore()
-        });
-    }
-
     let mut files = Vec::new();
-    let walker = builder.build();
 
-    for entry in walker {
+    for entry in build_walker(root, options) {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
@@ -543,30 +506,36 @@ fn extract_file_with_mode(
 }
 
 fn dedup_symbols(symbols: &mut Vec<ExtractedSymbol>) {
-    let ranges: Vec<(usize, usize, String, SymbolKind)> = symbols
-        .iter()
-        .map(|s| (s.byte_start, s.byte_end, s.name.clone(), s.kind))
-        .collect();
-
     let mut remove = vec![false; symbols.len()];
-    for i in 0..ranges.len() {
-        if remove[i] {
-            continue;
+    {
+        let mut groups: HashMap<(&str, SymbolKind), Vec<usize>> = HashMap::new();
+        for (idx, symbol) in symbols.iter().enumerate() {
+            groups.entry((symbol.name.as_str(), symbol.kind)).or_default().push(idx);
         }
-        for j in (i + 1)..ranges.len() {
-            if remove[j] {
-                continue;
-            }
-            if ranges[i].2 != ranges[j].2 || ranges[i].3 != ranges[j].3 {
-                continue;
-            }
-            if ranges[j].0 >= ranges[i].0 && ranges[j].1 <= ranges[i].1 {
-                remove[j] = true;
-            } else if ranges[i].0 >= ranges[j].0 && ranges[i].1 <= ranges[j].1 {
-                remove[i] = true;
-                break;
+
+        for indices in groups.values().filter(|indices| indices.len() > 1) {
+            for (pos, &i) in indices.iter().enumerate() {
+                if remove[i] {
+                    continue;
+                }
+                for &j in &indices[pos + 1..] {
+                    if remove[j] {
+                        continue;
+                    }
+                    let (a, b) = (&symbols[i], &symbols[j]);
+                    if b.byte_start >= a.byte_start && b.byte_end <= a.byte_end {
+                        remove[j] = true;
+                    } else if a.byte_start >= b.byte_start && a.byte_end <= b.byte_end {
+                        remove[i] = true;
+                        break;
+                    }
+                }
             }
         }
+    }
+
+    if !remove.contains(&true) {
+        return;
     }
 
     let mut idx = 0;
@@ -673,6 +642,8 @@ fn find_parent_name(node: Node, source: &str) -> Option<String> {
     let mut current = node.parent()?;
 
     loop {
+        // The root node (e.g. Python's `module`) is never a meaningful parent.
+        let next = current.parent()?;
         let k = current.kind();
         let is_container = matches!(
             k,
@@ -691,13 +662,12 @@ fn find_parent_name(node: Node, source: &str) -> Option<String> {
         );
 
         if is_container {
-            for i in 0..current.child_count() as u32 {
-                if let Some(child) = current.child(i) {
-                    let ck = child.kind();
-                    if ck == "identifier" || ck == "type_identifier" || ck == "name" || ck == "constant" || ck == "scope_resolution" {
-                        if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                            return Some(text.to_string());
-                        }
+            let mut cursor = current.walk();
+            for child in current.children(&mut cursor) {
+                let ck = child.kind();
+                if matches!(ck, "identifier" | "type_identifier" | "name" | "constant" | "scope_resolution") {
+                    if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                        return Some(text.to_string());
                     }
                 }
             }
@@ -708,7 +678,7 @@ fn find_parent_name(node: Node, source: &str) -> Option<String> {
                 .map(|s| s.trim().to_string());
         }
 
-        current = current.parent()?;
+        current = next;
     }
 }
 
@@ -724,51 +694,6 @@ fn sanitize_parent_name(parent: Option<String>) -> Option<String> {
         return None;
     }
     Some(trimmed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{extract_file_compact, sanitize_parent_name};
-    use crate::lang;
-
-    #[test]
-    fn sanitize_parent_name_drops_import_like_parents() {
-        assert_eq!(sanitize_parent_name(Some("import re".to_string())), None);
-        assert_eq!(sanitize_parent_name(Some("from os import path".to_string())), None);
-    }
-
-    #[test]
-    fn sanitize_parent_name_keeps_real_container_names() {
-        assert_eq!(
-            sanitize_parent_name(Some("CollectionManager".to_string())),
-            Some("CollectionManager".to_string())
-        );
-        assert_eq!(
-            sanitize_parent_name(Some(" QuickContext ".to_string())),
-            Some("QuickContext".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_file_compact_omits_source_heavy_fields() {
-        let spec = lang::python::spec();
-        let source = r#"
-class CodeSearcher:
-    def search_hybrid(self, query):
-        return query
-"#;
-
-        let result = extract_file_compact("fixture.py", source, &spec);
-        assert_eq!(result.symbols.len(), 2);
-
-        for symbol in result.symbols {
-            assert!(symbol.source.is_empty());
-            assert!(symbol.docstring.is_none());
-            assert!(symbol.params.is_none());
-            assert!(symbol.return_type.is_none());
-            assert!(symbol.signature.is_some());
-        }
-    }
 }
 
 fn extract_visibility(source: &str, def_node: &Node, language: &str) -> Option<String> {
@@ -821,5 +746,95 @@ fn extract_fallback_name(source: &str, kind: SymbolKind) -> String {
         format!("{:?}", kind).to_ascii_lowercase()
     } else {
         name.trim_end_matches(['(', ':']).to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_file, extract_file_compact, sanitize_parent_name};
+    use crate::lang;
+
+    #[test]
+    fn sanitize_parent_name_drops_import_like_parents() {
+        assert_eq!(sanitize_parent_name(Some("import re".to_string())), None);
+        assert_eq!(sanitize_parent_name(Some("from os import path".to_string())), None);
+    }
+
+    #[test]
+    fn sanitize_parent_name_keeps_real_container_names() {
+        assert_eq!(
+            sanitize_parent_name(Some("CollectionManager".to_string())),
+            Some("CollectionManager".to_string())
+        );
+        assert_eq!(
+            sanitize_parent_name(Some(" QuickContext ".to_string())),
+            Some("QuickContext".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_file_compact_omits_source_heavy_fields() {
+        let spec = lang::python::spec();
+        let source = r#"
+class CodeSearcher:
+    def search_hybrid(self, query):
+        return query
+"#;
+
+        let result = extract_file_compact("fixture.py", source, &spec);
+        assert_eq!(result.symbols.len(), 2);
+
+        for symbol in result.symbols {
+            assert!(symbol.source.is_empty());
+            assert!(symbol.docstring.is_none());
+            assert!(symbol.params.is_none());
+            assert!(symbol.return_type.is_none());
+            assert!(symbol.signature.is_some());
+        }
+    }
+
+    #[test]
+    fn top_level_python_symbols_have_no_parent() {
+        let spec = lang::python::spec();
+        let source = "#!/usr/bin/env python3
+import os
+
+def top_level():
+    return 1
+
+class Foo:
+    def meth(self):
+        pass
+";
+
+        let result = extract_file("fixture.py", source, &spec);
+        let parent_of = |name: &str| {
+            result
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.parent.clone())
+                .unwrap()
+        };
+
+        assert_eq!(parent_of("top_level"), None);
+        assert_eq!(parent_of("Foo"), None);
+        assert_eq!(parent_of("meth"), Some("Foo".to_string()));
+    }
+
+    #[test]
+    fn dedup_symbols_drops_nested_duplicates_only() {
+        let spec = lang::python::spec();
+        let source = "def run():
+    def run():
+        pass
+
+def other():
+    pass
+";
+        let result = extract_file("fixture.py", source, &spec);
+        let names: Vec<&str> = result.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "run").count(), 1);
+        assert!(names.contains(&"other"));
     }
 }

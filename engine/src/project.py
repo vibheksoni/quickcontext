@@ -49,9 +49,9 @@ def find_project_root(start_path: str | Path) -> Optional[Path]:
 
 def sanitize_project_name(name: str) -> str:
     """
-    Sanitize project name to be valid Qdrant collection name.
+    Sanitize a directory name into a stable collection name.
 
-    Qdrant collection names must:
+    Collection names must:
     - Start with a letter or underscore
     - Contain only letters, digits, underscores, hyphens
     - Be between 1-255 characters

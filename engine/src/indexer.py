@@ -1,14 +1,12 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import time
 import uuid
 
-from qdrant_client import QdrantClient, models
-
-from engine.src.embedder import EmbeddedChunk
 from engine.src.chunker import CodeChunk
+from engine.src.embedder import EmbeddedChunk
+from engine.src.vector_store import PointRecord, VectorStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +16,7 @@ class IndexStats:
 
     Args:
         total_chunks: Total chunks processed
-        upserted_points: Points successfully upserted to Qdrant
+        upserted_points: Points successfully written to the vector store
         failed_points: Points that failed to upsert
         total_tokens: Total tokens used for descriptions
         duration_seconds: Total indexing duration
@@ -44,8 +42,8 @@ class IndexStats:
         filter_stage_duration_seconds: Time spent filtering and capping chunks
         dedup_stage_duration_seconds: Time spent deduplicating chunks before embedding
         description_stage_duration_seconds: Time spent generating descriptions
-        point_build_stage_duration_seconds: Time spent converting embedded chunks into Qdrant points
-        upsert_stage_duration_seconds: Time spent sending point batches to Qdrant
+        point_build_stage_duration_seconds: Time spent converting embedded chunks into store points
+        upsert_stage_duration_seconds: Time spent writing point batches to the vector store
     """
     total_chunks: int
     upserted_points: int
@@ -84,185 +82,114 @@ class IndexedFileState:
     point_count: int
 
 
-class QdrantIndexer:
+def chunk_point_id(chunk_id: str) -> str:
     """
-    Batched upserter for Qdrant with dual-vector support.
+    Deterministic store point ID for a chunk ID.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id))
 
-    Handles:
-    - Batch upsert with configurable batch size
-    - Optional concurrent upsert workers
-    - Dual vector spaces (code + description)
-    - Structured payloads with metadata
-    - Error handling and retry logic
+
+class ChunkIndexer:
+    """
+    Batched writer of embedded code chunks into one store collection.
+
+    Each batch is a single SQLite transaction carrying both vector spaces
+    (code + description) and the structured chunk payload.
     """
 
     def __init__(
         self,
-        client: QdrantClient,
+        store: VectorStore,
         collection_name: str,
-        batch_size: int = 100,
-        wait: bool = True,
-        upsert_concurrency: int = 1,
+        batch_size: int = 512,
     ):
         """
-        Args:
-            client: Qdrant client instance
-            collection_name: Target collection name
-            batch_size: Number of points per batch
-            wait: Wait for indexing to complete before returning
-            upsert_concurrency: Number of concurrent upsert workers
+        store: VectorStore — Open vector store.
+        collection_name: str — Target collection or project alias.
+        batch_size: int — Points per write transaction.
         """
-        self._client = client
+        self._store = store
         self._collection_name = collection_name
         self._batch_size = max(1, int(batch_size))
-        self._wait = wait
-        self._upsert_concurrency = max(1, int(upsert_concurrency))
+
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
 
     def upsert_chunks(self, embedded_chunks: list[EmbeddedChunk], progress_callback=None) -> IndexStats:
         """
-        Upsert embedded chunks to Qdrant in batches.
+        Write embedded chunks in batches.
 
-        Args:
-            embedded_chunks: List of embedded chunks with dual vectors
-
-        Returns:
-            IndexStats with operation metrics
+        embedded_chunks: list[EmbeddedChunk] — Chunks with code and description vectors.
+        progress_callback: Callable[[int, int, int], None] | None — (written, total, failed).
+        Returns: IndexStats — Operation metrics.
         """
         start_time = time.time()
-
         total_chunks = len(embedded_chunks)
+        total_tokens = sum(chunk.description.token_count for chunk in embedded_chunks)
+
+        point_build_started = time.time()
+        points = [self._chunk_to_point(chunk) for chunk in embedded_chunks]
+        point_build_duration = time.time() - point_build_started
+
         upserted = 0
         failed = 0
-        total_tokens = sum(chunk.description.token_count for chunk in embedded_chunks)
-        point_build_started = time.time()
-
-        batches = [
-            embedded_chunks[i:i + self._batch_size]
-            for i in range(0, total_chunks, self._batch_size)
-        ]
-        prepared_batches = [
-            [self._chunk_to_point(chunk) for chunk in batch]
-            for batch in batches
-        ]
-        point_build_duration = time.time() - point_build_started
         upsert_started = time.time()
+        for offset in range(0, total_chunks, self._batch_size):
+            batch = points[offset:offset + self._batch_size]
+            try:
+                upserted += self._store.upsert(self._collection_name, batch)
+            except Exception as exc:
+                failed += len(batch)
+                print(f"Batch upsert failed: {exc}")
+            if progress_callback is not None:
+                progress_callback(upserted, total_chunks, failed)
 
-        if self._upsert_concurrency <= 1 or len(prepared_batches) <= 1:
-            for points in prepared_batches:
-                try:
-                    self._client.upsert(
-                        collection_name=self._collection_name,
-                        points=points,
-                        wait=self._wait,
-                    )
-                    upserted += len(points)
-                    if progress_callback is not None:
-                        progress_callback(upserted, total_chunks, failed)
-                except Exception as e:
-                    failed += len(points)
-                    if progress_callback is not None:
-                        progress_callback(upserted, total_chunks, failed)
-                    print(f"Batch upsert failed: {e}")
-        else:
-            with ThreadPoolExecutor(max_workers=min(self._upsert_concurrency, len(prepared_batches))) as executor:
-                futures = {
-                    executor.submit(self._upsert_points, points): len(points)
-                    for points in prepared_batches
-                }
-                for future in as_completed(futures):
-                    batch_size = futures[future]
-                    try:
-                        future.result()
-                        upserted += batch_size
-                        if progress_callback is not None:
-                            progress_callback(upserted, total_chunks, failed)
-                    except Exception as e:
-                        failed += batch_size
-                        if progress_callback is not None:
-                            progress_callback(upserted, total_chunks, failed)
-                        print(f"Batch upsert failed: {e}")
-
-        duration = time.time() - start_time
-        upsert_duration = time.time() - upsert_started
-
+        finished = time.time()
         return IndexStats(
             total_chunks=total_chunks,
             upserted_points=upserted,
             failed_points=failed,
             total_tokens=total_tokens,
-            duration_seconds=duration,
+            duration_seconds=finished - start_time,
             point_build_stage_duration_seconds=point_build_duration,
-            upsert_stage_duration_seconds=upsert_duration,
+            upsert_stage_duration_seconds=finished - upsert_started,
         )
 
-    def _upsert_points(self, points: list[models.PointStruct]) -> None:
+    def _chunk_to_point(self, chunk: EmbeddedChunk) -> PointRecord:
         """
-        Upsert one point batch to Qdrant.
-
-        points: list[models.PointStruct] — Prepared Qdrant points.
+        Convert an embedded chunk to a store point.
         """
-        self._client.upsert(
-            collection_name=self._collection_name,
-            points=points,
-            wait=self._wait,
-        )
-
-    def _chunk_to_point(self, chunk: EmbeddedChunk) -> models.PointStruct:
-        """
-        Convert embedded chunk to Qdrant point.
-
-        Args:
-            chunk: Embedded chunk with dual vectors
-
-        Returns:
-            PointStruct ready for upsert
-        """
+        code_chunk = chunk.chunk
         payload = {
-            "chunk_id": chunk.chunk.chunk_id,
-            "language": chunk.chunk.language,
-            "file_path": chunk.chunk.file_path,
-            "symbol_name": chunk.chunk.symbol_name,
-            "symbol_kind": chunk.chunk.symbol_kind,
-            "symbol_type": chunk.chunk.symbol_kind,
-            "line_start": chunk.chunk.line_start,
-            "line_end": chunk.chunk.line_end,
-            "byte_start": chunk.chunk.byte_start,
-            "byte_end": chunk.chunk.byte_end,
-            "file_hash": chunk.chunk.file_hash,
+            "chunk_id": code_chunk.chunk_id,
+            "language": code_chunk.language,
+            "file_path": code_chunk.file_path,
+            "symbol_name": code_chunk.symbol_name,
+            "symbol_kind": code_chunk.symbol_kind,
+            "symbol_type": code_chunk.symbol_kind,
+            "line_start": code_chunk.line_start,
+            "line_end": code_chunk.line_end,
+            "byte_start": code_chunk.byte_start,
+            "byte_end": code_chunk.byte_end,
+            "file_hash": code_chunk.file_hash,
             "description": chunk.description.description,
             "keywords": chunk.description.keywords,
-            "source": chunk.chunk.source,
-            "path_context": self._build_path_context(chunk.chunk.file_path),
+            "source": code_chunk.source,
+            "path_context": self._build_path_context(code_chunk.file_path),
         }
+        for key in ("signature", "docstring", "parent", "visibility", "role"):
+            value = getattr(code_chunk, key, None)
+            if value:
+                payload[key] = value
 
-        if chunk.chunk.signature:
-            payload["signature"] = chunk.chunk.signature
-
-        if chunk.chunk.docstring:
-            payload["docstring"] = chunk.chunk.docstring
-
-        if chunk.chunk.parent:
-            payload["parent"] = chunk.chunk.parent
-
-        if chunk.chunk.visibility:
-            payload["visibility"] = chunk.chunk.visibility
-
-        if chunk.chunk.role:
-            payload["role"] = chunk.chunk.role
-
-        path_prefixes = self._build_path_prefixes(chunk.chunk.file_path)
-        if path_prefixes:
-            payload["path_prefixes"] = path_prefixes
-
-        point_id = uuid.uuid5(uuid.NAMESPACE_DNS, chunk.chunk_id)
-
-        return models.PointStruct(
-            id=str(point_id),
-            vector={
+        return PointRecord(
+            id=chunk_point_id(chunk.chunk_id),
+            payload=payload,
+            vectors={
                 "code": chunk.code_vector,
                 "description": chunk.desc_vector,
             },
-            payload=payload,
         )
 
     def _build_path_context(self, file_path: str) -> str:
@@ -270,332 +197,116 @@ class QdrantIndexer:
         Build lightweight path context string for retrieval-time boosting.
 
         file_path: str — Absolute or relative file path.
-        Returns: str — Slash-joined parent path segments.
+        Returns: str — Slash-joined trailing path segments.
         """
         parts = [segment for segment in Path(file_path).parts if segment not in ("", "/", "\\")]
         if not parts:
             return ""
-
-        tail = parts[-5:]
-        return " / ".join(tail)
-
-    def _build_path_prefixes(self, file_path: str) -> list[str]:
-        """
-        Build normalized path prefixes for server-side path-scoped retrieval.
-
-        file_path: str — Absolute or relative file path.
-        Returns: list[str] — Incremental lowercase path prefixes.
-        """
-        normalized = file_path.replace("\\", "/").strip("/")
-        if not normalized:
-            return []
-
-        parts = [segment for segment in normalized.split("/") if segment]
-        prefixes: list[str] = []
-        current: list[str] = []
-        for part in parts[:-1]:
-            current.append(part)
-            prefixes.append("/".join(current).lower())
-        return prefixes
+        return " / ".join(parts[-5:])
 
     def delete_by_file(self, file_path: str) -> None:
         """
-        Delete all chunks for a specific file.
-
-        Args:
-            file_path: Path to file whose chunks should be deleted
+        Delete all chunks for one file.
         """
-        self._client.delete(
-            collection_name=self._collection_name,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="file_path",
-                            match=models.MatchValue(value=file_path),
-                        )
-                    ]
-                )
-            ),
-        )
+        self._store.delete_by_files(self._collection_name, [file_path])
 
     def delete_by_files(self, file_paths: list[str]) -> None:
         """
         Delete all chunks for a batch of files.
-
-        file_paths: list[str] — File paths whose chunks should be deleted.
         """
-        if not file_paths:
-            return
+        if file_paths:
+            self._store.delete_by_files(self._collection_name, file_paths)
 
-        self._client.delete(
-            collection_name=self._collection_name,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="file_path",
-                            match=models.MatchAny(any=file_paths),
-                        )
-                    ]
-                )
-            ),
-        )
-
-    def delete_by_chunk_ids(self, chunk_ids: list[str]) -> None:
+    def delete_by_chunk_ids(self, point_ids: list[str]) -> None:
         """
-        Delete specific chunks by ID.
-
-        chunk_ids: list[str] — List of chunk IDs to delete.
+        Delete specific points by store point ID.
         """
-        self._client.delete(
-            collection_name=self._collection_name,
-            points_selector=models.PointIdsList(
-                points=chunk_ids,
-            ),
-        )
-
-    def get_file_hashes(self, file_paths: list[str]) -> dict[str, Optional[str]]:
-        """
-        Get file hashes for change detection.
-
-        Args:
-            file_paths: List of file paths to check
-
-        Returns:
-            Dict mapping file_path to file_hash (None if not indexed)
-        """
-        hashes: dict[str, Optional[str]] = {path: None for path in file_paths}
-
-        if not file_paths:
-            return hashes
-
-        batch_size = 256
-        for offset in range(0, len(file_paths), batch_size):
-            batch = file_paths[offset:offset + batch_size]
-            try:
-                results, _ = self._client.scroll(
-                    collection_name=self._collection_name,
-                    scroll_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="file_path",
-                                match=models.MatchAny(any=batch),
-                            )
-                        ]
-                    ),
-                    limit=len(batch),
-                    with_payload=["file_path", "file_hash"],
-                    with_vectors=False,
-                )
-            except Exception:
-                continue
-
-            for point in results:
-                point_file_path = point.payload.get("file_path")
-                if point_file_path in hashes and hashes[point_file_path] is None:
-                    hashes[point_file_path] = point.payload.get("file_hash")
-
-        return hashes
-
-    def get_file_index_state(self, file_paths: list[str]) -> dict[str, IndexedFileState]:
-        """
-        Get lightweight indexing state for a set of files from the target collection.
-
-        file_paths: list[str] — File paths to inspect.
-        Returns: dict[str, IndexedFileState] — Indexed file hash and point count per file.
-        """
-        state: dict[str, dict[str, Optional[str] | int]] = {
-            path: {"file_hash": None, "point_count": 0}
-            for path in file_paths
-        }
-        if not file_paths:
-            return {}
-
-        batch_size = 128
-        scroll_limit = 512
-        for offset in range(0, len(file_paths), batch_size):
-            batch = file_paths[offset:offset + batch_size]
-            next_offset = None
-
-            while True:
-                try:
-                    records, next_offset = self._client.scroll(
-                        collection_name=self._collection_name,
-                        scroll_filter=models.Filter(
-                            must=[
-                                models.FieldCondition(
-                                    key="file_path",
-                                    match=models.MatchAny(any=batch),
-                                )
-                            ]
-                        ),
-                        limit=scroll_limit,
-                        offset=next_offset,
-                        with_payload=["file_path", "file_hash"],
-                        with_vectors=False,
-                    )
-                except Exception:
-                    break
-
-                if not records:
-                    break
-
-                for point in records:
-                    point_file_path = point.payload.get("file_path")
-                    if point_file_path not in state:
-                        continue
-                    state[point_file_path]["point_count"] = int(state[point_file_path]["point_count"]) + 1
-                    if state[point_file_path]["file_hash"] is None:
-                        state[point_file_path]["file_hash"] = point.payload.get("file_hash")
-
-                if next_offset is None:
-                    break
-
-        return {
-            path: IndexedFileState(
-                file_hash=item["file_hash"],
-                point_count=int(item["point_count"]),
-            )
-            for path, item in state.items()
-        }
-
-    def get_chunks_by_file(self, file_path: str) -> list[CodeChunk]:
-        """
-        Fetch all existing chunks for a file from Qdrant.
-
-        file_path: str — Path to file whose chunks to fetch.
-        Returns: list[CodeChunk] — Existing chunks for the file.
-        """
-        chunks: list[CodeChunk] = []
-
-        try:
-            results = self._client.scroll(
-                collection_name=self._collection_name,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="file_path",
-                            match=models.MatchValue(value=file_path),
-                        )
-                    ]
-                ),
-                limit=10000,
-                with_payload=True,
-                with_vectors=False,
-            )
-
-            for point in results[0]:
-                payload = point.payload
-                chunk_id = payload.get("chunk_id") or self._legacy_chunk_id_from_payload(payload)
-                chunk = CodeChunk(
-                    chunk_id=chunk_id,
-                    language=payload.get("language", "unknown"),
-                    file_path=payload["file_path"],
-                    symbol_name=payload["symbol_name"],
-                    symbol_kind=payload["symbol_kind"],
-                    line_start=payload["line_start"],
-                    line_end=payload["line_end"],
-                    byte_start=payload["byte_start"],
-                    byte_end=payload["byte_end"],
-                    file_hash=payload["file_hash"],
-                    source=payload["source"],
-                    signature=payload.get("signature"),
-                    docstring=payload.get("docstring"),
-                    parent=payload.get("parent"),
-                    visibility=payload.get("visibility"),
-                )
-                chunks.append(chunk)
-
-        except Exception as e:
-            print(f"Failed to fetch chunks for {file_path}: {e}")
-
-        return chunks
-
-    def get_chunks_by_files(self, file_paths: list[str]) -> dict[str, list[CodeChunk]]:
-        """
-        Fetch all existing chunks for a batch of files from Qdrant.
-
-        file_paths: list[str] — File paths whose chunks to fetch.
-        Returns: dict[str, list[CodeChunk]] — Existing chunks grouped by file path.
-        """
-        grouped: dict[str, list[CodeChunk]] = {file_path: [] for file_path in file_paths}
-        if not file_paths:
-            return grouped
-
-        batch_size = 128
-        for offset in range(0, len(file_paths), batch_size):
-            batch = file_paths[offset:offset + batch_size]
-            try:
-                results, _ = self._client.scroll(
-                    collection_name=self._collection_name,
-                    scroll_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="file_path",
-                                match=models.MatchAny(any=batch),
-                            )
-                        ]
-                    ),
-                    limit=10000,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-            except Exception as e:
-                print(f"Failed to fetch chunks for batch: {e}")
-                continue
-
-            for point in results:
-                payload = point.payload
-                file_path = payload.get("file_path")
-                if file_path not in grouped:
-                    continue
-                chunk_id = payload.get("chunk_id") or self._legacy_chunk_id_from_payload(payload)
-                grouped[file_path].append(CodeChunk(
-                    chunk_id=chunk_id,
-                    language=payload.get("language", "unknown"),
-                    file_path=file_path,
-                    symbol_name=payload["symbol_name"],
-                    symbol_kind=payload["symbol_kind"],
-                    line_start=payload["line_start"],
-                    line_end=payload["line_end"],
-                    byte_start=payload["byte_start"],
-                    byte_end=payload["byte_end"],
-                    file_hash=payload["file_hash"],
-                    source=payload["source"],
-                    signature=payload.get("signature"),
-                    docstring=payload.get("docstring"),
-                    parent=payload.get("parent"),
-                    visibility=payload.get("visibility"),
-                    role=payload.get("role"),
-                ))
-
-        return grouped
+        if point_ids:
+            self._store.delete_points(self._collection_name, point_ids)
 
     def delete_by_identities(self, identities: list) -> None:
         """
         Delete chunks by their ChunkIdentity objects.
-
-        identities: list[ChunkIdentity] — List of chunk identities to delete.
         """
-        if not identities:
-            return
+        self.delete_by_chunk_ids([chunk_point_id(identity.chunk_id) for identity in identities])
 
-        chunk_ids = []
-        for identity in identities:
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, identity.chunk_id))
-            chunk_ids.append(point_id)
+    def get_file_hashes(self, file_paths: list[str]) -> dict[str, Optional[str]]:
+        """
+        Return {file_path: indexed file hash or None} for change detection.
+        """
+        hashes: dict[str, Optional[str]] = {path: None for path in file_paths}
+        if not file_paths:
+            return hashes
+        try:
+            states = self._store.file_states(self._collection_name, file_paths)
+        except Exception:
+            return hashes
+        for path, (file_hash, _) in states.items():
+            hashes[path] = file_hash
+        return hashes
 
-        if chunk_ids:
-            self.delete_by_chunk_ids(chunk_ids)
+    def get_file_index_state(self, file_paths: list[str]) -> dict[str, IndexedFileState]:
+        """
+        Return indexed file hash and point count per file.
+        """
+        if not file_paths:
+            return {}
+        try:
+            states = self._store.file_states(self._collection_name, file_paths)
+        except Exception:
+            states = {}
+        return {
+            path: IndexedFileState(
+                file_hash=states.get(path, (None, 0))[0],
+                point_count=states.get(path, (None, 0))[1],
+            )
+            for path in file_paths
+        }
+
+    def get_chunks_by_file(self, file_path: str) -> list[CodeChunk]:
+        """
+        Fetch all stored chunks for one file.
+        """
+        return self.get_chunks_by_files([file_path]).get(file_path, [])
+
+    def get_chunks_by_files(self, file_paths: list[str]) -> dict[str, list[CodeChunk]]:
+        """
+        Fetch all stored chunks for a batch of files, grouped by file path.
+        """
+        grouped: dict[str, list[CodeChunk]] = {file_path: [] for file_path in file_paths}
+        if not file_paths:
+            return grouped
+        try:
+            records = self._store.records_by_files(self._collection_name, file_paths)
+        except Exception as exc:
+            print(f"Failed to fetch chunks: {exc}")
+            return grouped
+
+        for record in records:
+            payload = record.payload
+            file_path = payload.get("file_path")
+            if file_path not in grouped:
+                continue
+            grouped[file_path].append(CodeChunk(
+                chunk_id=payload.get("chunk_id") or self._legacy_chunk_id_from_payload(payload),
+                language=payload.get("language", "unknown"),
+                file_path=file_path,
+                symbol_name=payload["symbol_name"],
+                symbol_kind=payload["symbol_kind"],
+                line_start=payload["line_start"],
+                line_end=payload["line_end"],
+                byte_start=payload["byte_start"],
+                byte_end=payload["byte_end"],
+                file_hash=payload["file_hash"],
+                source=payload.get("source", ""),
+                signature=payload.get("signature"),
+                docstring=payload.get("docstring"),
+                parent=payload.get("parent"),
+                visibility=payload.get("visibility"),
+                role=payload.get("role"),
+            ))
+        return grouped
 
     def _legacy_chunk_id_from_payload(self, payload: dict) -> str:
-        """
-        Reconstruct the old chunk ID format for points indexed before chunk_id
-        was stored in payload.
-
-        payload: dict — Stored Qdrant payload.
-        Returns: str — Legacy chunk ID string.
-        """
         parent_str = f":{payload.get('parent')}" if payload.get("parent") else ""
         return f"{payload['file_path']}:{payload['symbol_name']}:{payload['symbol_kind']}{parent_str}"

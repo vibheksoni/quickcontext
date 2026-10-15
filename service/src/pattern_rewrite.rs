@@ -2,16 +2,11 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use ignore::WalkBuilder;
 use tree_sitter::Parser;
 
-use crate::lang::{self, LanguageSpec};
-use crate::pattern_match::{parse_pattern, find_matches_in_tree, MatchEnv, PatternNode};
+use crate::lang::LanguageSpec;
+use crate::pattern_match::{collect_files, find_matches_in_tree, parse_pattern, MatchEnv, PatternNode};
 use crate::types::{RewriteEdit, RewriteFileResult, RewriteResult};
-
-
-const QUICK_IGNORE_FILENAME: &str = ".quick-ignore";
-const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
 
 fn substitute_template(template: &str, env: &MatchEnv) -> String {
@@ -25,15 +20,15 @@ fn substitute_template(template: &str, env: &MatchEnv) -> String {
             let rest = &chars[i + 1..];
 
             if rest.starts_with(&['$', '$']) {
-                let name_start = 3;
+                let name_start = 2;
                 let name_end = name_start
-                    + rest[3..]
+                    + rest[name_start..]
                         .iter()
                         .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || **c == '_')
                         .count();
 
                 if name_end > name_start {
-                    let name: String = rest[3..name_end].iter().collect();
+                    let name: String = rest[name_start..name_end].iter().collect();
                     if let Some(texts) = env.multis.get(&name) {
                         result.push_str(&texts.join(", "));
                         i += 1 + name_end;
@@ -127,7 +122,7 @@ fn rewrite_file(
         });
     }
 
-    edits.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
     edits
 }
 
@@ -237,59 +232,23 @@ pub fn pattern_rewrite(
 }
 
 
-fn collect_files(
-    root: &Path,
-    respect_gitignore: bool,
-    lang_lower: &str,
-    specs: &[LanguageSpec],
-) -> Vec<(String, String)> {
-    if root.is_file() {
-        let path_str = root.to_string_lossy().to_string();
-        let detected = lang::detect_language(&path_str, specs);
-        if let Some(spec) = detected {
-            if spec.name.to_lowercase() == *lang_lower {
-                return vec![(path_str, spec.name.to_string())];
-            }
-        }
-        return Vec::new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substitute_template_expands_ellipsis_capture() {
+        let mut env = MatchEnv::default();
+        env.multis.insert("ARGS".to_string(), vec!["a".to_string(), "b".to_string()]);
+        env.singles.insert("NAME".to_string(), "f".to_string());
+        assert_eq!(substitute_template("$NAME($$$ARGS)", &env), "f(a, b)");
     }
 
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true)
-        .add_custom_ignore_filename(QUICK_IGNORE_FILENAME)
-        .threads(std::thread::available_parallelism().map_or(4, usize::from));
-
-    if !respect_gitignore {
-        builder.git_ignore(false).git_global(false).git_exclude(false);
+    #[test]
+    fn substitute_template_handles_trailing_ellipsis() {
+        let env = MatchEnv::default();
+        assert_eq!(substitute_template("call($$$", &env), "call($$$");
+        assert_eq!(substitute_template("$$$", &env), "$$$");
     }
-
-    let mut entries = Vec::new();
-
-    for entry in builder.build() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
-
-        if let Some(meta) = entry.metadata().ok() {
-            if meta.len() > MAX_FILE_SIZE {
-                continue;
-            }
-        }
-
-        let path_str = entry.path().to_string_lossy().to_string();
-        let detected = lang::detect_language(&path_str, specs);
-        if let Some(spec) = detected {
-            if spec.name.to_lowercase() == *lang_lower {
-                entries.push((path_str, spec.name.to_string()));
-            }
-        }
-    }
-
-    entries
 }

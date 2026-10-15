@@ -1,74 +1,73 @@
 # Low Memory and Hardware Setup Guide
 
-QuickContext is designed by default to maximize resource utilization to index your codebase as quickly as possible. It uses parallel workers and an **adaptive batching** mechanism that detects hardware speed and automatically scales batch sizes up to `128`. 
+Most indexing memory goes to the local embedding model (`fastembed`): its activations grow with
+`batch_size` and with input length. Remote (`litellm`) embeddings use almost no local memory
+beyond the vector store itself.
 
-When running local models via `fastembed`, this aggressive scaling can easily consume upwards of 5GB+ of system memory, leading to potential Out-Of-Memory (OOM) kills on constrained environments.
+If you are running on a machine with limited RAM, restrict memory usage through `quickcontext.json`.
 
-If you are running on a machine with limited RAM, you can rigidly restrict memory usage through `quickcontext.json`.
+## 1. Use Small Local Batches
 
-## 1. Disable Adaptive Batching
-
-Adaptive batching will dynamically override your `batch_size` flag if it thinks the system is fast enough. You must explicitly disable it via the JSON config to keep RAM usage predictable. 
-
-Lock your batch limits for both code and description embeddings tightly (e.g., `8` or `16`):
+For `fastembed`, `batch_size` sets how many inputs go through the model at once. Inputs are
+already sorted by length, so small batches stay efficient. Use `8` or `16` on constrained machines
+and keep `device` on `cpu` (a GPU device raises the batch size to at least 64):
 
 ```json
 "code_embedding": {
-  "adaptive_batching": false,
+  "provider": "fastembed",
   "batch_size": 8,
-  "max_batch_size": 8
+  "device": "cpu"
 }
 ```
 
-## 2. Reduce Parallelism (Concurrency)
+## 2. Cap Input Length
 
-QuickContext uses multiple background threads for generating the vector embeddings and another set of threads for pushing data points into the Qdrant database.
+`max_input_tokens` truncates each input before embedding. Activation memory and time grow with
+input length, so `256` cuts both, at a small recall cost (see
+[embeddings.md](embeddings.md#input-truncation) for measured numbers).
 
-Lowering the thread pool size limits memory allocations:
+For remote embeddings, `concurrency` is the number of requests in flight. Lower it if your
+provider rate-limits you; it has little effect on local memory.
 
-- `concurrency`: Controls the number of parallel workers generating embeddings.
-- `upsert_concurrency`: Controls the number of concurrent writes to the database.
+## 3. Size The Vector Store
 
-## 3. Tune Qdrant Docker Allocations
+The vector store has no separate server process. Its memory cost is the in-memory
+matrices of the collections you query:
 
-The default `docker-compose.yml` pre-allocates up to `4G` for Qdrant. If you're managing a small-to-medium codebase, you can restrict Qdrant's container to less memory within `docker-compose.yml`:
-
-```yaml
-    deploy:
-      resources:
-        limits:
-          memory: 2G
+```text
+points x (code dimension + description dimension) x 4 bytes
 ```
+
+For example, 20k chunks with 768 + 384 dimensions use about 92 MB, while 4096 + 4096
+dimensions use about 655 MB. To keep memory low:
+
+- prefer smaller embedding models (dimension is the main lever)
+- lower `store.max_cached_collections` so fewer collections stay resident
+- lower `store.upsert_batch_size` to reduce peak memory while indexing
 
 ---
 
 ## Example: Conservative `quickcontext.json`
 
-Here is a full configuration snippet designed to run on constrained machines. It disables automatic scaling and forces strict, single-threaded processing and small chunk batches.
-
 ```json
 {
-  "qdrant": {
-    "host": "localhost",
-    "port": 6333,
-    "upsert_batch_size": 50,
-    "upsert_concurrency": 1
+  "store": {
+    "upsert_batch_size": 64,
+    "max_cached_collections": 1
   },
   "code_embedding": {
     "provider": "fastembed",
-    "adaptive_batching": false,
     "batch_size": 8,
-    "max_batch_size": 8,
-    "concurrency": 1
+    "device": "cpu",
+    "max_input_tokens": 256
   },
   "desc_embedding": {
     "provider": "fastembed",
-    "adaptive_batching": false,
     "batch_size": 8,
-    "max_batch_size": 8,
-    "concurrency": 1
+    "device": "cpu",
+    "max_input_tokens": 256
   }
 }
 ```
 
-> **Performance Trade-off**: Enforcing these low memory limits will completely resolve the massive RAM hoarding/OOM kills, but your initial repository indexing phase will take noticeably longer to complete.
+> **Trade-off**: These limits keep peak memory low. Small batches make indexing a little slower, and the 256-token cap costs a little recall (it also makes indexing faster). Drop `max_input_tokens` if recall matters more than memory.

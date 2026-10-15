@@ -1,562 +1,244 @@
 import re
 
-from qdrant_client import QdrantClient, models
+from engine.src.config import EngineConfig
+from engine.src.vector_store import CollectionInfo, VectorStore
 
-from engine.src.config import EngineConfig, CollectionVectorConfig
-
-
-_DISTANCE_MAP = {
-    "cosine": models.Distance.COSINE,
-    "euclid": models.Distance.EUCLID,
-    "dot": models.Distance.DOT,
-}
 
 _VERSION_SUFFIX_RE = re.compile(r"^(.+)_v(\d+)$")
 
 
 class CollectionManager:
     """
-    Manages Qdrant collection lifecycle with alias-based snapshot isolation.
+    Manages a project's code collections with alias-based snapshot isolation.
 
     Collections use versioned names ({project}_v1, {project}_v2, ...) with an
     alias ({project}) pointing to the active version. Searches and reads go
     through the alias. Full re-indexes build a shadow collection and atomically
     swap the alias on completion.
 
-    _client: QdrantClient — Active Qdrant client.
+    _store: VectorStore — Embedded vector store.
     _config: EngineConfig — Engine configuration with vector specs.
     _collection_name: str — Logical project name (used as alias).
     """
 
-    def __init__(self, client: QdrantClient, config: EngineConfig, collection_name: str):
+    def __init__(self, store: VectorStore, config: EngineConfig, collection_name: str):
         """
-        client: QdrantClient — Connected Qdrant client.
+        store: VectorStore — Open vector store.
         config: EngineConfig — Engine config containing vector settings.
         collection_name: str — Logical project name (used as alias target).
         """
-        self._client = client
+        self._store = store
         self._config = config
         self._collection_name = collection_name
 
     @property
-    def client(self) -> QdrantClient:
+    def store(self) -> VectorStore:
         """
-        Returns: QdrantClient — Active Qdrant client.
+        Returns: VectorStore — Backing store.
         """
-        return self._client
+        return self._store
 
     @property
     def collection_name(self) -> str:
         """
-        Returns: str — Target collection name.
+        Returns: str — Logical project name.
         """
         return self._collection_name
 
-    def _build_vectors_config(self) -> dict[str, models.VectorParams]:
-        """
-        Build named vector config dict from EngineConfig.vectors.
+    def _versions(self) -> list[tuple[int, str]]:
+        prefix = self._collection_name + "_v"
+        versions = []
+        for info in self._store.list_collections():
+            suffix = info.name[len(prefix):] if info.name.startswith(prefix) else ""
+            if suffix.isdigit():
+                versions.append((int(suffix), info.name))
+        return sorted(versions)
 
-        Returns: dict[str, VectorParams] — Map of vector name to params.
+    def collection_exists(self, name: str) -> bool:
         """
-        vectors = {}
-        for vec in self._config.vectors:
-            distance = _DISTANCE_MAP.get(vec.distance)
-            if distance is None:
-                raise ValueError(
-                    f"Unknown distance metric: {vec.distance!r}. "
-                    f"Supported: {list(_DISTANCE_MAP.keys())}"
-                )
-            vectors[vec.name] = models.VectorParams(
-                size=vec.dimension,
-                distance=distance,
-            )
-        return vectors
+        Return True if a real collection with this name exists.
+        """
+        return self._store.collection_exists(name)
 
-    def _collection_exists(self, name: str) -> bool:
+    def delete_collection(self, name: str) -> bool:
         """
-        Check if a specific collection name exists in Qdrant.
-
-        name: str — Collection name to check.
-        Returns: bool — True if collection exists.
+        Delete one real collection by name.
         """
-        try:
-            self._client.get_collection(name)
-            return True
-        except Exception:
-            return False
+        return self._store.delete_collection(name)
 
     def resolve_alias(self) -> str | None:
         """
-        Resolve the alias to its underlying real collection name.
-
-        Returns: str | None — Real collection name, or None if alias doesn't exist.
+        Returns: str | None — Real collection the project alias points to, if any.
         """
-        try:
-            aliases = self._client.get_collection_aliases(self._collection_name)
-            for alias in aliases.aliases:
-                if alias.alias_name == self._collection_name:
-                    return alias.collection_name
-        except Exception:
-            pass
-
-        all_aliases = self._client.get_aliases()
-        for alias in all_aliases.aliases:
-            if alias.alias_name == self._collection_name:
-                return alias.collection_name
-        return None
+        return self._store.get_alias(self._collection_name)
 
     def active_collection(self) -> str:
         """
-        Get the real collection name that the alias currently points to.
-        Falls back to the logical name if no alias exists (legacy mode).
-
-        Returns: str — Real collection name backing the alias.
+        Returns: str — Real collection backing the alias, falling back to the logical name.
         """
-        resolved = self.resolve_alias()
-        if resolved is not None:
-            return resolved
-        if self._collection_exists(self._collection_name):
-            return self._collection_name
-        return self._collection_name
-
-    def _next_version(self) -> int:
-        """
-        Determine the next version number for a shadow collection.
-        Scans existing {project}_v{N} collections and returns max(N) + 1.
-
-        Returns: int — Next version number (starts at 1).
-        """
-        prefix = self._collection_name + "_v"
-        max_version = 0
-        collections = self._client.get_collections().collections
-        for col in collections:
-            if col.name.startswith(prefix):
-                suffix = col.name[len(prefix):]
-                if suffix.isdigit():
-                    max_version = max(max_version, int(suffix))
-        return max_version + 1
-
-    def _latest_versioned_collection(self) -> str | None:
-        """
-        Find the highest existing versioned collection for this project.
-
-        Returns: str | None — Latest versioned collection name, if any.
-        """
-        prefix = self._collection_name + "_v"
-        latest_name = None
-        latest_version = -1
-
-        collections = self._client.get_collections().collections
-        for col in collections:
-            if not col.name.startswith(prefix):
-                continue
-            suffix = col.name[len(prefix):]
-            if not suffix.isdigit():
-                continue
-            version = int(suffix)
-            if version > latest_version:
-                latest_version = version
-                latest_name = col.name
-
-        return latest_name
+        return self.resolve_alias() or self._collection_name
 
     def exists(self) -> bool:
         """
-        Check if the project has an active collection (via alias or direct name).
-
-        Returns: bool — True if a usable collection exists.
+        Returns: bool — True if the project has an alias or any versioned collection.
         """
         if self.resolve_alias() is not None:
             return True
-        if self._latest_versioned_collection() is not None:
+        if self._versions():
             return True
-        return self._collection_exists(self._collection_name)
+        return self._store.collection_exists(self._collection_name)
 
     def _create_versioned(self, version_name: str) -> None:
-        """
-        Create a versioned collection with vector config and payload indexes.
-
-        version_name: str — Full versioned collection name (e.g., "project_v1").
-        """
-        self._client.create_collection(
-            collection_name=version_name,
-            vectors_config=self._build_vectors_config(),
-        )
-        self._create_payload_indexes_for(version_name)
+        self._store.create_collection(version_name, self._config.vectors, kind="code", text_field="source")
 
     def create(self) -> bool:
         """
-        Create the collection with alias-based versioning.
-        Creates {project}_v1 and points alias {project} to it.
-        No-op if alias or collection already exists.
+        Create {project}_v1 and point the alias at it. No-op if the project exists.
 
-        Returns: bool — True if created, False if already existed.
+        Returns: bool — True if created.
         """
         if self.exists():
             return False
-
         version_name = f"{self._collection_name}_v1"
         self._create_versioned(version_name)
-
-        self._client.update_collection_aliases(
-            change_aliases_operations=[
-                models.CreateAliasOperation(
-                    create_alias=models.CreateAlias(
-                        collection_name=version_name,
-                        alias_name=self._collection_name,
-                    )
-                )
-            ]
-        )
+        self._store.set_alias(self._collection_name, version_name)
         return True
 
     def ensure(self) -> bool:
         """
-        Ensure the project has an active collection with alias.
-        Migrates legacy (non-aliased) collections to the alias scheme.
+        Ensure the project alias points at a collection, adopting the newest
+        versioned collection when the alias is missing.
 
-        Returns: bool — True if collection was created or migrated, False if already set up.
+        Returns: bool — True if anything was created or re-pointed.
         """
         if self.resolve_alias() is not None:
             return False
-
-        latest_versioned = self._latest_versioned_collection()
-        if latest_versioned is not None:
-            self._client.update_collection_aliases(
-                change_aliases_operations=[
-                    models.CreateAliasOperation(
-                        create_alias=models.CreateAlias(
-                            collection_name=latest_versioned,
-                            alias_name=self._collection_name,
-                        )
-                    )
-                ]
-            )
+        versions = self._versions()
+        if versions:
+            self._store.set_alias(self._collection_name, versions[-1][1])
             return True
-
-        if self._collection_exists(self._collection_name):
-            self._migrate_legacy()
-            return True
-
         return self.create()
 
-    def _create_payload_indexes_for(self, collection_name: str) -> None:
+    def vectors_match_config(self, name: str | None = None) -> bool:
         """
-        Create payload field indexes on a specific collection.
-
-        collection_name: str — Target collection name.
+        Return True when a collection's vector spaces match the configured ones.
         """
-        keyword_fields = [
-            "language",
-            "file_path",
-            "symbol_kind",
-            "symbol_type",
-            "symbol_name",
-            "path_prefixes",
-        ]
-        for field_name in keyword_fields:
-            self._client.create_payload_index(
-                collection_name=collection_name,
-                field_name=field_name,
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-
-    def _migrate_legacy(self) -> None:
-        """
-        Migrate a legacy collection (no alias) to the versioned alias scheme.
-        Renames {project} data into {project}_v1 by creating v1, copying points,
-        deleting old, and creating alias.
-
-        Qdrant has no rename API, so we create a new collection, scroll+upsert
-        all points, delete the old one, then create the alias.
-        """
-        old_name = self._collection_name
-        new_name = f"{self._collection_name}_v1"
-
-        self._create_versioned(new_name)
-
-        offset = None
-        batch_size = 100
-        while True:
-            records, next_offset = self._client.scroll(
-                collection_name=old_name,
-                limit=batch_size,
-                offset=offset,
-                with_payload=True,
-                with_vectors=True,
-            )
-            if not records:
-                break
-
-            points = []
-            for record in records:
-                points.append(models.PointStruct(
-                    id=record.id,
-                    vector=record.vector,
-                    payload=record.payload,
-                ))
-
-            if points:
-                self._client.upsert(
-                    collection_name=new_name,
-                    points=points,
-                    wait=True,
-                )
-
-            if next_offset is None:
-                break
-            offset = next_offset
-
-        self._client.delete_collection(old_name)
-
-        self._client.update_collection_aliases(
-            change_aliases_operations=[
-                models.CreateAliasOperation(
-                    create_alias=models.CreateAlias(
-                        collection_name=new_name,
-                        alias_name=self._collection_name,
-                    )
-                )
-            ]
-        )
+        info = self._store.get_collection(name or self._collection_name, with_count=False)
+        if info is None:
+            return True
+        return tuple(info.vectors) == tuple(self._config.vectors)
 
     def create_shadow(self) -> str:
         """
-        Create a new empty shadow collection for atomic re-indexing.
-        Does NOT touch the alias — caller populates the shadow, then calls swap_alias().
+        Create a new empty versioned collection for atomic re-indexing.
+        The alias is untouched until swap_alias().
 
-        Returns: str — Name of the new shadow collection (e.g., "project_v3").
+        Returns: str — Shadow collection name.
         """
-        version = self._next_version()
-        shadow_name = f"{self._collection_name}_v{version}"
+        versions = self._versions()
+        next_version = (versions[-1][0] + 1) if versions else 1
+        shadow_name = f"{self._collection_name}_v{next_version}"
         self._create_versioned(shadow_name)
         return shadow_name
 
-    def copy_points(self, source_collection: str, target_collection: str, batch_size: int = 256) -> int:
+    def copy_points(self, source_collection: str, target_collection: str) -> int:
         """
         Copy all points from one collection into another.
 
-        source_collection: str — Existing collection to read from.
-        target_collection: str — Empty collection to write into.
-        batch_size: int — Scroll and upsert batch size.
         Returns: int — Number of copied points.
         """
-        copied = 0
-        offset = None
-
-        while True:
-            records, next_offset = self._client.scroll(
-                collection_name=source_collection,
-                limit=max(1, int(batch_size)),
-                offset=offset,
-                with_payload=True,
-                with_vectors=True,
-            )
-            if not records:
-                break
-
-            points = [
-                models.PointStruct(
-                    id=record.id,
-                    vector=record.vector,
-                    payload=record.payload,
-                )
-                for record in records
-            ]
-
-            self._client.upsert(
-                collection_name=target_collection,
-                points=points,
-                wait=True,
-            )
-            copied += len(points)
-
-            if next_offset is None:
-                break
-            offset = next_offset
-
-        return copied
+        return self._store.copy_points(source_collection, target_collection)
 
     def swap_alias(self, new_collection: str) -> str | None:
         """
-        Atomically swap the alias to point to a new collection.
-        Returns the old collection name so the caller can delete it.
+        Atomically point the alias at new_collection.
 
-        new_collection: str — Versioned collection name to swap to.
-        Returns: str | None — Previous collection name (for cleanup), or None if no prior alias.
+        Returns: str | None — Previous target, for cleanup.
         """
-        old_collection = self.resolve_alias()
-
-        ops: list = []
-        if old_collection is not None:
-            ops.append(
-                models.DeleteAliasOperation(
-                    delete_alias=models.DeleteAlias(
-                        alias_name=self._collection_name,
-                    )
-                )
-            )
-
-        ops.append(
-            models.CreateAliasOperation(
-                create_alias=models.CreateAlias(
-                    collection_name=new_collection,
-                    alias_name=self._collection_name,
-                )
-            )
-        )
-
-        self._client.update_collection_aliases(
-            change_aliases_operations=ops,
-        )
-        return old_collection
+        return self._store.set_alias(self._collection_name, new_collection)
 
     def cleanup_old_versions(self, keep_current: bool = True) -> list[str]:
         """
-        Delete all versioned collections except the one the alias points to.
+        Delete versioned collections other than the active one.
 
-        keep_current: bool — If True, preserve the active version. If False, delete everything.
-        Returns: list[str] — Names of deleted collections.
+        keep_current: bool — When False, delete every version.
+        Returns: list[str] — Deleted collection names.
         """
         current = self.resolve_alias() if keep_current else None
-        prefix = self._collection_name + "_v"
         deleted = []
-
-        collections = self._client.get_collections().collections
-        for col in collections:
-            if col.name.startswith(prefix) and col.name != current:
-                suffix = col.name[len(prefix):]
-                if suffix.isdigit():
-                    self._client.delete_collection(col.name)
-                    deleted.append(col.name)
-
+        for _, name in self._versions():
+            if name != current and self._store.delete_collection(name):
+                deleted.append(name)
         return deleted
 
     def delete(self) -> bool:
         """
-        Delete the project: remove alias and all versioned collections.
+        Delete the alias and every versioned collection for the project.
 
-        Returns: bool — True if anything was deleted, False if nothing existed.
+        Returns: bool — True if anything existed.
         """
         if not self.exists():
             return False
-
-        resolved = self.resolve_alias()
-        if resolved is not None:
-            self._client.update_collection_aliases(
-                change_aliases_operations=[
-                    models.DeleteAliasOperation(
-                        delete_alias=models.DeleteAlias(
-                            alias_name=self._collection_name,
-                        )
-                    )
-                ]
-            )
-
+        self._store.delete_alias(self._collection_name)
         self.cleanup_old_versions(keep_current=False)
-
-        if self._collection_exists(self._collection_name):
-            self._client.delete_collection(self._collection_name)
-
+        if self._store.collection_exists(self._collection_name):
+            self._store.delete_collection(self._collection_name)
         return True
 
     def info(self) -> dict:
         """
-        Get collection info via the alias (or direct name for legacy).
-
-        Returns: dict — Collection metadata including alias and real collection name.
-        Raises: Exception — If collection doesn't exist.
+        Returns: dict — Metadata for the active collection.
+        Raises: KeyError — If the project has no collection.
         """
-        real_name = self.active_collection()
-        collection = self._client.get_collection(self._collection_name)
-        return {
-            "name": self._collection_name,
-            "real_collection": real_name,
-            "points_count": collection.points_count or 0,
-            "indexed_vectors_count": collection.indexed_vectors_count or 0,
-            "segments_count": collection.segments_count,
-            "status": collection.status.value,
-            "vectors": {
-                name: {
-                    "size": params.size,
-                    "distance": params.distance.value,
-                }
-                for name, params in (collection.config.params.vectors or {}).items()
-            },
-        }
+        info = self._store.get_collection(self._collection_name)
+        if info is None:
+            raise KeyError(f"Collection not found: {self._collection_name}")
+        return info.to_dict(alias=self._collection_name)
 
     def list_all_projects(self) -> list[dict]:
         """
-        List all projects by scanning aliases. Filters out raw versioned
-        collections that are backing an alias (avoids double-counting).
+        List code projects by alias, plus standalone non-versioned collections.
 
-        Returns: list[dict] — List of project metadata dicts.
+        Returns: list[dict] — Project metadata dicts.
         """
-        all_aliases = self._client.get_aliases()
-        alias_map: dict[str, str] = {}
-        backing_collections: set[str] = set()
-        for alias in all_aliases.aliases:
-            alias_map[alias.alias_name] = alias.collection_name
-            backing_collections.add(alias.collection_name)
+        return list_projects(self._store)
 
-        result = []
 
-        for alias_name, real_name in sorted(alias_map.items()):
-            try:
-                info = self._client.get_collection(alias_name)
-                result.append({
-                    "name": alias_name,
-                    "real_collection": real_name,
-                    "points_count": info.points_count or 0,
-                    "status": info.status.value,
-                    "vectors": {
-                        name: {
-                            "size": params.size,
-                            "distance": params.distance.value,
-                        }
-                        for name, params in (info.config.params.vectors or {}).items()
-                    },
-                })
-            except Exception:
-                result.append({
-                    "name": alias_name,
-                    "real_collection": real_name,
-                    "points_count": 0,
-                    "status": "unknown",
-                    "vectors": {},
-                })
+def list_projects(store: VectorStore, kind: str | None = "code") -> list[dict]:
+    """
+    List logical projects in a store: aliased collections first, then any
+    standalone collection that is neither an alias target nor a stray version.
+    """
+    aliases = store.list_aliases()
+    by_name: dict[str, CollectionInfo] = {info.name: info for info in store.list_collections()}
+    backing = set(aliases.values())
+    result = []
 
-        collections = self._client.get_collections().collections
-        for col in collections:
-            if col.name in backing_collections:
-                continue
-            if col.name in alias_map:
-                continue
-            match = _VERSION_SUFFIX_RE.match(col.name)
-            if match:
-                continue
-            try:
-                info = self._client.get_collection(col.name)
-                result.append({
-                    "name": col.name,
-                    "real_collection": col.name,
-                    "points_count": info.points_count or 0,
-                    "status": info.status.value,
-                    "vectors": {
-                        name: {
-                            "size": params.size,
-                            "distance": params.distance.value,
-                        }
-                        for name, params in (info.config.params.vectors or {}).items()
-                    },
-                })
-            except Exception:
-                result.append({
-                    "name": col.name,
-                    "real_collection": col.name,
-                    "points_count": 0,
-                    "status": "unknown",
-                    "vectors": {},
-                })
+    for alias_name, real_name in sorted(aliases.items()):
+        info = by_name.get(real_name)
+        if info is None:
+            continue
+        if kind is not None and info.kind != kind:
+            continue
+        result.append(info.to_dict(alias=alias_name))
 
-        return result
+    for name, info in sorted(by_name.items()):
+        if name in backing or name in aliases or _VERSION_SUFFIX_RE.match(name):
+            continue
+        if kind is not None and info.kind != kind:
+            continue
+        result.append(info.to_dict())
+
+    return result
+
+
+def orphaned_versions(store: VectorStore) -> list[str]:
+    """
+    Return versioned collections ({name}_vN) that no alias points to.
+    """
+    targets = set(store.list_aliases().values())
+    return [
+        info.name
+        for info in store.list_collections()
+        if info.name not in targets and _VERSION_SUFFIX_RE.match(info.name)
+    ]

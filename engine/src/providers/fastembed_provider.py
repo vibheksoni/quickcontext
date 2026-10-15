@@ -5,16 +5,6 @@ from engine.src.config import EmbeddingConfig
 from engine.src.providers.base import EmbeddingProvider
 
 
-def _get_fastembed_class():
-    """
-    Lazy-import fastembed TextEmbedding.
-
-    Returns: type — The TextEmbedding class.
-    """
-    from fastembed import TextEmbedding
-    return TextEmbedding
-
-
 class FastEmbedProvider(EmbeddingProvider):
     """
     Local ONNX-based embedding provider via fastembed.
@@ -29,6 +19,7 @@ class FastEmbedProvider(EmbeddingProvider):
         """
         super().__init__(config)
         self._model = None
+        self._device = "cpu"
 
     def _ensure_model(self):
         """
@@ -37,9 +28,22 @@ class FastEmbedProvider(EmbeddingProvider):
         Returns: TextEmbedding — Loaded model instance.
         """
         if self._model is None:
-            cls = _get_fastembed_class()
-            self._model = cls(model_name=self._config.model)
+            from engine.src.providers.local_models import get_local_model
+
+            self._model, self._device = get_local_model(
+                self._config.model,
+                device=self._config.device,
+                max_input_tokens=self._config.max_input_tokens,
+            )
         return self._model
+
+    @property
+    def device(self) -> str:
+        """
+        Returns: str — Resolved execution device ("cpu", "cuda", or "directml").
+        """
+        self._ensure_model()
+        return self._device
 
     def embed(self, texts: Sequence[str]) -> list[np.ndarray]:
         """
@@ -48,11 +52,11 @@ class FastEmbedProvider(EmbeddingProvider):
         texts: Sequence[str] — Input text strings.
         Returns: list[np.ndarray] — One embedding vector per input text.
         """
+        from engine.src.embedder import embed_length_sorted
+        from engine.src.providers.local_models import effective_batch_size
+
         model = self._ensure_model()
-        return list(model.embed(
-            documents=list(texts),
-            batch_size=self._config.batch_size,
-        ))
+        return embed_length_sorted(model, list(texts), effective_batch_size(self._config.batch_size, self._device))
 
     def embed_single(self, text: str) -> np.ndarray:
         """

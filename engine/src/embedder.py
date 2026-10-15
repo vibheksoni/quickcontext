@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 import random
 from threading import Lock
 import time
@@ -28,17 +29,6 @@ def _get_litellm():
     return litellm
 
 
-def _get_fastembed_class():
-    """
-    Lazy-import fastembed TextEmbedding class.
-
-    Returns: type — The TextEmbedding class.
-    Raises: ImportError — If fastembed is not installed.
-    """
-    from fastembed import TextEmbedding
-    return TextEmbedding
-
-
 @dataclass(frozen=True, slots=True)
 class EmbeddedChunk:
     """
@@ -58,6 +48,79 @@ class EmbeddedChunk:
     chunk: CodeChunk
     description: ChunkDescription
     embedding_cost_usd: float = 0.0
+
+
+def embed_length_sorted(model, texts: list[str], batch_size: int) -> list:
+    """
+    Embed texts with a local model in length-sorted batches, returning vectors in
+    input order.
+
+    Each batch is padded to its longest member, so mixing short and long inputs
+    wastes most of the compute; sorting by length first produced identical vectors
+    about 2x faster on real code chunks.
+    """
+    order = sorted(range(len(texts)), key=lambda idx: len(texts[idx]))
+    embedded = list(model.embed([texts[idx] for idx in order], batch_size=max(1, int(batch_size))))
+    vectors: list = [None] * len(texts)
+    for position, idx in enumerate(order):
+        vectors[idx] = embedded[position]
+    return vectors
+
+
+REMOTE_TOKENS_PER_SLOT = 512
+REMOTE_MIN_TOKEN_BUDGET = 2048
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Cheap token estimate for request packing (about 4 characters per token).
+    """
+    return len(text) // 4 + 1
+
+
+def plan_remote_batches(texts: list[str], batch_size: int, token_budget: Optional[int]) -> list[list[int]]:
+    """
+    Group text indexes into embedding requests, longest texts first.
+
+    Each request holds at most batch_size texts and, when token_budget is set, at
+    most that many estimated tokens (a single oversized text still gets its own
+    request). Scheduling the heaviest requests first and keeping request sizes
+    even avoids slow stragglers at the end of a parallel run.
+    """
+    order = sorted(range(len(texts)), key=lambda idx: len(texts[idx]), reverse=True)
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_tokens = 0
+    for idx in order:
+        tokens = estimate_tokens(texts[idx])
+        too_many = len(current) >= max(1, batch_size)
+        too_heavy = token_budget is not None and current and current_tokens + tokens > token_budget
+        if current and (too_many or too_heavy):
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(idx)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def contextual_code_text(chunk: CodeChunk) -> str:
+    """
+    Situate a code chunk before embedding: a short comment header with the
+    trailing file path and qualified symbol name. A deterministic, zero-cost
+    variant of contextual retrieval; chunks embedded in isolation otherwise
+    lose which file and class they belong to.
+    """
+    parts = [part for part in Path(str(chunk.file_path).replace("\\\\?\\", "")).parts if part not in ("", "/", "\\")]
+    lines = [f"// file: {'/'.join(parts[-4:])}"] if parts else []
+    kind = (chunk.symbol_kind or "").strip()
+    if kind and kind != "file_artifact" and chunk.symbol_name:
+        qualified = f"{chunk.parent}.{chunk.symbol_name}" if chunk.parent else chunk.symbol_name
+        lines.append(f"// {kind}: {qualified}")
+    if not lines:
+        return chunk.source
+    return "\n".join(lines) + "\n" + (chunk.source or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,8 +249,8 @@ class DualEmbedder:
         desc_adaptive_batching: bool = True,
         code_adaptive_target_latency_ms: int = 1500,
         desc_adaptive_target_latency_ms: int = 1500,
-        code_concurrency: int = 4,
-        desc_concurrency: int = 4,
+        code_concurrency: int = 16,
+        desc_concurrency: int = 16,
         code_max_retries: int = 3,
         desc_max_retries: int = 3,
         code_retry_base_delay_ms: int = 250,
@@ -198,6 +261,11 @@ class DualEmbedder:
         desc_request_timeout_seconds: Optional[float] = None,
         code_openrouter_provider: Optional[str] = None,
         desc_openrouter_provider: Optional[str] = None,
+        code_contextual_header: bool = True,
+        code_device: str = "auto",
+        desc_device: str = "auto",
+        code_max_input_tokens: Optional[int] = None,
+        desc_max_input_tokens: Optional[int] = None,
     ):
         """
         Args:
@@ -233,7 +301,13 @@ class DualEmbedder:
             desc_request_timeout_seconds: Optional per-request timeout for description embeddings
             code_openrouter_provider: Force specific OpenRouter upstream for code embeddings
             desc_openrouter_provider: Force specific OpenRouter upstream for description embeddings
+            code_contextual_header: Prepend a file/symbol header to code before embedding
+            code_device: Local execution device for code embeddings (auto/cpu/gpu/cuda/directml)
+            desc_device: Local execution device for description embeddings
+            code_max_input_tokens: Optional token cap for local code embedding inputs
+            desc_max_input_tokens: Optional token cap for local description embedding inputs
         """
+        self._code_contextual_header = code_contextual_header
         self._code_provider = code_provider
         self._code_model = code_model
         self._code_dimension = code_dimension
@@ -275,13 +349,28 @@ class DualEmbedder:
             description=EmbeddingProviderStats(0, 0, 0, 0, 0.0),
         )
 
-        if code_provider == "fastembed":
-            cls = _get_fastembed_class()
-            self._code_embedder = cls(code_model)
+        self._code_device = "cpu"
+        self._desc_device = "cpu"
+        if code_provider == "fastembed" or desc_provider == "fastembed":
+            from engine.src.providers.local_models import get_local_model
 
-        if desc_provider == "fastembed":
-            cls = _get_fastembed_class()
-            self._desc_embedder = cls(desc_model)
+            if code_provider == "fastembed":
+                self._code_embedder, self._code_device = get_local_model(code_model, code_device, code_max_input_tokens)
+            if desc_provider == "fastembed":
+                self._desc_embedder, self._desc_device = get_local_model(desc_model, desc_device, desc_max_input_tokens)
+
+    @staticmethod
+    def _local_batch(batch_size: int, device: str) -> int:
+        from engine.src.providers.local_models import effective_batch_size
+
+        return effective_batch_size(batch_size, device)
+
+    @property
+    def devices(self) -> dict[str, str]:
+        """
+        devices: dict[str, str] — Resolved local execution device per vector space.
+        """
+        return {"code": self._code_device, "description": self._desc_device}
 
     @property
     def last_run_stats(self) -> EmbeddingRunStats:
@@ -319,7 +408,10 @@ class DualEmbedder:
 
         desc_map = {desc.chunk_id: desc for desc in descriptions}
 
-        code_texts = [chunk.source for chunk in chunks]
+        code_texts = [
+            contextual_code_text(chunk) if self._code_contextual_header else chunk.source
+            for chunk in chunks
+        ]
         desc_texts = [desc_map[chunk.chunk_id].description for chunk in chunks]
         progress_state = {"code": 0, "description": 0}
         progress_lock = Lock() if self._code_provider == "litellm" or self._desc_provider == "litellm" else None
@@ -417,7 +509,7 @@ class DualEmbedder:
             Tuple of (code vectors, cost in USD, provider stats)
         """
         if self._code_provider == "fastembed":
-            vectors, stats = self._embed_fastembed(texts, self._code_embedder, self._code_batch_size, progress_callback=progress_callback)
+            vectors, stats = self._embed_fastembed(texts, self._code_embedder, self._local_batch(self._code_batch_size, self._code_device), progress_callback=progress_callback)
             return vectors, 0.0, stats
         if self._code_provider == "litellm":
             return self._embed_litellm(
@@ -467,7 +559,7 @@ class DualEmbedder:
             Tuple of (description vectors, cost in USD, provider stats)
         """
         if self._desc_provider == "fastembed":
-            vectors, stats = self._embed_fastembed(texts, self._desc_embedder, self._desc_batch_size, progress_callback=progress_callback)
+            vectors, stats = self._embed_fastembed(texts, self._desc_embedder, self._local_batch(self._desc_batch_size, self._desc_device), progress_callback=progress_callback)
             return vectors, 0.0, stats
         if self._desc_provider == "litellm":
             return self._embed_litellm(
@@ -516,8 +608,7 @@ class DualEmbedder:
         if not texts:
             return [], EmbeddingProviderStats(0, 0, 0, 0, 0.0)
 
-        embeddings = list(embedder.embed(texts, batch_size=max(1, int(batch_size))))
-        vectors = [emb.tolist() for emb in embeddings]
+        vectors = [emb.tolist() for emb in embed_length_sorted(embedder, texts, batch_size)]
         duration = time.time() - started
         if progress_callback is not None:
             progress_callback(len(texts), len(texts))
@@ -580,81 +671,56 @@ class DualEmbedder:
         effective_min_batch = max(1, int(min_batch_size))
         effective_max_batch = max(effective_min_batch, int(max_batch_size))
         current_batch_size = min(max(1, int(batch_size)), effective_max_batch)
+        token_budget = (
+            max(REMOTE_MIN_TOKEN_BUDGET, current_batch_size * REMOTE_TOKENS_PER_SLOT)
+            if adaptive_batching
+            else None
+        )
+        batches = plan_remote_batches(texts, current_batch_size, token_budget)
 
         vectors: list[list[float] | None] = [None] * len(texts)
         total_cost = 0.0
         total_retries = 0
         failed_requests = 0
-        shrink_events = 0
-        grow_events = 0
-
         request_count = 0
-        next_start = 0
         completed_inputs = 0
 
-        with ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
-            while next_start < len(texts):
-                wave_batches: list[tuple[int, list[str]]] = []
-                for _ in range(effective_concurrency):
-                    if next_start >= len(texts):
-                        break
-                    start = next_start
-                    end = min(len(texts), start + current_batch_size)
-                    wave_batches.append((start, texts[start:end]))
-                    next_start = end
-
-                wave_durations: list[float] = []
-                wave_success = True
-
-                future_map = {
-                    executor.submit(
-                        self._embed_litellm_batch,
-                        batch_texts=batch_texts,
-                        model=model,
-                        api_key=api_key,
-                        api_base=api_base,
-                        openrouter_provider=openrouter_provider,
-                        max_retries=max_retries,
-                        retry_base_delay_ms=retry_base_delay_ms,
-                        retry_max_delay_ms=retry_max_delay_ms,
-                        request_timeout_seconds=request_timeout_seconds,
-                    ): start
-                    for start, batch_texts in wave_batches
-                }
-
+        with ThreadPoolExecutor(max_workers=min(effective_concurrency, len(batches))) as executor:
+            future_map = {
+                executor.submit(
+                    self._embed_litellm_batch,
+                    batch_texts=[texts[idx] for idx in indexes],
+                    model=model,
+                    api_key=api_key,
+                    api_base=api_base,
+                    openrouter_provider=openrouter_provider,
+                    max_retries=max_retries,
+                    retry_base_delay_ms=retry_base_delay_ms,
+                    retry_max_delay_ms=retry_max_delay_ms,
+                    request_timeout_seconds=request_timeout_seconds,
+                ): indexes
+                for indexes in batches
+            }
+            try:
                 for future in as_completed(future_map):
-                    start = future_map[future]
+                    indexes = future_map[future]
                     try:
-                        batch_vectors, batch_cost, batch_retries, batch_duration_seconds = future.result()
+                        batch_vectors, batch_cost, batch_retries, _ = future.result()
                     except Exception:
                         failed_requests += 1
-                        wave_success = False
                         raise
-
                     total_cost += batch_cost
                     total_retries += batch_retries
                     request_count += 1
                     completed_inputs += len(batch_vectors)
+                    for idx, vector in zip(indexes, batch_vectors):
+                        vectors[idx] = vector
                     if progress_callback is not None:
                         progress_callback(completed_inputs, len(texts))
-                    wave_durations.append(batch_duration_seconds)
-
-                    for idx, vector in enumerate(batch_vectors):
-                        vectors[start + idx] = vector
-
-                if adaptive_batching and wave_durations:
-                    avg_latency_ms = (sum(wave_durations) / len(wave_durations)) * 1000.0
-
-                    if (not wave_success or avg_latency_ms > adaptive_target_latency_ms) and current_batch_size > effective_min_batch:
-                        next_size = max(effective_min_batch, current_batch_size // 2)
-                        if next_size < current_batch_size:
-                            current_batch_size = next_size
-                            shrink_events += 1
-                    elif wave_success and avg_latency_ms < (adaptive_target_latency_ms * 0.6) and current_batch_size < effective_max_batch:
-                        next_size = min(effective_max_batch, max(current_batch_size + 1, int(current_batch_size * 1.25)))
-                        if next_size > current_batch_size:
-                            current_batch_size = next_size
-                            grow_events += 1
+            except BaseException:
+                for pending in future_map:
+                    pending.cancel()
+                raise
 
         if any(vec is None for vec in vectors):
             raise RuntimeError("Embedding response missing vectors for one or more inputs")
@@ -668,8 +734,6 @@ class DualEmbedder:
             input_count=len(texts),
             duration_seconds=duration,
             final_batch_size=current_batch_size,
-            batch_shrink_events=shrink_events,
-            batch_grow_events=grow_events,
         )
 
     def _embed_litellm_batch(

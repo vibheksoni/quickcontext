@@ -247,12 +247,10 @@ fn is_entrypoint(symbol: &ExtractedSymbol, name_lower: &str) -> bool {
         return false;
     }
 
-    let is_public = symbol
+    symbol
         .visibility
         .as_deref()
-        .map_or(true, |v| v.contains("pub") || v.contains("export"));
-
-    is_public
+        .is_none_or(|v| v.contains("pub") || v.contains("export"))
 }
 
 
@@ -273,7 +271,7 @@ fn is_orchestration_name(name_lower: &str) -> bool {
 ///
 /// symbol: &ExtractedSymbol — Symbol to check.
 fn is_utility(symbol: &ExtractedSymbol) -> bool {
-    let is_private = symbol.visibility.as_deref().map_or(false, |v| {
+    let is_private = symbol.visibility.as_deref().is_some_and(|v| {
         v.contains("private") || v.contains("protected")
     });
 

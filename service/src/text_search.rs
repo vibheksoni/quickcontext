@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 use crate::intent::{build_intent_terms, normalize_intent_level, IntentTerms};
 use crate::lang::LanguageSpec;
@@ -164,19 +165,19 @@ fn score_and_rank(
     let mut matches = Vec::new();
 
     for candidate in candidates {
-        let content = match read_candidate_content(&candidate.file_path) {
-            Some(c) => c,
+        let analyzed = match analyzed_content(&candidate.file_path) {
+            Some(analyzed) => analyzed,
             None => continue,
         };
+        let content = analyzed.content.as_str();
 
-        if !evaluate_expr(expr, &content) {
+        if !evaluate_expr_lower(expr, &analyzed.lower) {
             continue;
         }
 
         let category_boost = compute_query_aware_category_boost(candidate.category, &query_terms);
-        let coverage_boost = structural_boost::compute_coverage_boost(&query_terms, &content);
-        let role_boost =
-            structural_boost::compute_role_boost(structural_boost::classify_role_from_content(&content));
+        let coverage_boost = structural_boost::compute_coverage_boost_lower(&query_terms, &analyzed.lower);
+        let role_boost = structural_boost::compute_role_boost(analyzed.role);
         let tooling_penalty = compute_tooling_path_penalty(&candidate.file_path, &query_terms);
         let path_boost = compute_path_keyword_boost(&candidate.file_path, &query_terms);
 
@@ -304,6 +305,84 @@ fn compute_matched_term_coverage_boost(matched_terms: &[String], query_terms: &[
     1.0 + (ratio * 0.22)
 }
 
+const ANALYZED_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Per-file data the slow ranking path needs on every query, computed once per
+/// file version: raw content, lowercased content, and structural role.
+struct AnalyzedContent {
+    content: String,
+    lower: String,
+    role: structural_boost::FileRole,
+}
+
+struct AnalyzedEntry {
+    modified: Option<SystemTime>,
+    len: u64,
+    value: Arc<AnalyzedContent>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct AnalyzedCache {
+    entries: HashMap<String, AnalyzedEntry>,
+    bytes: usize,
+    tick: u64,
+}
+
+fn analyzed_cache() -> &'static Mutex<AnalyzedCache> {
+    static CACHE: OnceLock<Mutex<AnalyzedCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AnalyzedCache::default()))
+}
+
+/// Load a candidate's analyzed content, reusing the cached copy while the file's
+/// modification time and size are unchanged. Lowercasing and role classification
+/// of every candidate file on every query dominated text-search latency.
+fn analyzed_content(path: &str) -> Option<Arc<AnalyzedContent>> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+
+    if let Ok(mut cache) = analyzed_cache().lock() {
+        cache.tick += 1;
+        let tick = cache.tick;
+        if let Some(entry) = cache.entries.get_mut(path) {
+            if entry.modified == modified && entry.len == len {
+                entry.last_used = tick;
+                return Some(Arc::clone(&entry.value));
+            }
+        }
+    }
+
+    let content = read_candidate_content(path)?;
+    let lower = content.to_lowercase();
+    let role = structural_boost::classify_role_from_content(&content);
+    let size = content.len() + lower.len();
+    let value = Arc::new(AnalyzedContent { content, lower, role });
+
+    if size <= ANALYZED_CACHE_MAX_BYTES / 4 {
+        if let Ok(mut cache) = analyzed_cache().lock() {
+            let tick = cache.tick;
+            let entry = AnalyzedEntry { modified, len, value: Arc::clone(&value), last_used: tick };
+            if let Some(previous) = cache.entries.insert(path.to_string(), entry) {
+                cache.bytes = cache.bytes.saturating_sub(previous.value.content.len() + previous.value.lower.len());
+            }
+            cache.bytes += size;
+            while cache.bytes > ANALYZED_CACHE_MAX_BYTES {
+                let oldest = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| key.clone());
+                let Some(key) = oldest else { break };
+                if let Some(evicted) = cache.entries.remove(&key) {
+                    cache.bytes = cache.bytes.saturating_sub(evicted.value.content.len() + evicted.value.lower.len());
+                }
+            }
+        }
+    }
+    Some(value)
+}
+
 fn read_candidate_content(path: &str) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
     if content.contains('\0') {
@@ -409,9 +488,12 @@ fn compute_intent_score(
 ///
 /// expr: &QueryExpr — Expression tree node to evaluate.
 /// content: &str — File content to match against.
+#[cfg(test)]
 fn evaluate_expr(expr: &QueryExpr, content: &str) -> bool {
-    let content_lower = content.to_lowercase();
+    evaluate_expr_lower(expr, &content.to_lowercase())
+}
 
+fn evaluate_expr_lower(expr: &QueryExpr, content_lower: &str) -> bool {
     match expr {
         QueryExpr::Term {
             keywords,
@@ -423,7 +505,7 @@ fn evaluate_expr(expr: &QueryExpr, content: &str) -> bool {
                 let phrase = keywords.join(" ");
                 content_lower.contains(&phrase)
             } else {
-                keywords.iter().any(|kw| content_lower.contains(kw))
+                keywords.iter().any(|kw| content_lower.contains(kw.as_str()))
             };
 
             if *excluded {
@@ -432,8 +514,12 @@ fn evaluate_expr(expr: &QueryExpr, content: &str) -> bool {
                 found
             }
         }
-        QueryExpr::And(left, right) => evaluate_expr(left, content) && evaluate_expr(right, content),
-        QueryExpr::Or(left, right) => evaluate_expr(left, content) || evaluate_expr(right, content),
+        QueryExpr::And(left, right) => {
+            evaluate_expr_lower(left, content_lower) && evaluate_expr_lower(right, content_lower)
+        }
+        QueryExpr::Or(left, right) => {
+            evaluate_expr_lower(left, content_lower) || evaluate_expr_lower(right, content_lower)
+        }
     }
 }
 

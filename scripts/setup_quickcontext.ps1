@@ -30,9 +30,6 @@ $args = @(
     "--venv", $Venv
 )
 
-if ($SkipDocker) {
-    $args += "--skip-docker"
-}
 if ($SkipInit) {
     $args += "--skip-init"
 }

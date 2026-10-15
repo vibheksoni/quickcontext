@@ -56,10 +56,10 @@ DEFAULT_CASES = (
         expected_parent="CollectionManager",
     ),
     SymbolEvalCase(
-        query="QdrantConnection.connect",
-        expected_path="engine/src/qdrant.py",
-        expected_name="connect",
-        expected_parent="QdrantConnection",
+        query="VectorStore.open",
+        expected_path="engine/src/vector_store.py",
+        expected_name="open",
+        expected_parent="VectorStore",
     ),
     SymbolEvalCase(
         query="RustParserService.scan_files",
@@ -80,10 +80,10 @@ DEFAULT_CASES = (
         expected_parent="ChunkBuilder",
     ),
     SymbolEvalCase(
-        query="QdrantIndexer.delete_by_file",
+        query="ChunkIndexer.delete_by_file",
         expected_path="engine/src/indexer.py",
         expected_name="delete_by_file",
-        expected_parent="QdrantIndexer",
+        expected_parent="ChunkIndexer",
     ),
     SymbolEvalCase(
         query="CodeSearcher.search_hybrid",

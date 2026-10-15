@@ -46,7 +46,7 @@ DEFAULT_CASES = (
         expected_paths=("engine/src/searcher.py",),
     ),
     EvalCase(
-        query="How does this codebase make parser-only Python commands work without requiring Qdrant imports at startup?",
+        query="How does this codebase make parser-only Python commands work without importing the vector store at startup?",
         expected_paths=("engine/src/parsing.py", "engine/__init__.py"),
     ),
     EvalCase(

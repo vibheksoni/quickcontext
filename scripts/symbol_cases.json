@@ -23,10 +23,10 @@
     "expected_parent": "CollectionManager"
   },
   {
-    "query": "QdrantConnection.connect",
-    "expected_path": "engine/src/qdrant.py",
-    "expected_name": "connect",
-    "expected_parent": "QdrantConnection"
+    "query": "VectorStore.open",
+    "expected_path": "engine/src/vector_store.py",
+    "expected_name": "open",
+    "expected_parent": "VectorStore"
   },
   {
     "query": "RustParserService.scan_files",
@@ -47,10 +47,10 @@
     "expected_parent": "ChunkBuilder"
   },
   {
-    "query": "QdrantIndexer.delete_by_file",
+    "query": "ChunkIndexer.delete_by_file",
     "expected_path": "engine/src/indexer.py",
     "expected_name": "delete_by_file",
-    "expected_parent": "QdrantIndexer"
+    "expected_parent": "ChunkIndexer"
   },
   {
     "query": "CodeSearcher.search_hybrid",

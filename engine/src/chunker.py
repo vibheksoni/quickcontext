@@ -23,7 +23,7 @@ class CodeChunk:
     Represents a chunk of code ready for embedding.
 
     Args:
-        chunk_id: Deterministic hash-based ID for Qdrant point
+        chunk_id: Deterministic hash-based ID for the stored point
         source: Raw source code text
         language: Programming language
         file_path: Absolute path to source file
@@ -709,7 +709,7 @@ class ChunkBuilder:
         byte_end: Optional[int] = None,
     ) -> str:
         """
-        Generate deterministic chunk ID for Qdrant point.
+        Generate deterministic chunk ID for the stored point.
         Uses symbol identity plus signature or byte span to avoid collisions.
 
         file_path: str — Source file path.

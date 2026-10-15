@@ -107,7 +107,7 @@ The service owns:
 - file read and edit primitives
 - LSP-backed document and workspace operations
 
-These operations do not require vector search and often remain usable even when Qdrant is unavailable.
+These operations do not require vector search and keep working even when the vector store is disabled.
 
 ## Build And Run
 
@@ -137,7 +137,7 @@ The Python layer can auto-start the service when `service.path` is available in 
 
 The service does not manage:
 
-- Qdrant collections
+- vector store collections
 - embeddings
 - optional LLM descriptions
 - higher-level semantic retrieval composition
@@ -149,6 +149,6 @@ Current split:
 - Rust service
   parsing, lexical search, symbol and graph operations, protocol extraction, file operations, LSP, IPC
 - Python SDK
-  chunking, deduplication, embeddings, optional LLM descriptions, Qdrant indexing, retrieval composition, wrappers
+  chunking, deduplication, embeddings, optional LLM descriptions, vector store indexing, retrieval composition, wrappers
 
 That split keeps the performance-sensitive execution in Rust while preserving an easy integration surface in Python.

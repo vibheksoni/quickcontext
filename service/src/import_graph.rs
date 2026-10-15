@@ -7,7 +7,7 @@ use crate::extract::{collect_file_signatures_fast, extract_path_with_options, Ex
 use crate::lang::LanguageSpec;
 use crate::types::{ImportEdge, ImportGraphResult, ImportNeighborsResult, SymbolKind};
 
-const REFRESH_DEBOUNCE_MS: u128 = 5000;
+const REFRESH_DEBOUNCE_MS: u128 = 1000;
 
 #[derive(Debug, Clone)]
 struct ProjectImportGraph {
@@ -410,9 +410,11 @@ fn parse_python_import(source: &str) -> String {
 
 
 fn parse_js_import(source: &str) -> String {
-    if let Some(idx) = source.find("from") {
-        let after = source[idx + 4..].trim();
-        return extract_string_literal(after);
+    for (idx, _) in source.match_indices("from") {
+        let after = source[idx + 4..].trim_start();
+        if after.starts_with(['\'', '"', '`']) {
+            return extract_string_literal(after);
+        }
     }
 
     if let Some(idx) = source.find("require(") {
@@ -420,8 +422,8 @@ fn parse_js_import(source: &str) -> String {
         return extract_string_literal(after);
     }
 
-    if source.starts_with("import") {
-        let after = source[6..].trim();
+    if let Some(after) = source.strip_prefix("import") {
+        let after = after.trim();
         if after.starts_with('\'') || after.starts_with('"') {
             return extract_string_literal(after);
         }
@@ -445,8 +447,8 @@ fn parse_rust_use(source: &str) -> String {
 fn parse_go_import(source: &str) -> String {
     let trimmed = source.trim();
 
-    if trimmed.starts_with("import") {
-        let after = trimmed[6..].trim();
+    if let Some(after) = trimmed.strip_prefix("import") {
+        let after = after.trim();
 
         if after.starts_with('(') {
             let inner = after.trim_start_matches('(').trim_end_matches(')').trim();
@@ -502,13 +504,13 @@ fn parse_c_include(source: &str) -> String {
 
     if let Some(rest) = trimmed.strip_prefix("#include") {
         let rest = rest.trim_start();
-        if rest.starts_with('"') {
-            let end = rest[1..].find('"').unwrap_or(rest.len() - 1);
-            return rest[1..1 + end].to_string();
+        if let Some(inner) = rest.strip_prefix('"') {
+            let end = inner.find('"').unwrap_or(inner.len());
+            return inner[..end].to_string();
         }
-        if rest.starts_with('<') {
-            let end = rest[1..].find('>').unwrap_or(rest.len() - 1);
-            return rest[1..1 + end].to_string();
+        if let Some(inner) = rest.strip_prefix('<') {
+            let end = inner.find('>').unwrap_or(inner.len());
+            return inner[..end].to_string();
         }
     }
 
@@ -518,17 +520,11 @@ fn parse_c_include(source: &str) -> String {
 
 fn extract_string_literal(s: &str) -> String {
     let trimmed = s.trim();
-    if trimmed.starts_with('"') {
-        let end = trimmed[1..].find('"').unwrap_or(trimmed.len() - 1);
-        return trimmed[1..1 + end].to_string();
-    }
-    if trimmed.starts_with('\'') {
-        let end = trimmed[1..].find('\'').unwrap_or(trimmed.len() - 1);
-        return trimmed[1..1 + end].to_string();
-    }
-    if trimmed.starts_with('`') {
-        let end = trimmed[1..].find('`').unwrap_or(trimmed.len() - 1);
-        return trimmed[1..1 + end].to_string();
+    for quote in ['"', '\'', '`'] {
+        if let Some(inner) = trimmed.strip_prefix(quote) {
+            let end = inner.find(quote).unwrap_or(inner.len());
+            return inner[..end].to_string();
+        }
     }
     String::new()
 }
@@ -714,4 +710,25 @@ fn resolve_c_include(
 fn normalize(path: &Path) -> String {
     let s = path.to_string_lossy().to_string();
     s.replace('\\', "/").to_ascii_lowercase()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_c_include, parse_js_import};
+
+    #[test]
+    fn parse_js_import_skips_identifiers_containing_from() {
+        assert_eq!(parse_js_import("import { fromEvent } from 'rxjs'"), "rxjs");
+        assert_eq!(parse_js_import("import x from \"./x\""), "./x");
+        assert_eq!(parse_js_import("const u = require('./from_utils')"), "./from_utils");
+        assert_eq!(parse_js_import("import './side-effect'"), "./side-effect");
+    }
+
+    #[test]
+    fn parse_c_include_handles_both_forms() {
+        assert_eq!(parse_c_include("#include \"local.h\""), "local.h");
+        assert_eq!(parse_c_include("#include <stdio.h>"), "stdio.h");
+        assert_eq!(parse_c_include("#include \"unterminated"), "unterminated");
+    }
 }

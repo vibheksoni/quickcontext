@@ -5,8 +5,6 @@ from pathlib import Path
 import sys
 import uuid
 
-from qdrant_client import models
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -19,10 +17,11 @@ from engine.src.artifact_index import (
 )
 from engine.src.chunk_filter import ChunkFilterConfig, filter_chunks
 from engine.src.chunker import ChunkBuilder
-from engine.src.config import EngineConfig
+from engine.src.config import EngineConfig, StoreConfig
 from engine.src.dedup import deduplicate_chunks
 from engine.src.describer import build_fallback_descriptions
-from engine.src.indexer import QdrantIndexer
+from engine.src.indexer import ChunkIndexer
+from engine.src.vector_store import VectorStore
 from engine.src.parsing import ExtractionResult, RustParserService
 
 
@@ -72,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--path", required=True, help="Target directory to profile.")
     parser.add_argument("--largest-files", type=int, default=12, help="Number of largest supported files to extract/profile.")
     parser.add_argument("--embed-sample-chunks", type=int, default=64, help="Number of filtered chunks to embed as a sample. Use 0 to skip embeddings.")
-    parser.add_argument("--upsert-sample-chunks", type=int, default=64, help="Number of embedded chunks to upsert into a temp collection. Use 0 to skip Qdrant upsert.")
+    parser.add_argument("--upsert-sample-chunks", type=int, default=64, help="Number of embedded chunks to upsert into a temp collection. Use 0 to skip the store write.")
     parser.add_argument("--min-chunk-bytes", type=int, default=200, help="Chunk min-byte filter used in fast indexing mode.")
     parser.add_argument("--max-chunks-per-file", type=int, default=180, help="Per-file chunk cap used in fast indexing mode.")
     parser.add_argument("--artifact-aware-fast", action="store_true", help="Downgrade obvious bundle artifacts to coarse file chunks before extraction.")
@@ -198,41 +197,20 @@ def main() -> None:
 
             if args.upsert_sample_chunks > 0 and embedded_chunks:
                 upsert_sample = embedded_chunks[: min(len(embedded_chunks), int(args.upsert_sample_chunks))]
-                client = qc.connection.client
+                store = VectorStore(StoreConfig(path=":memory:")).open()
                 collection_name = f"qc-index-phase-benchmark-{uuid.uuid4().hex[:8]}"
-                try:
-                    client.delete_collection(collection_name)
-                except Exception:
-                    pass
-                client.create_collection(
-                    collection_name=collection_name,
-                    vectors_config={
-                        config.vectors[0].name: models.VectorParams(
-                            size=config.vectors[0].dimension,
-                            distance=models.Distance.COSINE,
-                        ),
-                        config.vectors[1].name: models.VectorParams(
-                            size=config.vectors[1].dimension,
-                            distance=models.Distance.COSINE,
-                        ),
-                    },
-                )
+                store.create_collection(collection_name, config.vectors)
 
-                indexer = QdrantIndexer(
-                    client=client,
-                    collection_name=collection_name,
-                    batch_size=32,
-                    upsert_concurrency=1,
-                )
+                indexer = ChunkIndexer(store=store, collection_name=collection_name, batch_size=512)
                 started = time.perf_counter()
                 points = [indexer._chunk_to_point(chunk) for chunk in upsert_sample]
                 point_build_ms = (time.perf_counter() - started) * 1000
 
                 started = time.perf_counter()
-                client.upsert(collection_name=collection_name, points=points, wait=True)
+                store.upsert(collection_name, points)
                 upsert_ms = (time.perf_counter() - started) * 1000
                 upserted_points = len(points)
-                client.delete_collection(collection_name)
+                store.close()
 
     total_ms = (time.perf_counter() - overall_start) * 1000
 
@@ -274,7 +252,7 @@ def main() -> None:
             print(f"  Mean ms per embed input: {embed_ms / embed_input_count:.2f}")
         if upserted_points:
             print(f"  Point build time: {point_build_ms:.2f} ms")
-            print(f"  Qdrant upsert time: {upsert_ms:.2f} ms")
+            print(f"  Store write time: {upsert_ms:.2f} ms")
             print(f"  Upserted points: {upserted_points}")
 
     print()

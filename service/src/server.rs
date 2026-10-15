@@ -3,7 +3,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio_util::sync::CancellationToken;
 
 use crate::extract::{
@@ -28,6 +28,8 @@ use crate::text_search;
 
 #[cfg(windows)]
 const PIPE_NAME: &str = r"\\.\pipe\quickcontext";
+#[cfg(windows)]
+const PIPE_NAME_ENV_VAR: &str = "QC_PIPE_NAME";
 #[cfg(unix)]
 const SOCKET_PATH_ENV_VAR: &str = "QC_SOCKET_PATH";
 #[cfg(unix)]
@@ -36,6 +38,7 @@ const DEFAULT_SOCKET_BASENAME: &str = "quickcontext.sock";
 const MAX_INSTANCES: usize = 16;
 #[cfg(windows)]
 const BUFFER_SIZE: u32 = 65536;
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const DEFAULT_GREP_LIMIT: usize = 200;
 const DEFAULT_SYMBOL_LIMIT: usize = 50;
 const DEFAULT_CALLER_LIMIT: usize = 100;
@@ -135,22 +138,57 @@ impl Drop for SocketCleanupGuard {
 
 
 #[cfg(windows)]
-async fn run_windows() -> std::io::Result<()> {
-    let cancel = CancellationToken::new();
-    let specs = lang::registry();
-
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
+fn create_pipe_instance(first: bool) -> std::io::Result<NamedPipeServer> {
+    ServerOptions::new()
+        .first_pipe_instance(first)
         .pipe_mode(PipeMode::Byte)
         .in_buffer_size(BUFFER_SIZE)
         .out_buffer_size(BUFFER_SIZE)
         .max_instances(MAX_INSTANCES)
-        .create(PIPE_NAME)?;
+        .create(pipe_name())
+}
 
-    eprintln!("[quickcontext] listening on {PIPE_NAME}");
+#[cfg(windows)]
+fn pipe_name() -> String {
+    std::env::var(PIPE_NAME_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| PIPE_NAME.to_string())
+}
+
+
+#[cfg(windows)]
+async fn run_windows() -> std::io::Result<()> {
+    let cancel = CancellationToken::new();
+    let specs = lang::registry();
+
+    let mut next_instance = Some(create_pipe_instance(true)?);
+
+    eprintln!("[quickcontext] listening on {}", pipe_name());
     install_ctrl_c_handler(&cancel);
 
-    loop {
+    'accept: loop {
+        let server = match next_instance.take() {
+            Some(server) => server,
+            None => loop {
+                match create_pipe_instance(false) {
+                    Ok(server) => break server,
+                    Err(e) => {
+                        eprintln!("[quickcontext] failed to create pipe instance: {e}");
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                eprintln!("[quickcontext] server stopped");
+                                break 'accept;
+                            }
+                            _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => {}
+                        }
+                    }
+                }
+            },
+        };
+
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -158,20 +196,15 @@ async fn run_windows() -> std::io::Result<()> {
                 break;
             }
             result = server.connect() => {
-                result?;
-                let client = server;
-
-                server = ServerOptions::new()
-                    .pipe_mode(PipeMode::Byte)
-                    .in_buffer_size(BUFFER_SIZE)
-                    .out_buffer_size(BUFFER_SIZE)
-                    .max_instances(MAX_INSTANCES)
-                    .create(PIPE_NAME)?;
+                if let Err(e) = result {
+                    eprintln!("[quickcontext] pipe connect failed: {e}");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
 
                 let cancel = cancel.clone();
-
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(client, specs, &cancel).await {
+                    if let Err(e) = handle_client(server, specs, &cancel).await {
                         if should_log_client_error(&e) {
                             eprintln!("[quickcontext] client error: {e}");
                         }
@@ -221,7 +254,14 @@ async fn run_unix() -> std::io::Result<()> {
                 break;
             }
             result = listener.accept() => {
-                let (stream, _) = result?;
+                let stream = match result {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        eprintln!("[quickcontext] accept failed: {e}");
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
                 let cancel = cancel.clone();
 
                 tokio::spawn(async move {
@@ -247,7 +287,7 @@ async fn run_unix() -> std::io::Result<()> {
 
 async fn handle_client(
     mut pipe: impl AsyncRead + AsyncWrite + Unpin,
-    specs: &[LanguageSpec],
+    specs: &'static [LanguageSpec],
     cancel: &CancellationToken,
 ) -> std::io::Result<()> {
     loop {
@@ -265,12 +305,17 @@ async fn handle_client(
         };
 
         let response = match serde_json::from_slice::<Request>(&request) {
-            Ok(req) => dispatch(req, specs, cancel).await,
+            Ok(req) => dispatch(req, specs).await,
             Err(e) => Response::error(format!("invalid request: {e}")),
         };
 
-        let payload = serde_json::to_vec(&response)
+        let mut payload = serde_json::to_vec(&response)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if u32::try_from(payload.len()).is_err() {
+            let response = Response::error(format!("response too large: {} bytes", payload.len()));
+            payload = serde_json::to_vec(&response)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
 
         write_frame(&mut pipe, &payload).await?;
     }
@@ -279,7 +324,67 @@ async fn handle_client(
 }
 
 
-async fn dispatch(req: Request, specs: &[LanguageSpec], _cancel: &CancellationToken) -> Response {
+async fn dispatch(req: Request, specs: &'static [LanguageSpec]) -> Response {
+    match req {
+        Request::LspDefinition { file, line, character } => {
+            handle_lsp_definition(&file, line, character).await
+        }
+        Request::LspReferences { file, line, character, include_declaration } => {
+            handle_lsp_references(&file, line, character, include_declaration.unwrap_or(true)).await
+        }
+        Request::LspHover { file, line, character } => {
+            handle_lsp_hover(&file, line, character).await
+        }
+        Request::LspSymbols { file } => {
+            handle_lsp_symbols(&file).await
+        }
+        Request::LspFormat { file, tab_size, insert_spaces } => {
+            handle_lsp_format(&file, tab_size.unwrap_or(4), insert_spaces.unwrap_or(true)).await
+        }
+        Request::LspDiagnostics { file } => {
+            handle_lsp_diagnostics(&file).await
+        }
+        Request::LspCompletion { file, line, character } => {
+            handle_lsp_completion(&file, line, character).await
+        }
+        Request::LspRename { file, line, character, new_name } => {
+            handle_lsp_rename(&file, line, character, &new_name).await
+        }
+        Request::LspPrepareRename { file, line, character } => {
+            handle_lsp_prepare_rename(&file, line, character).await
+        }
+        Request::LspCodeActions { file, start_line, start_character, end_line, end_character, diagnostics } => {
+            handle_lsp_code_actions(&file, start_line, start_character, end_line, end_character, diagnostics.as_deref()).await
+        }
+        Request::LspSignatureHelp { file, line, character } => {
+            handle_lsp_signature_help(&file, line, character).await
+        }
+        Request::LspWorkspaceSymbols { query, file } => {
+            handle_lsp_workspace_symbols(&query, file.as_deref()).await
+        }
+        Request::Ping => Response::ok_data(serde_json::json!("pong")),
+        Request::LspSessions => handle_lsp_sessions().await,
+        Request::LspShutdownAll => handle_lsp_shutdown_all().await,
+        Request::Shutdown => {
+            eprintln!("[quickcontext] shutdown requested");
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let mgr = lsp::manager::global();
+                let mut mgr = mgr.lock().await;
+                mgr.shutdown_all().await;
+                std::process::exit(0);
+            });
+            Response::ok_empty()
+        }
+        req => match tokio::task::spawn_blocking(move || dispatch_blocking(req, specs)).await {
+            Ok(response) => response,
+            Err(e) => Response::error(format!("request handler failed: {e}")),
+        },
+    }
+}
+
+
+fn dispatch_blocking(req: Request, specs: &[LanguageSpec]) -> Response {
     match req {
         Request::Extract {
             path,
@@ -490,42 +595,6 @@ async fn dispatch(req: Request, specs: &[LanguageSpec], _cancel: &CancellationTo
             dry_run.unwrap_or(true),
             specs,
         ),
-        Request::LspDefinition { file, line, character } => {
-            handle_lsp_definition(&file, line, character).await
-        }
-        Request::LspReferences { file, line, character, include_declaration } => {
-            handle_lsp_references(&file, line, character, include_declaration.unwrap_or(true)).await
-        }
-        Request::LspHover { file, line, character } => {
-            handle_lsp_hover(&file, line, character).await
-        }
-        Request::LspSymbols { file } => {
-            handle_lsp_symbols(&file).await
-        }
-        Request::LspFormat { file, tab_size, insert_spaces } => {
-            handle_lsp_format(&file, tab_size.unwrap_or(4), insert_spaces.unwrap_or(true)).await
-        }
-        Request::LspDiagnostics { file } => {
-            handle_lsp_diagnostics(&file).await
-        }
-        Request::LspCompletion { file, line, character } => {
-            handle_lsp_completion(&file, line, character).await
-        }
-        Request::LspRename { file, line, character, new_name } => {
-            handle_lsp_rename(&file, line, character, &new_name).await
-        }
-        Request::LspPrepareRename { file, line, character } => {
-            handle_lsp_prepare_rename(&file, line, character).await
-        }
-        Request::LspCodeActions { file, start_line, start_character, end_line, end_character, diagnostics } => {
-            handle_lsp_code_actions(&file, start_line, start_character, end_line, end_character, diagnostics.as_deref()).await
-        }
-        Request::LspSignatureHelp { file, line, character } => {
-            handle_lsp_signature_help(&file, line, character).await
-        }
-        Request::LspWorkspaceSymbols { query, file } => {
-            handle_lsp_workspace_symbols(&query, file.as_deref()).await
-        }
         Request::FileRead {
             file,
             start_line,
@@ -573,20 +642,7 @@ async fn dispatch(req: Request, specs: &[LanguageSpec], _cancel: &CancellationTo
             expected_hash.as_deref(),
             record_undo.unwrap_or(true),
         ),
-        Request::Ping => Response::ok_data(serde_json::json!("pong")),
-        Request::LspSessions => handle_lsp_sessions().await,
-        Request::LspShutdownAll => handle_lsp_shutdown_all().await,
-        Request::Shutdown => {
-            eprintln!("[quickcontext] shutdown requested");
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                let mgr = lsp::manager::global();
-                let mut mgr = mgr.lock().await;
-                mgr.shutdown_all().await;
-                std::process::exit(0);
-            });
-            Response::ok_empty()
-        }
+        _ => Response::error("request must be dispatched asynchronously"),
     }
 }
 
@@ -1617,4 +1673,55 @@ async fn write_frame(pipe: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> std::
     pipe.write_all(data).await?;
     pipe.flush().await?;
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn roundtrip(
+        client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+        payload: &[u8],
+    ) -> serde_json::Value {
+        write_frame(client, payload).await.unwrap();
+        let frame = read_frame(client).await.unwrap();
+        serde_json::from_slice(&frame).unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_client_serves_async_blocking_and_invalid_requests() {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            handle_client(server, lang::registry(), &server_cancel).await
+        });
+
+        let pong = roundtrip(&mut client, br#"{"method":"ping"}"#).await;
+        assert_eq!(pong, serde_json::json!({"status": "ok", "data": "pong"}));
+
+        let file = std::env::temp_dir().join(format!("qc_server_grep_{}.txt", std::process::id()));
+        std::fs::write(&file, "alpha\nneedle\n").unwrap();
+        let request = serde_json::json!({
+            "method": "grep",
+            "query": "needle",
+            "path": file.to_string_lossy(),
+        });
+        let grep = roundtrip(&mut client, request.to_string().as_bytes()).await;
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(grep["status"], "ok");
+        assert_eq!(grep["data"]["matches"][0]["line_number"], 2);
+
+        let invalid = roundtrip(&mut client, br#"{"method":"nope"}"#).await;
+        assert_eq!(invalid["status"], "error");
+        assert!(invalid["message"].as_str().unwrap().starts_with("invalid request"));
+
+        let sessions = roundtrip(&mut client, br#"{"method":"lsp_sessions"}"#).await;
+        assert_eq!(sessions["status"], "ok");
+        assert!(sessions["data"]["sessions"].is_array());
+
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
 }

@@ -1,25 +1,26 @@
 {
-  "qdrant": {
-    "host": "localhost",
-    "port": 6333,
-    "grpc_port": 6334,
-    "prefer_grpc": false,
-    "collection": "codebase",
-    "timeout": 30.0
+  "store": {
+    "path": null,
+    "upsert_batch_size": 512,
+    "max_cached_collections": 4
   },
   "code_embedding": {
     "provider": "litellm",
     "model": "openrouter/qwen/qwen3-embedding-8b",
     "dimension": 4096,
     "batch_size": 32,
-    "api_key": "YOUR_OPENROUTER_API_KEY"
+    "api_key": "YOUR_OPENROUTER_API_KEY",
+    "concurrency": 32,
+    "query_prefix": "Instruct: Given a question about a codebase, retrieve the code that answers it\nQuery:"
   },
   "desc_embedding": {
     "provider": "litellm",
     "model": "openrouter/qwen/qwen3-embedding-8b",
     "dimension": 4096,
     "batch_size": 32,
-    "api_key": "YOUR_OPENROUTER_API_KEY"
+    "api_key": "YOUR_OPENROUTER_API_KEY",
+    "concurrency": 32,
+    "query_prefix": "Instruct: Given a question about a codebase, retrieve the code that answers it\nQuery:"
   },
   "llm": {
     "provider": "litellm",
@@ -53,5 +54,22 @@
       "dimension": 4096,
       "distance": "cosine"
     }
-  ]
+  ],
+  "profiles": {
+    "local": {
+      "code_embedding": {
+        "provider": "fastembed",
+        "model": "BAAI/bge-small-en-v1.5",
+        "dimension": 384,
+        "batch_size": 16
+      },
+      "desc_embedding": {
+        "provider": "fastembed",
+        "model": "BAAI/bge-small-en-v1.5",
+        "dimension": 384,
+        "batch_size": 16
+      },
+      "llm": null
+    }
+  }
 }

@@ -22,7 +22,7 @@ const BM25_B: f64 = 0.5;
 const PATH_BM25_WEIGHT: f64 = 0.5;
 const PATH_BASENAME_TERM_BOOST: u32 = 4;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
-const REFRESH_DEBOUNCE_MS: u128 = 5000;
+const REFRESH_DEBOUNCE_MS: u128 = 1000;
 
 fn default_file_category() -> FileCategory {
     FileCategory::Source
@@ -180,6 +180,8 @@ fn refresh_index_if_needed(
                 },
             );
             if current == index.file_signatures {
+                drop(index);
+                mark_text_index_checked(project_lock)?;
                 return Ok(());
             }
         }
@@ -206,6 +208,14 @@ fn refresh_index_if_needed(
         persist_index(project_root, &index)?;
     }
 
+    Ok(())
+}
+
+fn mark_text_index_checked(project_lock: &Arc<RwLock<ProjectTextIndex>>) -> Result<(), String> {
+    project_lock
+        .write()
+        .map_err(|_| "text index write lock poisoned".to_string())?
+        .last_refresh_check_ms = now_ms();
     Ok(())
 }
 
@@ -597,14 +607,9 @@ fn score_candidates(
         }
     }
 
-    let mut scored: Vec<(u32, f64)> = index
-        .docs
-        .iter()
-        .filter_map(|(doc_id, doc)| {
-            if !matches_filter(&doc.file_path, &doc.language, filter) {
-                return None;
-            }
-
+    let mut scored: Vec<(u32, f64)> = terms_by_doc
+        .keys()
+        .filter_map(|doc_id| {
             let content_score = content_score_by_doc.get(doc_id).copied().unwrap_or(0.0);
             let path_score = path_score_by_doc.get(doc_id).copied().unwrap_or(0.0);
             let score = content_score + (PATH_BM25_WEIGHT * path_score);
@@ -653,6 +658,14 @@ fn count_filtered_docs(index: &ProjectTextIndex, filter: &SearchFilter) -> usize
 }
 
 fn matches_filter(path: &str, lang_name: &str, filter: &SearchFilter) -> bool {
+    if filter.file_pattern.is_none()
+        && filter.ext_filter.is_none()
+        && filter.dir_filter.is_none()
+        && filter.lang_filter.is_none()
+    {
+        return true;
+    }
+
     let path_lower = path.to_lowercase().replace('\\', "/");
 
     if let Some(ref pat) = filter.file_pattern {
@@ -858,8 +871,10 @@ mod tests {
 
     #[test]
     fn test_matches_filter_extension() {
-        let mut filter = SearchFilter::default();
-        filter.ext_filter = Some("rs".to_string());
+        let filter = SearchFilter {
+            ext_filter: Some("rs".to_string()),
+            ..SearchFilter::default()
+        };
 
         assert!(matches_filter("src/main.rs", "rust", &filter));
         assert!(!matches_filter("src/main.py", "python", &filter));
@@ -868,9 +883,9 @@ mod tests {
     #[test]
     fn test_config_fingerprint_stable_and_sensitive() {
         let specs = crate::lang::registry();
-        let fp_a = config_fingerprint(&specs, true);
-        let fp_b = config_fingerprint(&specs, true);
-        let fp_c = config_fingerprint(&specs, false);
+        let fp_a = config_fingerprint(specs, true);
+        let fp_b = config_fingerprint(specs, true);
+        let fp_c = config_fingerprint(specs, false);
 
         assert_eq!(fp_a, fp_b);
         assert_ne!(fp_a, fp_c);

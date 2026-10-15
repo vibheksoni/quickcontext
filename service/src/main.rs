@@ -73,7 +73,7 @@ fn cmd_extract(args: &[String]) {
         if stats_only {
             let mut sink = std::io::sink();
             let stats = quickcontext_service::extract::extract_compact_streaming(
-                path, &specs, options, &mut sink,
+                path, specs, options, &mut sink,
             );
             let json = if pretty {
                 serde_json::to_string_pretty(&stats)
@@ -90,7 +90,7 @@ fn cmd_extract(args: &[String]) {
         } else {
             let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
             let stats = quickcontext_service::extract::extract_compact_streaming(
-                path, &specs, options, &mut stdout,
+                path, specs, options, &mut stdout,
             );
             drop(stdout);
             let json = if pretty {
@@ -106,7 +106,7 @@ fn cmd_extract(args: &[String]) {
         return;
     }
 
-    let results = match extract_path(path, &specs) {
+    let results = match extract_path(path, specs) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
@@ -148,7 +148,7 @@ fn cmd_extract_symbol(args: &[String]) {
         process::exit(1);
     }
 
-    let results = match extract_path(path, &specs) {
+    let results = match extract_path(path, specs) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
@@ -364,7 +364,7 @@ fn cmd_skeleton(args: &[String]) {
     let specs = lang::registry();
     let path = Path::new(target);
 
-    let result = match skeleton::build_skeleton(path, &specs, &options) {
+    let result = match skeleton::build_skeleton(path, specs, &options) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
@@ -474,7 +474,7 @@ fn cmd_text_search(args: &[String]) {
         target,
         respect_gitignore,
         limit,
-        &specs,
+        specs,
         intent_mode,
         intent_level,
     ) {
@@ -642,7 +642,7 @@ fn cmd_protocol_search(args: &[String]) {
         target,
         respect_gitignore,
         limit,
-        &specs,
+        specs,
         Some(&options),
     ) {
         Ok(r) => r,
@@ -736,7 +736,7 @@ fn cmd_pattern_search(args: &[String]) {
     let target = Path::new(&path);
     let specs = lang::registry();
 
-    let result = match pattern_match::pattern_search(&pattern, &language, target, respect_gitignore, limit, &specs) {
+    let result = match pattern_match::pattern_search(&pattern, &language, target, respect_gitignore, limit, specs) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");

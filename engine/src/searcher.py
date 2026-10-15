@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 import re
@@ -16,6 +17,7 @@ from engine.src.keywords import (
 )
 from engine.src.providers import EmbeddingProvider
 from engine.src.query_dsl import StructuredSubQuery
+from engine.src.vector_store import SearchFilter, SearchRequest, normalize_path_prefix
 
 if TYPE_CHECKING:
     from engine.src.reranker import ColBERTReranker
@@ -100,6 +102,97 @@ def _normalize_result_path(path: str) -> str:
     return str(path or "").replace("\\\\?\\", "")
 
 
+def _path_tail(path: str, segments: int = 3) -> str:
+    """
+    Last few path segments. Absolute prefixes (drive, home, repo parents) carry no
+    ranking signal and would otherwise crowd the file name out of token budgets.
+    """
+    parts = [part for part in str(path or "").replace("\\", "/").split("/") if part and part != "?"]
+    return "/".join(parts[-segments:])
+
+
+def embed_query(provider: Any, query: str):
+    """
+    Embed a search query, applying the provider's query instruction when it has one.
+    """
+    embed = getattr(provider, "embed_query", None)
+    if callable(embed):
+        return embed(query)
+    return provider.embed_single(query)
+
+
+@lru_cache(maxsize=65536)
+def _token_variants_cached(token: str) -> tuple[str, ...]:
+    """
+    Expand a token with lightweight inflection variants and synonyms for ranking.
+    Pure and memoized: ranking calls it tens of thousands of times per query batch.
+    """
+    token = token.lower()
+    variants = [token]
+
+    if len(token) > 4 and token.endswith("ies"):
+        variants.append(token[:-3] + "y")
+    elif len(token) > 4 and token.endswith("ing"):
+        stem = token[:-3]
+        variants.append(stem)
+        if len(stem) >= 2 and stem[-1] == stem[-2]:
+            variants.append(stem[:-1])
+    elif len(token) > 4 and token.endswith("ed"):
+        stem = token[:-2]
+        variants.append(stem)
+        if not stem.endswith("e"):
+            variants.append(token[:-1])
+    elif len(token) > 4 and token.endswith(("ches", "shes", "xes", "zes", "sses")):
+        variants.append(token[:-2])
+    elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        variants.append(token[:-1])
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for candidate in variants:
+        if len(candidate) < 3 or candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+        for synonym in TOKEN_SYNONYMS.get(candidate, ()):
+            if len(synonym) < 3 or synonym in seen:
+                continue
+            seen.add(synonym)
+            out.append(synonym)
+    return tuple(out)
+
+
+@lru_cache(maxsize=32768)
+def _identifier_tokens_cached(text: str, max_tokens: Optional[int]) -> tuple[str, ...]:
+    """
+    Tokenize identifier-like text, including snake_case and path segments.
+    Pure and memoized for the same reason as _token_variants_cached.
+    """
+    if not text:
+        return ()
+
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    expanded = re.sub(r"[\\/.\-:()\\[\\],]", " ", expanded)
+    raw_tokens = re.findall(r"[A-Za-z0-9_]+", expanded)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw_token in raw_tokens:
+        for part in raw_token.split("_"):
+            lower = part.lower().strip()
+            if len(lower) < 3:
+                continue
+            for candidate in _token_variants_cached(lower):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                out.append(candidate)
+                if max_tokens is not None and len(out) >= max_tokens:
+                    return tuple(out)
+
+    return tuple(out)
+
+
 @dataclass(frozen=True, slots=True)
 class SearchResult:
     """
@@ -151,7 +244,7 @@ class CodeSearcher:
 
     def __init__(
         self,
-        client: Any,
+        store: Any,
         collection_name: str,
         code_provider: EmbeddingProvider,
         desc_provider: EmbeddingProvider,
@@ -159,13 +252,13 @@ class CodeSearcher:
     ):
         """
         Args:
-            client: QdrantClient — Qdrant client instance.
-            collection_name: str — Target collection name.
+            store: VectorStore — Embedded vector store (or any object with the same search API).
+            collection_name: str — Target collection name or project alias.
             code_provider: EmbeddingProvider — Embedding provider for code vectors.
             desc_provider: EmbeddingProvider — Embedding provider for description vectors.
             reranker: Optional[ColBERTReranker] — ColBERT reranker for post-retrieval reranking.
         """
-        self._client = client
+        self._store = store
         self._collection_name = collection_name
         self._code_provider = code_provider
         self._desc_provider = desc_provider
@@ -177,11 +270,12 @@ class CodeSearcher:
 
     def close(self) -> None:
         """
-        Close the underlying search client if it supports cleanup.
+        Release per-searcher caches. The vector store is owned by the caller.
         """
-        close = getattr(self._client, "close", None)
-        if callable(close):
-            close()
+        with self._cache_lock:
+            self._query_vector_cache.clear()
+            self._keyword_cache.clear()
+            self._metadata_token_cache.clear()
 
     def search_code(
         self,
@@ -687,165 +781,47 @@ class CodeSearcher:
         Returns:
             list[SearchResult] — Sorted search results.
         """
-        filters = []
-
-        if language:
-            filters.append(self._match_filter("language", language))
-
-        if file_path:
-            filters.append(self._match_filter("file_path", file_path))
-
-        normalized_path_prefix = None
-        if path_prefix:
-            normalized_path_prefix = path_prefix.replace("\\", "/").strip().strip("/").lower()
-            if normalized_path_prefix:
-                filters.append(self._match_filter("path_prefixes", normalized_path_prefix))
-
-        if symbol_kind:
-            filters.append(
-                {
-                    "should": [
-                        self._match_filter("symbol_kind", symbol_kind),
-                        self._match_filter("symbol_type", symbol_kind),
-                    ]
-                }
-            )
-
-        query_filter = {"must": filters} if filters else None
-
-        rerank_active = rerank and self._reranker is not None
-        if rerank_active:
-            fetch_limit = limit * 5
-        elif ranking_keywords:
-            fetch_limit = limit * 3
-        else:
-            fetch_limit = limit
-
-        if normalized_path_prefix:
-            fetch_limit = max(fetch_limit, limit * 10)
-
-        results = self._client.query_points(
-            collection_name=self._collection_name,
-            query=query_vector,
-            using=using,
-            query_filter=query_filter,
-            limit=fetch_limit,
-            with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
+        query_filter, normalized_path_prefix, fetch_limit = self._build_query_filter(
+            limit=limit,
+            language=language,
+            file_path=file_path,
+            path_prefix=path_prefix,
+            symbol_kind=symbol_kind,
+            ranking_keywords=ranking_keywords,
+            rerank=rerank,
         )
 
-        if normalized_path_prefix and not results.points:
-            fallback_filters = [
-                condition for condition in filters
-                if not (isinstance(condition, dict) and condition.get("key") == "path_prefixes")
-            ]
-            fallback_filter = {"must": fallback_filters} if fallback_filters else None
-            results = self._client.query_points(
-                collection_name=self._collection_name,
-                query=query_vector,
+        points = self._store.search(
+            self._collection_name,
+            SearchRequest(
+                vector=query_vector,
                 using=using,
-                query_filter=fallback_filter,
-                limit=max(fetch_limit, limit * 25),
+                limit=fetch_limit,
+                filter=query_filter,
                 with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
+            ),
+        )
+        if normalized_path_prefix and not points:
+            points = self._store.search(
+                self._collection_name,
+                SearchRequest(
+                    vector=query_vector,
+                    using=using,
+                    limit=max(fetch_limit, limit * 25),
+                    filter=query_filter.without_path() if query_filter is not None else None,
+                    with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
+                ),
             )
 
-        search_results = []
-        for point in results.points:
-            vector_score = point.score
-            chunk_keywords = point.payload.get("keywords", [])
-            path_context = point.payload.get("path_context")
+        search_results = self._points_to_results(
+            points=points,
+            ranking_keywords=ranking_keywords,
+            blend_keywords=blend_keywords,
+            keyword_weight=keyword_weight,
+            normalized_path_prefix=normalized_path_prefix,
+        )
 
-            if blend_keywords and chunk_keywords:
-                kw_score = keyword_overlap_score(blend_keywords, chunk_keywords)
-                final_score = vector_score * (1 - keyword_weight) + kw_score * keyword_weight
-            else:
-                final_score = vector_score
-
-            if path_context and ranking_keywords:
-                path_keywords = extract_keywords(path_context)
-                if path_keywords:
-                    final_score += keyword_query_coverage_score(ranking_keywords, path_keywords) * 0.1
-
-            symbol_kind_value = point.payload.get("symbol_kind") or point.payload.get("symbol_type") or "unknown"
-            symbol_name_value = point.payload["symbol_name"]
-            file_path_value = _normalize_result_path(point.payload["file_path"])
-            final_score *= self._kind_score_multiplier(symbol_kind_value, len(ranking_keywords))
-            final_score *= self._path_signal_multiplier(file_path_value, ranking_keywords)
-            final_score += self._basename_hit_bonus(file_path_value, ranking_keywords)
-            final_score += self._provider_path_bonus(file_path_value, ranking_keywords)
-            final_score += self._startup_boundary_bonus(file_path_value, ranking_keywords)
-            final_score += self._startup_symbol_bonus(file_path_value, symbol_name_value, ranking_keywords)
-            final_score += self._implementation_path_bonus(file_path_value, ranking_keywords)
-            final_score += self._graph_path_bonus(file_path_value, symbol_name_value, ranking_keywords)
-            final_score += self._filecache_bonus(file_path_value, symbol_name_value, ranking_keywords)
-            final_score += self._role_bonus(point.payload.get("role"), ranking_keywords)
-            final_score *= self._subsystem_conflict_penalty(file_path_value, ranking_keywords)
-            final_score *= self._ranking_subsystem_penalty(file_path_value, ranking_keywords)
-            final_score *= self._ranking_helper_penalty(symbol_name_value, ranking_keywords)
-            final_score *= self._startup_import_symbol_penalty(symbol_kind_value, ranking_keywords)
-            final_score *= self._graph_wrapper_penalty(file_path_value, ranking_keywords)
-            final_score *= self._constructor_penalty(symbol_name_value, ranking_keywords)
-            final_score *= self._wrapper_symbol_penalty(file_path_value, symbol_name_value, ranking_keywords)
-            final_score *= self._container_symbol_penalty(symbol_name_value, symbol_kind_value, ranking_keywords)
-            if ranking_keywords:
-                symbol_tokens = self._symbol_tokens(
-                    symbol_name_value,
-                    point.payload.get("signature"),
-                )
-                symbol_overlap = keyword_query_coverage_score(ranking_keywords, symbol_tokens)
-                final_score += symbol_overlap * 0.18
-                final_score += self._action_symbol_bonus(ranking_keywords, symbol_tokens)
-                if len(ranking_keywords) >= 2 and symbol_overlap >= 0.5:
-                    final_score *= 1.12
-                if (
-                    len(ranking_keywords) >= 2
-                    and symbol_overlap < 0.5
-                    and symbol_kind_value.lower() in {"data_key", "variable", "property", "import"}
-                ):
-                    final_score *= 0.7
-
-            if ranking_keywords:
-                metadata_tokens = self._metadata_tokens(point.payload)
-                metadata_overlap = keyword_query_coverage_score(ranking_keywords, metadata_tokens)
-                final_score += metadata_overlap * 0.16
-                if len(ranking_keywords) >= 3 and metadata_overlap >= 0.45:
-                    final_score *= 1.08
-
-                generic_symbol_names = {"main", "entry", "_start", "init"}
-                normalized_symbol_name = symbol_name_value.lower()
-                if (
-                    len(ranking_keywords) > 1
-                    and normalized_symbol_name in generic_symbol_names
-                    and all(term not in normalized_symbol_name for term in ranking_keywords)
-                ):
-                    final_score *= 0.92
-            if normalized_path_prefix:
-                normalized_file_path = file_path_value.replace("\\", "/").lower()
-                normalized_context = (path_context or "").replace("\\", "/").lower()
-                if normalized_path_prefix not in normalized_file_path and normalized_path_prefix not in normalized_context:
-                    continue
-
-            search_results.append(
-                SearchResult(
-                    score=final_score,
-                    file_path=file_path_value,
-                    symbol_name=symbol_name_value,
-                    symbol_kind=symbol_kind_value,
-                    line_start=point.payload["line_start"],
-                    line_end=point.payload["line_end"],
-                    source=point.payload.get("source", ""),
-                    description=point.payload["description"],
-                    point_id=getattr(point, "id", None),
-                    signature=point.payload.get("signature"),
-                    docstring=point.payload.get("docstring"),
-                    parent=point.payload.get("parent"),
-                    language=point.payload.get("language"),
-                    path_context=path_context,
-                )
-            )
-
-        search_results.sort(key=lambda item: item.score, reverse=True)
-
-        if rerank_active:
+        if rerank and self._reranker is not None:
             return self._blend_with_rerank(query, search_results, limit)
 
         diversified = self._diversify_results(search_results, ranking_keywords, limit)
@@ -861,7 +837,7 @@ class CodeSearcher:
         if not requests:
             return []
 
-        query_requests: list[dict] = []
+        query_requests: list[SearchRequest] = []
         contexts: list[dict] = []
 
         for request in requests:
@@ -876,14 +852,13 @@ class CodeSearcher:
                 apply_keyword_overfetch=False,
             )
             query_requests.append(
-                {
-                    "query": request["query_vector"],
-                    "using": request["using"],
-                    "filter": query_filter,
-                    "limit": fetch_limit,
-                    "with_payload": LIGHT_RESULT_PAYLOAD_FIELDS,
-                    "with_vector": False,
-                }
+                SearchRequest(
+                    vector=request["query_vector"],
+                    using=request["using"],
+                    limit=fetch_limit,
+                    filter=query_filter,
+                    with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
+                )
             )
             contexts.append(
                 {
@@ -894,39 +869,35 @@ class CodeSearcher:
                     "query_vector": request["query_vector"],
                     "using": request["using"],
                     "limit": request["limit"],
+                    "filter": query_filter,
                 }
             )
 
-        responses = self._client.query_batch_points(
-            collection_name=self._collection_name,
-            requests=query_requests,
-        )
+        responses = self._store.search_batch(self._collection_name, query_requests)
 
         out: list[list[SearchResult]] = []
-        for request, response, context in zip(requests, responses, contexts):
+        for response, context in zip(responses, contexts):
             results = self._points_to_results(
-                points=response.points,
+                points=response,
                 ranking_keywords=context["ranking_keywords"],
                 blend_keywords=context["blend_keywords"],
                 keyword_weight=context["keyword_weight"],
                 normalized_path_prefix=context["normalized_path_prefix"],
             )
-            if context["normalized_path_prefix"] and not response.points:
-                fallback_filter = self._build_fallback_query_filter(
-                    language=request["language"],
-                    file_path=request["file_path"],
-                    symbol_kind=request["symbol_kind"],
-                )
-                fallback_response = self._client.query_points(
-                    collection_name=self._collection_name,
-                    query=context["query_vector"],
-                    using=context["using"],
-                    query_filter=fallback_filter,
-                    limit=max(context["limit"] * 25, 30),
-                    with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
+            if context["normalized_path_prefix"] and not response:
+                fallback_filter = context["filter"].without_path() if context["filter"] is not None else None
+                fallback_points = self._store.search(
+                    self._collection_name,
+                    SearchRequest(
+                        vector=context["query_vector"],
+                        using=context["using"],
+                        limit=max(context["limit"] * 25, 30),
+                        filter=fallback_filter,
+                        with_payload=LIGHT_RESULT_PAYLOAD_FIELDS,
+                    ),
                 )
                 results = self._points_to_results(
-                    points=fallback_response.points,
+                    points=fallback_points,
                     ranking_keywords=context["ranking_keywords"],
                     blend_keywords=context["blend_keywords"],
                     keyword_weight=context["keyword_weight"],
@@ -946,40 +917,22 @@ class CodeSearcher:
         ranking_keywords: list[str],
         rerank: bool,
         apply_keyword_overfetch: bool = True,
-    ) -> tuple[Optional[dict], Optional[str], int]:
+    ) -> tuple[Optional[SearchFilter], Optional[str], int]:
         """
-        Build Qdrant filter and fetch sizing for a search request.
+        Build the store filter and candidate fetch size for a search request.
 
-        Returns: tuple[Optional[Filter], Optional[str], int]
+        Returns: tuple[Optional[SearchFilter], Optional[str], int] — filter,
+            normalized path prefix, and fetch limit.
         """
-        filters = []
+        normalized_path_prefix = normalize_path_prefix(path_prefix)
+        query_filter = SearchFilter.build(
+            path_prefix=normalized_path_prefix,
+            language=language,
+            file_path=file_path,
+            symbol_kind=symbol_kind,
+        )
 
-        if language:
-            filters.append(self._match_filter("language", language))
-
-        if file_path:
-            filters.append(self._match_filter("file_path", file_path))
-
-        normalized_path_prefix = None
-        if path_prefix:
-            normalized_path_prefix = path_prefix.replace("\\", "/").strip().strip("/").lower()
-            if normalized_path_prefix:
-                filters.append(self._match_filter("path_prefixes", normalized_path_prefix))
-
-        if symbol_kind:
-            filters.append(
-                {
-                    "should": [
-                        self._match_filter("symbol_kind", symbol_kind),
-                        self._match_filter("symbol_type", symbol_kind),
-                    ]
-                }
-            )
-
-        query_filter = {"must": filters} if filters else None
-
-        rerank_active = rerank and self._reranker is not None
-        if rerank_active:
+        if rerank and self._reranker is not None:
             fetch_limit = limit * 5
         elif ranking_keywords and apply_keyword_overfetch:
             fetch_limit = limit * 3
@@ -992,26 +945,6 @@ class CodeSearcher:
 
         return query_filter, normalized_path_prefix, fetch_limit
 
-    def _build_fallback_query_filter(
-        self,
-        language: Optional[str],
-        file_path: Optional[str],
-        symbol_kind: Optional[str],
-    ) -> Optional[dict]:
-        """
-        Build a fallback filter without path-prefix constraints.
-        """
-        query_filter, _, _ = self._build_query_filter(
-            limit=1,
-            language=language,
-            file_path=file_path,
-            path_prefix=None,
-            symbol_kind=symbol_kind,
-            ranking_keywords=[],
-            rerank=False,
-        )
-        return query_filter
-
     def _points_to_results(
         self,
         points,
@@ -1021,7 +954,7 @@ class CodeSearcher:
         normalized_path_prefix: Optional[str],
     ) -> list[SearchResult]:
         """
-        Convert Qdrant points to scored SearchResult objects.
+        Convert store search points to scored SearchResult objects.
         """
         search_results = []
         for point in points:
@@ -1120,12 +1053,6 @@ class CodeSearcher:
         search_results.sort(key=lambda item: item.score, reverse=True)
         return search_results
 
-    def _match_filter(self, key: str, value: str) -> dict:
-        """
-        Build a simple exact-match filter clause for the REST search client.
-        """
-        return {"key": key, "match": {"value": value}}
-
     def _hydrate_results(self, results: list[SearchResult]) -> list[SearchResult]:
         """
         Fetch full payloads only for final results that still need source content.
@@ -1148,11 +1075,10 @@ class CodeSearcher:
             return results
 
         try:
-            records = self._client.retrieve(
-                collection_name=self._collection_name,
-                ids=ids_to_fetch,
+            records = self._store.retrieve(
+                self._collection_name,
+                ids_to_fetch,
                 with_payload=FULL_RESULT_PAYLOAD_FIELDS,
-                with_vectors=False,
             )
         except Exception:
             return results
@@ -1194,30 +1120,6 @@ class CodeSearcher:
         if not include_source:
             return results
         return self._hydrate_results(results)
-
-    def _diversify_results(
-        self,
-        results: list[SearchResult],
-        ranking_keywords: list[str],
-        limit: int,
-    ) -> list[SearchResult]:
-        """
-        Prefer distinct files in early ranks for broad architecture questions.
-        """
-        if len(ranking_keywords) < 10 or limit <= 1:
-            return results[:limit]
-
-        unique: list[SearchResult] = []
-        duplicates: list[SearchResult] = []
-        seen_paths: set[str] = set()
-        for result in results:
-            if result.file_path in seen_paths:
-                duplicates.append(result)
-                continue
-            seen_paths.add(result.file_path)
-            unique.append(result)
-
-        return (unique + duplicates)[:limit]
 
     def _diversify_results(
         self,
@@ -1315,7 +1217,7 @@ class CodeSearcher:
                     self._query_vector_cache.popitem(last=False)
             return disk_cached
 
-        vector = provider.embed_single(query).tolist()
+        vector = embed_query(provider, query).tolist()
 
         self._store_query_vector_to_disk(
             query=query,
@@ -1343,7 +1245,8 @@ class CodeSearcher:
         """
         Build a stable on-disk cache path for a query embedding.
         """
-        provider_key = f"{type(provider).__name__}:{provider.model}:{provider.dimension}:{cache_key}:{query}"
+        prefix = getattr(provider, "query_prefix", "") or ""
+        provider_key = f"{type(provider).__name__}:{provider.model}:{provider.dimension}:{cache_key}:{prefix}{query}"
         digest = hashlib.sha256(provider_key.encode("utf-8")).hexdigest()
         return self._query_cache_dir() / f"{digest}.json"
 
@@ -1495,67 +1398,13 @@ class CodeSearcher:
         """
         Expand a token with lightweight inflection variants for ranking.
         """
-        token = token.lower()
-        variants = [token]
-
-        if len(token) > 4 and token.endswith("ies"):
-            variants.append(token[:-3] + "y")
-        elif len(token) > 4 and token.endswith("ing"):
-            stem = token[:-3]
-            variants.append(stem)
-            if len(stem) >= 2 and stem[-1] == stem[-2]:
-                variants.append(stem[:-1])
-        elif len(token) > 4 and token.endswith("ed"):
-            stem = token[:-2]
-            variants.append(stem)
-            if not stem.endswith("e"):
-                variants.append(token[:-1])
-        elif len(token) > 4 and token.endswith(("ches", "shes", "xes", "zes", "sses")):
-            variants.append(token[:-2])
-        elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-            variants.append(token[:-1])
-
-        seen: set[str] = set()
-        out: list[str] = []
-        for candidate in variants:
-            if len(candidate) < 3 or candidate in seen:
-                continue
-            seen.add(candidate)
-            out.append(candidate)
-            for synonym in TOKEN_SYNONYMS.get(candidate, ()):
-                if len(synonym) < 3 or synonym in seen:
-                    continue
-                seen.add(synonym)
-                out.append(synonym)
-        return out
+        return list(_token_variants_cached(token))
 
     def _identifier_tokens(self, text: str, max_tokens: Optional[int] = None) -> list[str]:
         """
         Tokenize identifier-like text, including snake_case and path segments.
         """
-        if not text:
-            return []
-
-        expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
-        expanded = re.sub(r"[\\/.\-:()\\[\\],]", " ", expanded)
-        raw_tokens = re.findall(r"[A-Za-z0-9_]+", expanded)
-
-        seen: set[str] = set()
-        out: list[str] = []
-        for raw_token in raw_tokens:
-            for part in raw_token.split("_"):
-                lower = part.lower().strip()
-                if len(lower) < 3:
-                    continue
-                for candidate in self._token_variants(lower):
-                    if candidate in seen:
-                        continue
-                    seen.add(candidate)
-                    out.append(candidate)
-                    if max_tokens is not None and len(out) >= max_tokens:
-                        return out
-
-        return out
+        return list(_identifier_tokens_cached(text or "", max_tokens))
 
     def _metadata_tokens(self, payload: dict) -> list[str]:
         """
@@ -1569,7 +1418,7 @@ class CodeSearcher:
                 return cached
 
         tokens: list[str] = []
-        tokens.extend(self._identifier_tokens(payload.get("file_path", ""), max_tokens=12))
+        tokens.extend(self._identifier_tokens(_path_tail(payload.get("file_path", "")), max_tokens=12))
         tokens.extend(self._identifier_tokens(payload.get("path_context", ""), max_tokens=12))
         tokens.extend(self._identifier_tokens(payload.get("symbol_name", ""), max_tokens=8))
         tokens.extend(self._identifier_tokens(payload.get("symbol_kind", ""), max_tokens=4))
@@ -1926,7 +1775,7 @@ class CodeSearcher:
             ):
                 return 0.2
             if (
-                normalized.endswith("/engine/src/qdrant.py")
+                normalized.endswith("/engine/src/vector_store.py")
                 or normalized.endswith("/engine/src/collection.py")
                 or normalized.endswith("/engine/src/config.py")
             ):
@@ -1999,7 +1848,7 @@ class CodeSearcher:
                 return cached
 
         provider = self._code_provider if using == "code" else self._desc_provider
-        vector = provider.embed_single(query).tolist()
+        vector = embed_query(provider, query).tolist()
 
         with self._cache_lock:
             self._query_vector_cache[cache_key] = vector

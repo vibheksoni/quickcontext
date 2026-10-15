@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from engine.sdk import QuickContext
-from engine.src.config import EngineConfig, QdrantConfig
+from engine.src.config import EngineConfig, StoreConfig
 from engine.src.indexer import IndexStats
 from engine.src.operation_status import GLOBAL_OPERATION_REGISTRY
 from engine.src.parsing import TextSearchMatch
@@ -14,29 +14,29 @@ from engine.src.sdk_models import ProjectCollectionInfo
 
 
 class SDKSurfaceTests(unittest.TestCase):
-    def test_qdrant_available_probes_connection_when_requested(self) -> None:
-        qc = QuickContext(EngineConfig(qdrant=QdrantConfig()))
+    def test_vector_store_available_probes_connection_when_requested(self) -> None:
+        qc = QuickContext(EngineConfig(store=StoreConfig(path=":memory:")))
 
         with mock.patch.object(qc, "connect", return_value=qc) as connect:
-            self.assertTrue(qc.qdrant_available(verify=True))
+            self.assertTrue(qc.vector_store_available(verify=True))
 
         connect.assert_called_once_with(verify=True)
 
-    def test_status_reports_qdrant_health_without_prior_cached_client(self) -> None:
-        qc = QuickContext(EngineConfig(qdrant=QdrantConfig()))
+    def test_status_reports_store_health_without_prior_open(self) -> None:
+        qc = QuickContext(EngineConfig(store=StoreConfig(path=":memory:")))
         fake_pipe = mock.Mock(_pipe_name="test-pipe")
         qc._parser_service = mock.Mock(connected=True, _client=fake_pipe)
 
-        with mock.patch.object(qc, "connect", return_value=qc) as connect:
-            status = qc.status()
+        status = qc.status()
 
-        self.assertTrue(status["qdrant"]["configured"])
-        self.assertTrue(status["qdrant"]["alive"])
+        self.assertTrue(status["store"]["configured"])
+        self.assertTrue(status["store"]["alive"])
+        self.assertEqual(status["store"]["path"], ":memory:")
         self.assertEqual(status["parser"]["pipe_name"], "test-pipe")
-        connect.assert_called_once_with(verify=True)
+        qc.close()
 
     def test_project_info_returns_stable_discovery_payload(self) -> None:
-        qc = QuickContext(EngineConfig(qdrant=QdrantConfig()))
+        qc = QuickContext(EngineConfig(store=StoreConfig(path=":memory:")))
         qc._parser_service = mock.Mock(connected=False)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,11 +44,11 @@ class SDKSurfaceTests(unittest.TestCase):
             (root / "package.json").write_text("{}", encoding="utf-8")
             (root / "src").mkdir()
 
-            with mock.patch.object(qc, "qdrant_available", return_value=False):
+            with mock.patch.object(qc, "vector_store_available", return_value=False):
                 info = qc.project_info(root, include_folders=True)
 
         self.assertEqual(info.project_name, root.name)
-        self.assertFalse(info.qdrant_available)
+        self.assertFalse(info.vector_store_available)
         self.assertFalse(info.collection.indexed)
         self.assertEqual(info.folders[0].relative_path, ".")
         self.assertIn("src", {item.relative_path for item in info.folders})
@@ -66,10 +66,7 @@ class SDKSurfaceTests(unittest.TestCase):
         self.assertEqual(project_name, "windsurf_com")
 
     def test_list_projects_returns_typed_collection_info(self) -> None:
-        qc = QuickContext(EngineConfig(qdrant=QdrantConfig()))
-        qc._conn = mock.Mock()
-        qc._conn.client = object()
-
+        qc = QuickContext(EngineConfig(store=StoreConfig(path=":memory:")))
         fake_projects = [
             {
                 "name": "demo",
@@ -82,8 +79,8 @@ class SDKSurfaceTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch.object(qc, "qdrant_available", return_value=True):
-            with mock.patch("engine.src.collection.CollectionManager.list_all_projects", return_value=fake_projects):
+        with mock.patch.object(qc, "vector_store_available", return_value=True):
+            with mock.patch("engine.src.collection.list_projects", return_value=fake_projects):
                 projects = qc.list_projects()
 
         self.assertEqual(len(projects), 1)
@@ -107,7 +104,7 @@ class SDKSurfaceTests(unittest.TestCase):
         self.assertEqual(match.file_path, "C:\\repo\\src\\main.py")
 
     def test_start_index_directory_exposes_pollable_progress_snapshot(self) -> None:
-        qc = QuickContext(EngineConfig(qdrant=QdrantConfig()))
+        qc = QuickContext(EngineConfig(store=StoreConfig(path=":memory:")))
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

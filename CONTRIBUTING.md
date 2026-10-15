@@ -30,7 +30,6 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 cargo build --release --manifest-path service/Cargo.toml
-docker compose up -d qdrant
 ```
 
 Linux:
@@ -43,7 +42,6 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
 cargo build --release --manifest-path service/Cargo.toml
-docker compose up -d qdrant
 ```
 
 ## Contribution Guidelines
@@ -67,8 +65,11 @@ At minimum, run the checks that apply to your change:
 
 ```text
 python -m py_compile engine/src/pipe.py engine/src/parsing.py engine/src/cli.py engine/__init__.py
+python -m unittest engine.tests.test_vector_store engine.tests.test_regressions engine.tests.test_mcp_server
 cargo check --manifest-path service/Cargo.toml
 ```
+
+No database server is needed for development or tests; the vector store is an embedded SQLite file.
 
 If your change affects indexing, search, or IPC behavior, include a short note in the pull request describing what you validated.
 

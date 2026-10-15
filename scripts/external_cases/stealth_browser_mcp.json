@@ -1,0 +1,422 @@
+[
+ {
+  "query": "BrowserManager.spawn_browser",
+  "expected_paths": [
+   "src/browser_manager.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "spawn_browser"
+  ]
+ },
+ {
+  "query": "NetworkInterceptor.get_response_body",
+  "expected_paths": [
+   "src/network_interceptor.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "get_response_body"
+  ]
+ },
+ {
+  "query": "AuthenticatedProxyForwarder",
+  "expected_paths": [
+   "src/proxy_forwarder.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "AuthenticatedProxyForwarder"
+  ]
+ },
+ {
+  "query": "ProcessCleanup.cleanup_deferred_profiles",
+  "expected_paths": [
+   "src/process_cleanup.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "cleanup_deferred_profiles"
+  ]
+ },
+ {
+  "query": "install_stdio_guard",
+  "expected_paths": [
+   "src/stdio_guard.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "install_stdio_guard"
+  ]
+ },
+ {
+  "query": "validate_upload_paths",
+  "expected_paths": [
+   "src/file_upload_security.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "validate_upload_paths"
+  ]
+ },
+ {
+  "query": "parse_proxy_config",
+  "expected_paths": [
+   "src/proxy_utils.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "parse_proxy_config"
+  ]
+ },
+ {
+  "query": "Where is PageBindingManager.get_calls defined?",
+  "expected_paths": [
+   "src/page_bindings.py"
+  ],
+  "kind": "symbol",
+  "expected_symbols": [
+   "get_calls"
+  ]
+ },
+ {
+  "query": "How does the server stop MCP stdio from being corrupted by stray print statements?",
+  "expected_paths": [
+   "src/stdio_guard.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "install_stdio_guard",
+   "TransportSafeStdout",
+   "write"
+  ]
+ },
+ {
+  "query": "How are proxies that need a username and password handled when launching Chrome?",
+  "expected_paths": [
+   "src/proxy_forwarder.py",
+   "src/proxy_utils.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "AuthenticatedProxyForwarder",
+   "parse_proxy_config",
+   "start",
+   "merge_proxy_server_arg"
+  ]
+ },
+ {
+  "query": "Where are temporary browser profile directories deleted after a browser closes?",
+  "expected_paths": [
+   "src/process_cleanup.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_cleanup_profile_dir",
+   "_cleanup_profile_for_metadata",
+   "cleanup_deferred_profiles",
+   "finalize_browser_process"
+  ]
+ },
+ {
+  "query": "How does the idle reaper close browser instances that have not been used for a while?",
+  "expected_paths": [
+   "src/browser_manager.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_run_idle_reaper",
+   "start_idle_reaper",
+   "cleanup_inactive"
+  ]
+ },
+ {
+  "query": "How are network response bodies captured and filtered before storing them?",
+  "expected_paths": [
+   "src/network_interceptor.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_should_capture_body",
+   "_on_loading_finished",
+   "_fetch_body",
+   "set_capture_filters"
+  ]
+ },
+ {
+  "query": "How do dynamic hooks handle paused requests and decide to block, redirect, or fulfill them?",
+  "expected_paths": [
+   "src/dynamic_hook_system.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_on_request_paused",
+   "_process_request_hooks",
+   "_execute_hook_action",
+   "process"
+  ]
+ },
+ {
+  "query": "How is AI generated hook code compiled into a process_request function?",
+  "expected_paths": [
+   "src/dynamic_hook_system.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_compile_function"
+  ]
+ },
+ {
+  "query": "How does typing text send trusted keyboard events and hold shift for capital letters?",
+  "expected_paths": [
+   "src/input_actions.py",
+   "src/dom_handler.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "type_character",
+   "character_key",
+   "type_text"
+  ]
+ },
+ {
+  "query": "How does clicking scroll the element into view and fall back to a JavaScript click when it is covered?",
+  "expected_paths": [
+   "src/input_actions.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "click_node",
+   "scroll_into_view",
+   "click_element"
+  ]
+ },
+ {
+  "query": "How are file upload paths checked against the allowed upload directories?",
+  "expected_paths": [
+   "src/file_upload_security.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "validate_upload_paths",
+   "get_allowed_upload_roots",
+   "_resolve_upload_root"
+  ]
+ },
+ {
+  "query": "How is the HTTP transport protected with a bearer token?",
+  "expected_paths": [
+   "src/http_security.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "EnvironmentBearerTokenVerifier",
+   "verify_token",
+   "create_http_auth_provider",
+   "get_http_auth_token"
+  ]
+ },
+ {
+  "query": "When does Chrome have to run without its sandbox, for example as root or inside a container?",
+  "expected_paths": [
+   "src/platform_utils.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "sandbox_must_be_disabled",
+   "get_required_sandbox_args",
+   "is_running_in_container",
+   "is_running_as_root"
+  ]
+ },
+ {
+  "query": "How are large tool responses written to a file instead of being returned when they exceed the token budget?",
+  "expected_paths": [
+   "src/response_handler.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "handle_response",
+   "estimate_tokens",
+   "ResponseHandler"
+  ]
+ },
+ {
+  "query": "How are deep serialized JavaScript evaluation results converted into plain Python values?",
+  "expected_paths": [
+   "src/js_values.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "from_deep_serialized",
+   "to_python",
+   "evaluate_to_python"
+  ]
+ },
+ {
+  "query": "How does headless mode replace the HeadlessChrome user agent token?",
+  "expected_paths": [
+   "src/browser_manager.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_resolve_headless_user_agent",
+   "_headful_user_agent"
+  ]
+ },
+ {
+  "query": "How are page bindings installed into a page and their calls recorded?",
+  "expected_paths": [
+   "src/page_bindings.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_install",
+   "prepare_tab",
+   "create",
+   "on_binding_called",
+   "_on_binding_called"
+  ]
+ },
+ {
+  "query": "How does navigation wait for the load or DOMContentLoaded event?",
+  "expected_paths": [
+   "src/browser_manager.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_wait_for_navigation_condition",
+   "_navigation_event_type",
+   "navigate"
+  ]
+ },
+ {
+  "query": "How is Python code translated into JavaScript and executed in the browser?",
+  "expected_paths": [
+   "src/cdp_function_executor.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "execute_python_in_browser",
+   "_translate_python_to_js",
+   "_fallback_python_to_js"
+  ]
+ },
+ {
+  "query": "How are matched CSS rules, computed styles and event listeners extracted for an element over CDP?",
+  "expected_paths": [
+   "src/cdp_element_cloner.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "extract_complete_element_cdp",
+   "_get_matched_styles_cdp",
+   "_get_computed_styles_cdp",
+   "_get_event_listeners_cdp"
+  ]
+ },
+ {
+  "query": "How does progressive cloning store an element and expand its children later?",
+  "expected_paths": [
+   "src/progressive_element_cloner.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "clone_element_progressive",
+   "expand_children",
+   "_get_store",
+   "_save_store"
+  ]
+ },
+ {
+  "query": "How are whole tool sections disabled at startup?",
+  "expected_paths": [
+   "src/server.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "apply_disabled_sections"
+  ]
+ },
+ {
+  "query": "How are key names like Enter or ArrowDown resolved into key codes and modifier flags?",
+  "expected_paths": [
+   "src/key_definitions.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "resolve_key_descriptor",
+   "resolve_modifiers"
+  ]
+ },
+ {
+  "query": "How does the debug logger export logs as gzip or pickle files?",
+  "expected_paths": [
+   "src/debug_logger.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_export_gzip_pickle",
+   "_export_pickle",
+   "export_to_file",
+   "export_to_file_paginated"
+  ]
+ },
+ {
+  "query": "How does the browser launcher wait for the DevTools port to start listening?",
+  "expected_paths": [
+   "src/browser_launcher.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "launch_browser",
+   "_is_listening",
+   "_read_active_port"
+  ]
+ },
+ {
+  "query": "How does the stealth benchmark score the Cloudflare challenge?",
+  "expected_paths": [
+   "benchmarks/stealth/targets/cloudflare.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "evaluate",
+   "is_challenge",
+   "collect"
+  ]
+ },
+ {
+  "query": "How are stealth benchmark runs compared to detect regressions between results?",
+  "expected_paths": [
+   "benchmarks/stealth/regression.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "compare_runs",
+   "find_regressions",
+   "is_regression"
+  ]
+ },
+ {
+  "query": "How does take_screenshot capture the full page and return the image?",
+  "expected_paths": [
+   "src/server.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "take_screenshot"
+  ]
+ },
+ {
+  "query": "Where are orphaned Chrome processes from a previous server run found and killed at startup?",
+  "expected_paths": [
+   "src/process_cleanup.py"
+  ],
+  "kind": "nl",
+  "expected_symbols": [
+   "_recover_orphaned_processes",
+   "_sweep_orphaned_temp_profiles"
+  ]
+ }
+]
