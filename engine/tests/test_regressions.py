@@ -3791,10 +3791,14 @@ class RegressionTests(unittest.TestCase):
         with mock.patch("engine.src.parsing.PipeClient") as client:
             RustParserService(config=config)
 
+        from engine.src.pipe import resolve_pipe_name
+
         client.assert_called_once_with(
-            pipe_name=r"\\.\pipe\quickcontext-custom",
+            pipe_name=resolve_pipe_name(config),
             service_path="C:/tools/quickcontext-service.exe",
         )
+        if os.name == "nt":
+            self.assertEqual(resolve_pipe_name(config), r"\\.\pipe\quickcontext-custom")
 
     def test_index_resume_state_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

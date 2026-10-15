@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -144,6 +145,7 @@ class LspSetupTests(unittest.TestCase):
         by_name = {server.name: server for server in plan.servers}
         self.assertEqual(by_name["rust-analyzer"].status, "ready")
 
+    @unittest.skipUnless(os.name == "nt", "npm .cmd shims only exist on Windows")
     def test_lsp_check_resolves_windows_npm_global_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
